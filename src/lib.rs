@@ -10,7 +10,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString};
 use rusqlite::{Connection, params_from_iter, types::Value};
 use std::sync::{Mutex, OnceLock};
 
-use pool::{Pool, PoolError, PooledConnection};
+use pool::{DEFAULT_POOL_SIZE, Pool, PoolError, PooledConnection};
 
 create_exception!(
     _catalyst,
@@ -24,6 +24,13 @@ create_exception!(
     ArgumentError,
     SQLAlchemyError,
     "Raised when arguments to a database API call are invalid."
+);
+
+create_exception!(
+    _catalyst,
+    NoSuchModuleError,
+    ArgumentError,
+    "Raised when a requested dialect plugin cannot be loaded."
 );
 
 create_exception!(
@@ -114,9 +121,27 @@ struct NativeResult {
 #[pymethods]
 impl NativeEngine {
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, pool_size=DEFAULT_POOL_SIZE, max_overflow=10, pool_timeout=30.0, sqlite_timeout=5.0))]
+    fn new(
+        path: &str,
+        pool_size: usize,
+        max_overflow: isize,
+        pool_timeout: f64,
+        sqlite_timeout: f64,
+    ) -> PyResult<Self> {
         Ok(Self {
-            pool: Pool::new(path).map_err(map_pool_error)?,
+            pool: Pool::new_with_options(
+                path,
+                pool_size,
+                if max_overflow < 0 {
+                    usize::MAX
+                } else {
+                    max_overflow as usize
+                },
+                std::time::Duration::from_secs_f64(pool_timeout.max(0.0)),
+                std::time::Duration::from_secs_f64(sqlite_timeout.max(0.0)),
+            )
+            .map_err(map_pool_error)?,
         })
     }
 
@@ -514,6 +539,10 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("SQLAlchemyError", module.py().get_type::<SQLAlchemyError>())?;
     module.add("CatalystError", module.py().get_type::<SQLAlchemyError>())?;
     module.add("ArgumentError", module.py().get_type::<ArgumentError>())?;
+    module.add(
+        "NoSuchModuleError",
+        module.py().get_type::<NoSuchModuleError>(),
+    )?;
     module.add("StatementError", module.py().get_type::<StatementError>())?;
     module.add("DBAPIError", module.py().get_type::<DBAPIError>())?;
     module.add("DatabaseError", module.py().get_type::<DatabaseError>())?;
@@ -541,6 +570,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "SQLAlchemyError",
             "CatalystError",
             "ArgumentError",
+            "NoSuchModuleError",
             "StatementError",
             "DBAPIError",
             "DatabaseError",

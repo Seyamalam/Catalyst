@@ -1,10 +1,10 @@
 //! Small synchronous SQLite connection pool used by native engines.
 
 use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-const DEFAULT_MAX_CONNECTIONS: usize = 5;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 5;
 
 struct PoolState {
     idle: Vec<Arc<Mutex<Connection>>>,
@@ -15,8 +15,12 @@ struct PoolState {
 
 struct PoolInner {
     path: String,
-    max_connections: usize,
+    pool_size: usize,
+    max_overflow: usize,
+    timeout: Duration,
+    sqlite_timeout: Duration,
     state: Mutex<PoolState>,
+    available: Condvar,
 }
 
 /// A bounded SQLite connection pool. In-memory engines intentionally use one connection.
@@ -40,7 +44,24 @@ pub(crate) enum PoolError {
 }
 
 impl Pool {
+    #[cfg(test)]
     pub(crate) fn new(path: &str) -> Result<Self, PoolError> {
+        Self::new_with_options(
+            path,
+            DEFAULT_POOL_SIZE,
+            10,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+    }
+
+    pub(crate) fn new_with_options(
+        path: &str,
+        pool_size: usize,
+        max_overflow: usize,
+        timeout: Duration,
+        sqlite_timeout: Duration,
+    ) -> Result<Self, PoolError> {
         let memory_connection = if path == ":memory:" {
             Some(Arc::new(Mutex::new(
                 Connection::open_in_memory().map_err(PoolError::Sqlite)?,
@@ -48,15 +69,24 @@ impl Pool {
         } else {
             None
         };
-        let max_connections = if memory_connection.is_some() {
+        let pool_size = if memory_connection.is_some() {
             1
         } else {
-            DEFAULT_MAX_CONNECTIONS
+            pool_size
+        };
+        let max_overflow = if memory_connection.is_some() {
+            0
+        } else {
+            max_overflow
         };
         Ok(Self {
             inner: Arc::new(PoolInner {
                 path: path.to_owned(),
-                max_connections,
+                pool_size,
+                max_overflow,
+                timeout,
+                sqlite_timeout,
+                available: Condvar::new(),
                 state: Mutex::new(PoolState {
                     idle: Vec::new(),
                     memory_connection,
@@ -68,36 +98,53 @@ impl Pool {
     }
 
     pub(crate) fn checkout(&self) -> Result<PooledConnection, PoolError> {
+        let started = Instant::now();
         let mut state = self.inner.state.lock().map_err(|_| PoolError::Poisoned)?;
-        if state.closed {
-            return Err(PoolError::Closed);
+        loop {
+            if state.closed {
+                return Err(PoolError::Closed);
+            }
+            if let Some(connection) = &state.memory_connection {
+                return Ok(PooledConnection {
+                    connection: Some(Arc::clone(connection)),
+                    pool: Arc::clone(&self.inner),
+                    shared: true,
+                });
+            }
+            if let Some(connection) = state.idle.pop() {
+                return Ok(PooledConnection {
+                    connection: Some(connection),
+                    pool: Arc::clone(&self.inner),
+                    shared: false,
+                });
+            }
+            if self.inner.pool_size == 0
+                || state.total < self.inner.pool_size.saturating_add(self.inner.max_overflow)
+            {
+                // Reserve before releasing the mutex; connection opens run outside it.
+                state.total += 1;
+                break;
+            }
+            let remaining = self.inner.timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(PoolError::Exhausted);
+            }
+            let (next, result) = self
+                .inner
+                .available
+                .wait_timeout(state, remaining)
+                .map_err(|_| PoolError::Poisoned)?;
+            state = next;
+            if result.timed_out() && state.idle.is_empty() {
+                return Err(PoolError::Exhausted);
+            }
         }
-        if let Some(connection) = &state.memory_connection {
-            return Ok(PooledConnection {
-                connection: Some(Arc::clone(connection)),
-                pool: Arc::clone(&self.inner),
-                shared: true,
-            });
-        }
-        if let Some(connection) = state.idle.pop() {
-            return Ok(PooledConnection {
-                connection: Some(connection),
-                pool: Arc::clone(&self.inner),
-                shared: false,
-            });
-        }
-        if state.total >= self.inner.max_connections {
-            return Err(PoolError::Exhausted);
-        }
-        // Reserve the slot before releasing the pool mutex so the bound holds
-        // while the (potentially slow) file open runs outside the lock.
-        state.total += 1;
         drop(state);
 
         let opened = (|| {
             let connection = Connection::open(&self.inner.path).map_err(PoolError::Sqlite)?;
             connection
-                .busy_timeout(Duration::from_secs(5))
+                .busy_timeout(self.inner.sqlite_timeout)
                 .map_err(PoolError::Sqlite)?;
             Ok(connection)
         })();
@@ -111,6 +158,7 @@ impl Pool {
                 if let Ok(mut state) = self.inner.state.lock() {
                     state.total = state.total.saturating_sub(1);
                 }
+                self.inner.available.notify_one();
                 Err(error)
             }
         }
@@ -122,6 +170,7 @@ impl Pool {
         state.total = state.total.saturating_sub(state.idle.len());
         state.idle.clear();
         state.memory_connection.take();
+        self.inner.available.notify_all();
         Ok(())
     }
 }
@@ -152,17 +201,21 @@ impl Drop for PooledConnection {
         let Ok(mut state) = self.pool.state.lock() else {
             return;
         };
-        if state.closed {
+        if state.closed || state.total > self.pool.pool_size {
             state.total = state.total.saturating_sub(1);
         } else {
             state.idle.push(connection);
         }
+        self.pool.available.notify_one();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Pool, PoolError};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn checkout_and_return_reuses_connection_and_state() {
@@ -218,13 +271,82 @@ mod tests {
     fn checkout_is_exclusive_and_exhaustion_is_reported() {
         let path =
             std::env::temp_dir().join(format!("catalyst-exhaust-{}.sqlite", std::process::id()));
-        let pool = Pool::new(path.to_str().expect("UTF-8 temp path")).expect("pool");
+        let pool = Pool::new_with_options(
+            path.to_str().expect("UTF-8 temp path"),
+            5,
+            0,
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .expect("pool");
         let held: Vec<_> = (0..5)
             .map(|_| pool.checkout().expect("pool slot"))
             .collect();
         assert!(matches!(pool.checkout(), Err(PoolError::Exhausted)));
         drop(held);
         assert!(pool.checkout().is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn overflow_connections_are_created_beyond_pool_size() {
+        let path =
+            std::env::temp_dir().join(format!("catalyst-overflow-{}.sqlite", std::process::id()));
+        let pool = Pool::new_with_options(
+            path.to_str().expect("UTF-8 temp path"),
+            1,
+            2,
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .expect("pool");
+        let held: Vec<_> = (0..3)
+            .map(|_| pool.checkout().expect("overflow slot"))
+            .collect();
+        assert!(matches!(pool.checkout(), Err(PoolError::Exhausted)));
+        drop(held);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn timed_wait_wakes_when_a_connection_is_returned() {
+        let path =
+            std::env::temp_dir().join(format!("catalyst-wait-{}.sqlite", std::process::id()));
+        let pool = Pool::new_with_options(
+            path.to_str().expect("UTF-8 temp path"),
+            1,
+            0,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("pool");
+        let held = pool.checkout().expect("initial slot");
+        let waiter_pool = Pool {
+            inner: Arc::clone(&pool.inner),
+        };
+        let waiter = thread::spawn(move || waiter_pool.checkout());
+        thread::sleep(Duration::from_millis(30));
+        drop(held);
+        assert!(waiter.join().expect("waiter thread").is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn timed_wait_reports_exhaustion_after_timeout() {
+        let path =
+            std::env::temp_dir().join(format!("catalyst-timeout-{}.sqlite", std::process::id()));
+        let pool = Pool::new_with_options(
+            path.to_str().expect("UTF-8 temp path"),
+            1,
+            0,
+            Duration::from_millis(40),
+            Duration::from_secs(5),
+        )
+        .expect("pool");
+        let _held = pool.checkout().expect("initial slot");
+        let started = Instant::now();
+        assert!(matches!(pool.checkout(), Err(PoolError::Exhausted)));
+        assert!(started.elapsed() >= Duration::from_millis(30));
         let _ = std::fs::remove_file(path);
     }
 

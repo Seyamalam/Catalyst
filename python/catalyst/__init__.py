@@ -25,6 +25,7 @@ from ._catalyst import (
     NativeConnection,
     NativeEngine,
     NativeResult,
+    NoSuchModuleError,
     OperationalError,
     ProgrammingError,
     SQLAlchemyError,
@@ -46,6 +47,7 @@ from .engine import (
 __all__ = [
     "CatalystError",
     "ArgumentError",
+    "NoSuchModuleError",
     "DBAPIError",
     "DatabaseError",
     "IntegrityError",

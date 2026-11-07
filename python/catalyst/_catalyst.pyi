@@ -6,6 +6,7 @@ __all__ = [
     "SQLAlchemyError",
     "CatalystError",
     "ArgumentError",
+    "NoSuchModuleError",
     "StatementError",
     "DBAPIError",
     "DatabaseError",
@@ -32,7 +33,14 @@ def sqlite_text(sql: str, parameters: list[object]) -> list[list[object]]:
 class NativeEngine:
     """Native SQLite engine used by the public Python Engine wrapper."""
 
-    def __new__(cls, path: str) -> NativeEngine: ...
+    def __new__(
+        cls,
+        path: str,
+        pool_size: int = ...,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        sqlite_timeout: float = 5.0,
+    ) -> NativeEngine: ...
     def connect(self) -> NativeConnection: ...
     def close(self) -> None: ...
 
@@ -65,6 +73,9 @@ class NativeResult:
 
 class ArgumentError(CatalystError):
     """Invalid arguments to a database API call."""
+
+class NoSuchModuleError(ArgumentError):
+    """Dialect plugin could not be loaded."""
 
 class StatementError(CatalystError):
     """Base class for SQL statement errors."""

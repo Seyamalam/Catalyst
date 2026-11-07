@@ -13,3 +13,4 @@ All notable changes to Catalyst are recorded here.
 - Replace the engine's shared SQLite handle with a Rust bounded pool: distinct reusable file connections, a singleton connection for `:memory:`, and SQLAlchemy-style `TimeoutError` on immediate pool exhaustion; add pool unit and SQLAlchemy parity tests.
 - Add Python `text()`/`TextClause` and Rust-native SQLite named binds (`:name`, `@name`, `$name`), escaped literal colons, positional execution compatibility, and result/error parity tests.
 - Add Rust-native SQLite commit-as-you-go transactions and arbitrary nested savepoints, Python root/savepoint transaction shells and `Engine.begin()`, rollback-on-close, and SQLAlchemy parity tests.
+- Add SQLAlchemy-style SQLite URL and engine option parsing, dialect error registry, configurable pool size/overflow and condition-variable checkout timeout, SQL echo logging, and parity tests.

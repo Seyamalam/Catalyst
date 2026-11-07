@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Mapping, Sequence
+import logging
+import math
+import re
+import warnings
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from ._catalyst import (
     ArgumentError,
@@ -15,6 +20,8 @@ from ._catalyst import (
     NativeEngine,
     NativeResult,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -64,9 +71,10 @@ class CursorResult:
 class Connection:
     """A checked-out synchronous connection backed by Rust SQLite."""
 
-    def __init__(self, native: NativeConnection) -> None:
+    def __init__(self, native: NativeConnection, *, echo: bool = False) -> None:
         self._native = native
         self._closed = False
+        self._echo = echo
 
     def execute(
         self,
@@ -92,6 +100,8 @@ class Connection:
             native_parameters: dict[str, object] | list[object] = dict(bindings)
         else:
             native_parameters = list(bindings)
+        if self._echo:
+            _logger.info("%s", sql)
         return CursorResult(
             self._native.execute(sql, native_parameters, isinstance(statement, TextClause))
         )
@@ -237,15 +247,25 @@ class Engine:
         >>> engine.dispose()
     """
 
-    def __init__(self, database: str | Path) -> None:
-        self._native = NativeEngine(str(database))
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        timeout: float = 5.0,
+        echo: bool = False,
+    ) -> None:
+        self._native = NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
+        self._echo = echo
         self._disposed = False
 
     def connect(self) -> Connection:
         """Return a logical connection handle."""
         if self._disposed:
             raise RuntimeError("Engine is disposed")
-        return Connection(self._native.connect())
+        return Connection(self._native.connect(), echo=self._echo)
 
     @contextmanager
     def begin(self) -> Generator[Connection, None, None]:
@@ -278,22 +298,137 @@ def text(sql: str) -> TextClause:
 
 
 def create_engine(url: str | Path, **options: Any) -> Engine:
-    """Create a synchronous SQLite engine.
+    """Create a synchronous SQLite engine with SQLAlchemy-style URL options."""
+    database, url_options = _parse_database_url(str(url))
+    merged: dict[str, Any] = dict(url_options)
+    merged.update(options)
+    # SQLAlchemy rejects only falsy ``future`` values; truthy strings pass.
+    if not merged.pop("future", True):
+        raise ArgumentError(
+            "The 'future' parameter passed to create_engine() may only be set to True."
+        )
+    accepted = {"pool_size", "max_overflow", "pool_timeout", "echo", "timeout"}
+    unknown = sorted(set(merged) - accepted)
+    if unknown:
+        names = ", ".join(repr(item) for item in unknown)
+        raise TypeError(f"Invalid argument(s) {names} sent to create_engine()")
+    try:
+        pool_size = int(merged.get("pool_size", 5))
+        max_overflow = int(merged.get("max_overflow", 10))
+        pool_timeout = float(merged.get("pool_timeout", 30.0))
+        timeout = float(merged.get("timeout", 5.0))
+    except (TypeError, ValueError) as error:
+        raise ArgumentError("Invalid numeric value in engine options") from error
+    if pool_size < 0 or max_overflow < -1 or timeout < 0 or pool_timeout < 0:
+        raise ArgumentError("Engine pool sizes and timeouts must be non-negative")
+    # Non-finite timeouts cannot map to a native Duration; SQLAlchemy accepts
+    # ``inf`` but Catalyst rejects it (documented parity difference).
+    if not (math.isfinite(pool_timeout) and math.isfinite(timeout)):
+        raise ArgumentError("Engine timeouts must be finite numbers")
+    echo = _asbool(merged.get("echo", False))
+    return Engine(
+        database,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        timeout=timeout,
+        echo=echo,
+    )
 
-    Accepts ``:memory:``, a filesystem path, and ``sqlite:///path`` URLs.
-    Other SQLAlchemy engine options and dialects are not yet supported.
-    """
-    if options:
-        unsupported = ", ".join(sorted(options))
-        raise TypeError(f"Unsupported engine options: {unsupported}")
 
-    value = str(url)
+def _asbool(value: object) -> bool:
+    """Coerce configuration values like SQLAlchemy's ``util.asbool``."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on", "y", "t"}:
+            return True
+        if lowered in {"false", "0", "no", "off", "n", "f", ""}:
+            return False
+        raise ValueError(f"String is not true/false: {value!r}")
+    return bool(value)
+
+
+def _load_sqlite() -> Callable[..., Engine]:
+    return Engine
+
+
+def _load_unimplemented_dialect(name: str) -> Callable[..., Engine]:
+    raise ModuleNotFoundError(f"No module named '{name}'")
+
+
+def _load_unknown_dialect(name: str) -> Callable[..., Engine]:
+    from ._catalyst import NoSuchModuleError
+
+    raise NoSuchModuleError(f"Can't load plugin: catalyst.dialects:{name}")
+
+
+_DIALECTS: dict[str, Callable[[], Callable[..., Engine]]] = {
+    "sqlite": _load_sqlite,
+    "postgresql": lambda: _load_unimplemented_dialect("psycopg"),
+    "mysql": lambda: _load_unimplemented_dialect("MySQLdb"),
+    "oracle": lambda: _load_unimplemented_dialect("oracledb"),
+}
+
+
+_DEFAULT_DRIVERS = {"postgresql": "psycopg", "mysql": "MySQLdb", "oracle": "oracledb"}
+
+
+def _parse_database_url(value: str) -> tuple[str, dict[str, str]]:
+    """Parse URL syntax in Python because it is a compatibility surface."""
     if value == ":memory:":
-        database = value
-    elif value.startswith("sqlite:///"):
-        database = value.removeprefix("sqlite:///")
-    elif value.startswith("sqlite://"):
-        raise ValueError("SQLite URLs must use sqlite:///path or sqlite:///:memory:")
+        return value, {}
+    match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", value)
+    if match is None:
+        if "://" in value:
+            raise ArgumentError("Could not parse SQLAlchemy URL from given URL string")
+        return value, {}
+    scheme = match.group(1).lower()
+    dialect, separator, driver = scheme.partition("+")
+    if dialect not in _DIALECTS:
+        _load_unknown_dialect(scheme)
+    if dialect != "sqlite":
+        # Known dialect without an installed/known driver fails the same way
+        # SQLAlchemy does when its DBAPI module is missing.
+        driver_name = driver if separator and driver else _DEFAULT_DRIVERS[dialect]
+        if (
+            separator
+            and dialect in {"postgresql", "mysql"}
+            and driver_name
+            not in {
+                "psycopg",
+                "psycopg2",
+                "mysqldb",
+                "pymysql",
+                "mysqlconnector",
+            }
+        ):
+            _load_unknown_dialect(scheme)
+        _load_unimplemented_dialect(driver_name)
+    if separator and driver != "pysqlite":
+        _load_unknown_dialect(scheme)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise ArgumentError("Could not parse SQLAlchemy URL from given URL string") from error
+    if parsed.netloc:
+        raise ArgumentError("Could not parse SQLAlchemy URL from given URL string")
+    if parsed.path in {"", "/"}:
+        database = ":memory:"
     else:
-        database = value
-    return Engine(database)
+        raw_path = unquote(parsed.path)
+        database = raw_path[1:] if raw_path.startswith("/") else raw_path
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query:
+        # SQLAlchemy's pysqlite dialect ignores unrecognized URL query
+        # arguments with a warning instead of applying or rejecting them.
+        keys = ", ".join(sorted(query))
+        warnings.warn(
+            f"Ignoring URL query argument(s) {keys}; they are not supported",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return database, {}

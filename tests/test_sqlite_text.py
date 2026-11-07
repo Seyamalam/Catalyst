@@ -139,7 +139,9 @@ def test_close_returns_connection_to_pool() -> None:
 def test_exhausted_pool_raises_sqlalchemy_timeout_class() -> None:
     """Catalyst and SQLAlchemy report pool exhaustion with matching class names."""
     with tempfile.TemporaryDirectory() as directory:
-        engine = catalyst_create_engine(Path(directory) / "exhausted.sqlite")
+        engine = catalyst_create_engine(
+            Path(directory) / "exhausted.sqlite", max_overflow=0, pool_timeout=0
+        )
         connections = [engine.connect() for _ in range(5)]
         try:
             with pytest.raises(CatalystTimeoutError) as catalyst_error:

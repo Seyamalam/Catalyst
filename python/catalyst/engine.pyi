@@ -27,7 +27,7 @@ class CursorResult:
 
 @final
 class Connection:
-    def __init__(self, native: NativeConnection) -> None: ...
+    def __init__(self, native: NativeConnection, *, echo: bool = False) -> None: ...
     def execute(
         self,
         statement: str | TextClause,
@@ -62,7 +62,16 @@ class SavepointTransaction:
 
 @final
 class Engine:
-    def __init__(self, database: str | Path) -> None: ...
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        timeout: float = 5.0,
+        echo: bool = False,
+    ) -> None: ...
     def connect(self) -> Connection: ...
     def begin(self) -> Generator[Connection]: ...
     def dispose(self) -> None: ...
