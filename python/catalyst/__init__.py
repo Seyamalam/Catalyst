@@ -16,6 +16,7 @@ Examples:
 """
 
 from ._catalyst import (
+    ArgumentError,
     CatalystError,
     DatabaseError,
     DBAPIError,
@@ -30,10 +31,11 @@ from ._catalyst import (
     TimeoutError,
     sqlite_text,
 )
-from .engine import Connection, CursorResult, Engine, create_engine
+from .engine import Connection, CursorResult, Engine, TextClause, create_engine, text
 
 __all__ = [
     "CatalystError",
+    "ArgumentError",
     "DBAPIError",
     "DatabaseError",
     "IntegrityError",
@@ -46,6 +48,8 @@ __all__ = [
     "Engine",
     "Connection",
     "CursorResult",
+    "TextClause",
+    "text",
     "create_engine",
     "NativeEngine",
     "NativeConnection",

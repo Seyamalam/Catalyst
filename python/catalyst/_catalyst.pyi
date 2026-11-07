@@ -5,6 +5,7 @@ from typing import final
 __all__ = [
     "SQLAlchemyError",
     "CatalystError",
+    "ArgumentError",
     "StatementError",
     "DBAPIError",
     "DatabaseError",
@@ -38,7 +39,9 @@ class NativeEngine:
 class NativeConnection:
     """Native SQLite connection checked out from an engine pool."""
 
-    def execute(self, sql: str, parameters: list[object]) -> NativeResult: ...
+    def execute(
+        self, sql: str, parameters: list[object] | dict[str, object], text_mode: bool
+    ) -> NativeResult: ...
     def close(self) -> None: ...
 
 @final
@@ -51,6 +54,9 @@ class NativeResult:
     def rowcount(self) -> int: ...
     def fetchall(self) -> list[tuple[object, ...]]: ...
     def fetchone(self) -> tuple[object, ...] | None: ...
+
+class ArgumentError(CatalystError):
+    """Invalid arguments to a database API call."""
 
 class StatementError(CatalystError):
     """Base class for SQL statement errors."""

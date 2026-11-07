@@ -6,7 +6,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString};
 use rusqlite::{Connection, params_from_iter, types::Value};
 use std::sync::{Mutex, OnceLock};
 
@@ -17,6 +17,13 @@ create_exception!(
     SQLAlchemyError,
     PyException,
     "Root exception class for SQLAlchemy-compatible Catalyst errors."
+);
+
+create_exception!(
+    _catalyst,
+    ArgumentError,
+    SQLAlchemyError,
+    "Raised when arguments to a database API call are invalid."
 );
 
 create_exception!(
@@ -86,7 +93,7 @@ struct NativeResult {
     columns: Vec<String>,
     rows: Vec<Vec<Py<PyAny>>>,
     next_row: usize,
-    rowcount: u64,
+    rowcount: i64,
 }
 
 #[pymethods]
@@ -114,18 +121,49 @@ impl NativeEngine {
 
 #[pymethods]
 impl NativeConnection {
-    /// Execute SQL with a positional parameter batch and buffer rows natively.
+    /// Execute SQL with positional values or a named mapping, buffering rows natively.
     fn execute(
         &self,
         sql: &str,
-        parameters: Vec<Py<PyAny>>,
+        parameters: &Bound<'_, PyAny>,
+        text_mode: bool,
         py: Python<'_>,
     ) -> PyResult<NativeResult> {
-        let values = parameters
-            .iter()
-            .map(|value| python_to_sqlite(value.bind(py)))
-            .collect::<PyResult<Vec<_>>>()?;
-        let sql = sql.to_owned();
+        let named_values = if let Ok(mapping) = parameters.cast::<PyDict>() {
+            Some(
+                mapping
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = key.extract::<String>().map_err(|_| {
+                            StatementError::new_err(
+                                "Mapping keys must be strings for named bind parameters",
+                            )
+                        })?;
+                        Ok((key, python_to_sqlite(&value)?))
+                    })
+                    .collect::<PyResult<std::collections::HashMap<_, _>>>()?,
+            )
+        } else {
+            None
+        };
+        let positional_values = if named_values.is_none() {
+            Some(
+                parameters
+                    .extract::<Vec<Py<PyAny>>>()?
+                    .iter()
+                    .map(|value| python_to_sqlite(value.bind(py)))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        // SQLAlchemy scopes the `\:` literal-colon escape to text() execution;
+        // raw-string positional SQL must not be rewritten.
+        let sql = if text_mode {
+            sql.replace("\\:", ":")
+        } else {
+            sql.to_owned()
+        };
         let connection_guard = self
             .connection
             .lock()
@@ -147,6 +185,31 @@ impl NativeConnection {
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<_>>();
+            let values = if let Some(named) = named_values {
+                let mut ordered = Vec::with_capacity(statement.parameter_count());
+                for index in 1..=statement.parameter_count() {
+                    let name = statement.parameter_name(index).ok_or_else(|| {
+                        ProgrammingError::new_err(
+                            "Named parameters cannot bind anonymous SQLite placeholders",
+                        )
+                    })?;
+                    let key = name.trim_start_matches([':', '@', '$']);
+                    if key.is_empty() || key.starts_with('?') {
+                        return Err(ProgrammingError::new_err(format!(
+                            "Named parameters cannot bind anonymous or numbered placeholder '{name}'"
+                        )));
+                    }
+                    let value = named.get(key).ok_or_else(|| {
+                        StatementError::new_err(format!(
+                            "A value is required for bind parameter '{key}'"
+                        ))
+                    })?;
+                    ordered.push(value.clone());
+                }
+                ordered
+            } else {
+                positional_values.unwrap_or_default()
+            };
             let mut rows = statement
                 .query(params_from_iter(values.iter()))
                 .map_err(map_sqlite_error)?;
@@ -160,7 +223,11 @@ impl NativeConnection {
             }
             drop(rows);
             drop(statement);
-            let rowcount = transaction.changes();
+            let rowcount = if columns.is_empty() {
+                transaction.changes() as i64
+            } else {
+                -1
+            };
             transaction.commit().map_err(map_sqlite_error)?;
             Ok::<_, PyErr>((columns, buffered_rows, rowcount))
         })?;
@@ -204,7 +271,7 @@ impl NativeResult {
     }
 
     #[getter]
-    fn rowcount(&self) -> u64 {
+    fn rowcount(&self) -> i64 {
         self.rowcount
     }
 
@@ -256,6 +323,7 @@ fn sqlite_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("SQLAlchemyError", module.py().get_type::<SQLAlchemyError>())?;
     module.add("CatalystError", module.py().get_type::<SQLAlchemyError>())?;
+    module.add("ArgumentError", module.py().get_type::<ArgumentError>())?;
     module.add("StatementError", module.py().get_type::<StatementError>())?;
     module.add("DBAPIError", module.py().get_type::<DBAPIError>())?;
     module.add("DatabaseError", module.py().get_type::<DatabaseError>())?;
@@ -278,6 +346,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         [
             "SQLAlchemyError",
             "CatalystError",
+            "ArgumentError",
             "StatementError",
             "DBAPIError",
             "DatabaseError",

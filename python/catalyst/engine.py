@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._catalyst import NativeConnection, NativeEngine, NativeResult
+from ._catalyst import ArgumentError, NativeConnection, NativeEngine, NativeResult
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TextClause:
+    """A SQL text statement suitable for execution with named parameters."""
+
+    text: str
+
+    def __repr__(self) -> str:
+        return f"TextClause({self.text!r})"
 
 
 class CursorResult:
@@ -50,11 +61,33 @@ class Connection:
         self._native = native
         self._closed = False
 
-    def execute(self, statement: str, parameters: Sequence[object] = ()) -> CursorResult:
-        """Execute SQL with one positional parameter batch."""
+    def execute(
+        self,
+        statement: str | TextClause,
+        parameters: Sequence[object] | Mapping[str, object] | None = None,
+    ) -> CursorResult:
+        """Execute SQL with positional values or a mapping for named binds."""
         if self._closed:
             raise RuntimeError("Connection is closed")
-        return CursorResult(self._native.execute(statement, list(parameters)))
+        if isinstance(statement, TextClause):
+            sql = statement.text
+            if parameters is not None and not isinstance(parameters, Mapping):
+                raise ArgumentError("List argument must consist only of dictionaries")
+            bindings: Sequence[object] | Mapping[str, object] = (
+                {} if parameters is None else parameters
+            )
+        else:
+            sql = statement
+            if parameters is not None and isinstance(parameters, Mapping):
+                raise ArgumentError("Mapping is only supported with text() statements")
+            bindings = () if parameters is None else parameters
+        if isinstance(bindings, Mapping):
+            native_parameters: dict[str, object] | list[object] = dict(bindings)
+        else:
+            native_parameters = list(bindings)
+        return CursorResult(
+            self._native.execute(sql, native_parameters, isinstance(statement, TextClause))
+        )
 
     def close(self) -> None:
         """Release this logical connection handle."""
@@ -109,6 +142,11 @@ class Engine:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.dispose()
+
+
+def text(sql: str) -> TextClause:
+    """Construct a SQL text statement for execution with named parameters."""
+    return TextClause(sql)
 
 
 def create_engine(url: str | Path, **options: Any) -> Engine:
