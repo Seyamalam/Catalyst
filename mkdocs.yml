@@ -1,0 +1,37 @@
+site_name: Catalyst
+site_description: Rust-backed ORM and SQL toolkit for Python
+site_url: https://example.invalid/catalyst/
+repo_name: catalyst
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Development: development.md
+  - Decisions:
+      - Driver selection: decisions/0001-driver-selection.md
+      - Documentation tooling: decisions/0002-documentation-tooling.md
+  - Parity:
+      - Overview: parity/index.md
+      - Core: parity/core.md
+      - ORM: parity/orm.md
+      - Session: parity/session.md
+      - Async: parity/async.md
+      - Dialects: parity/dialects.md
+      - Types: parity/types.md
+      - Events: parity/events.md
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+
+plugins:
+  - search
+  - mermaid2
+
+theme:
+  name: material

@@ -39,8 +39,7 @@ def test_exception_subclass_relationships_match_sqlalchemy() -> None:
         (OperationalError, sqlalchemy_exc.OperationalError),
     ]
     actual_by_sqlalchemy = {expected: actual for actual, expected in pairs}
-    # SQLAlchemyError mixes in HasDescriptionCode; Catalyst currently mirrors the
-    # SQLAlchemyError name but not that non-exception mixin's direct inheritance.
+    # SQLAlchemy's SQLAlchemyError also has HasDescriptionCode as a direct base.
     assert issubclass(SQLAlchemyError, Exception)
     for actual, expected in pairs[1:]:
         expected_bases = tuple(actual_by_sqlalchemy.get(base, base) for base in expected.__bases__)
