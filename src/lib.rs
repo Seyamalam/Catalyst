@@ -145,27 +145,17 @@ fn sqlite_text(
                     .map(|value| {
                         Ok(match value {
                             Value::Null => py.None(),
-                            Value::Integer(value) => value
-                                .into_pyobject(py)
-                                .unwrap()
-                                .to_owned()
-                                .unbind()
-                                .into_any(),
-                            Value::Real(value) => value
-                                .into_pyobject(py)
-                                .unwrap()
-                                .to_owned()
-                                .unbind()
-                                .into_any(),
-                            Value::Text(value) => value
-                                .into_pyobject(py)
-                                .unwrap()
-                                .to_owned()
-                                .unbind()
-                                .into_any(),
+                            Value::Integer(value) => {
+                                value.into_pyobject(py)?.to_owned().unbind().into_any()
+                            }
+                            Value::Real(value) => {
+                                value.into_pyobject(py)?.to_owned().unbind().into_any()
+                            }
+                            Value::Text(value) => {
+                                value.into_pyobject(py)?.to_owned().unbind().into_any()
+                            }
                             Value::Blob(value) => PyBytes::new(py, &value)
-                                .into_pyobject(py)
-                                .unwrap()
+                                .into_pyobject(py)?
                                 .to_owned()
                                 .unbind()
                                 .into_any(),
@@ -204,12 +194,8 @@ fn map_sqlite_error(error: rusqlite::Error) -> PyErr {
         rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::ConstraintViolation => {
             IntegrityError::new_err(error.to_string())
         }
-        rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::Unknown => {
-            OperationalError::new_err(error.to_string())
-        }
-        rusqlite::Error::SqliteFailure(_, _)
-        | rusqlite::Error::InvalidParameterName(_)
-        | rusqlite::Error::InvalidParameterCount(_, _) => {
+        rusqlite::Error::SqliteFailure(_, _) => OperationalError::new_err(error.to_string()),
+        rusqlite::Error::InvalidParameterName(_) | rusqlite::Error::InvalidParameterCount(_, _) => {
             ProgrammingError::new_err(error.to_string())
         }
         _ => DatabaseError::new_err(error.to_string()),

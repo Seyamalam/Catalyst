@@ -25,7 +25,7 @@ def test_binding_mismatch_raises_matching_programming_error() -> None:
         sqlite_text("SELECT ?", [])
     with pytest.raises(SAProgrammingError):
         with create_engine("sqlite://").connect() as connection:
-            connection.execute(text("SELECT ?"), [])
+            connection.exec_driver_sql("SELECT ?", ())
 
     assert type(catalyst_error.value).__name__ == SAProgrammingError.__name__
 
@@ -38,10 +38,13 @@ def test_unsupported_parameter_type_is_rejected_before_execution() -> None:
 
 def test_integrity_error_maps_to_matching_exception() -> None:
     """SQLite constraint errors map to SQLAlchemy's IntegrityError class name."""
-    sqlite_text("CREATE TABLE test (value INTEGER UNIQUE)", [])
-    sqlite_text("INSERT INTO test VALUES (1)", [])
+    import uuid
+
+    table_name = f"test_{uuid.uuid4().hex}"
+    sqlite_text(f"CREATE TABLE {table_name} (value INTEGER UNIQUE)", [])
+    sqlite_text(f"INSERT INTO {table_name} VALUES (1)", [])
     with pytest.raises(IntegrityError) as catalyst_error:
-        sqlite_text("INSERT INTO test VALUES (1)", [])
+        sqlite_text(f"INSERT INTO {table_name} VALUES (1)", [])
 
     with pytest.raises(SAIntegrityError):
         with create_engine("sqlite://").begin() as connection:
