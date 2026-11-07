@@ -2,6 +2,6 @@
 
 | SQLAlchemy feature | Status | Proving test | Notes |
 | --- | --- | --- | --- |
-| SQLite compilation and execution | not started | — | Driver/compiler not implemented; `rusqlite` selected by ADR 0001. |
+| SQLite positional text execution | partial | `tests/test_sqlite_text.py` | A foundation helper uses rusqlite; no dialect compiler or engine/pool API exists. |
 | PostgreSQL dialect and execution | not started | — | Driver selection ADR pending. |
 | MySQL dialect and execution | not started | — | Driver selection ADR pending. |

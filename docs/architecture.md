@@ -63,4 +63,4 @@ stateDiagram-v2
 
 ## Current implementation
 
-The native extension currently defines a SQLAlchemy-style exception hierarchy for the supported DBAPI error family. The SQLite engine, pool, text execution, hydration, and async APIs are not yet implemented. Update this section alongside verified code changes.
+The native extension defines a SQLAlchemy-style exception hierarchy and a foundation `sqlite_text` helper. The helper executes SQL with a positional parameter batch against a process-local SQLite connection and returns rows in bulk. A public engine API, pool, query AST/dialect compiler, and async APIs are not yet implemented. Update this section alongside verified code changes.
