@@ -6,7 +6,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
-from ._catalyst import NativeEngine, NativeResult
+from ._catalyst import NativeConnection, NativeEngine, NativeResult
 
 
 class CursorResult:
@@ -46,7 +46,7 @@ class CursorResult:
 class Connection:
     """A checked-out synchronous connection backed by Rust SQLite."""
 
-    def __init__(self, native: NativeEngine) -> None:
+    def __init__(self, native: NativeConnection) -> None:
         self._native = native
         self._closed = False
 
@@ -58,7 +58,9 @@ class Connection:
 
     def close(self) -> None:
         """Release this logical connection handle."""
-        self._closed = True
+        if not self._closed:
+            self._native.close()
+            self._closed = True
 
     def __enter__(self) -> Connection:
         if self._closed:
@@ -92,7 +94,7 @@ class Engine:
         """Return a logical connection handle."""
         if self._disposed:
             raise RuntimeError("Engine is disposed")
-        return Connection(self._native)
+        return Connection(self._native.connect())
 
     def dispose(self) -> None:
         """Close the native database connection; repeated calls are safe."""

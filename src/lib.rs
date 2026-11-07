@@ -1,5 +1,7 @@
 #![deny(clippy::all, unsafe_code)]
 
+mod pool;
+
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::PyTypeError;
@@ -7,6 +9,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
 use rusqlite::{Connection, params_from_iter, types::Value};
 use std::sync::{Mutex, OnceLock};
+
+use pool::{Pool, PoolError, PooledConnection};
 
 create_exception!(
     _catalyst,
@@ -57,10 +61,23 @@ create_exception!(
     "Raised when a database operation cannot be completed due to a connection issue."
 );
 
-/// A native SQLite engine connection owned by a public Python Engine.
+create_exception!(
+    _catalyst,
+    TimeoutError,
+    SQLAlchemyError,
+    "Raised when a connection pool checkout times out or is exhausted."
+);
+
+/// A native SQLite engine owning a bounded connection pool.
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeEngine {
-    connection: Mutex<Option<Connection>>,
+    pool: Pool,
+}
+
+/// A native connection checked out from a `NativeEngine` pool.
+#[pyclass(module = "catalyst._catalyst")]
+struct NativeConnection {
+    connection: Mutex<Option<PooledConnection>>,
 }
 
 /// A buffered result set hydrated from one native query execution.
@@ -76,21 +93,27 @@ struct NativeResult {
 impl NativeEngine {
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        let connection = if path == ":memory:" {
-            Connection::open_in_memory()
-        } else {
-            Connection::open(path)
-        }
-        .map_err(map_sqlite_error)?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(map_sqlite_error)?;
-
         Ok(Self {
+            pool: Pool::new(path).map_err(map_pool_error)?,
+        })
+    }
+
+    /// Check out one connection from the native pool.
+    fn connect(&self, py: Python<'_>) -> PyResult<NativeConnection> {
+        let connection = py.detach(|| self.pool.checkout()).map_err(map_pool_error)?;
+        Ok(NativeConnection {
             connection: Mutex::new(Some(connection)),
         })
     }
 
+    /// Dispose idle pool connections. Checked-out connections close on return.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.pool.close()).map_err(map_pool_error)
+    }
+}
+
+#[pymethods]
+impl NativeConnection {
     /// Execute SQL with a positional parameter batch and buffer rows natively.
     fn execute(
         &self,
@@ -103,15 +126,20 @@ impl NativeEngine {
             .map(|value| python_to_sqlite(value.bind(py)))
             .collect::<PyResult<Vec<_>>>()?;
         let sql = sql.to_owned();
-        let mut connection = self
+        let connection_guard = self
             .connection
             .lock()
             .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
-        let connection = connection
-            .as_mut()
-            .ok_or_else(|| OperationalError::new_err("Engine is disposed"))?;
+        let checkout = connection_guard
+            .as_ref()
+            .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+        let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        drop(connection_guard);
 
-        let (columns, buffered_rows, rowcount) = py.detach(|| {
+        let (columns, buffered_rows, rowcount) = py.detach(move || {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
             let transaction = connection.transaction().map_err(map_sqlite_error)?;
             let mut statement = transaction.prepare(&sql).map_err(map_sqlite_error)?;
             let columns = statement
@@ -156,17 +184,14 @@ impl NativeEngine {
         })
     }
 
-    /// Close the connection. Repeated calls are safe.
-    fn close(&self) -> PyResult<()> {
-        let mut connection = self
+    /// Return the checked-out connection to the pool. Repeated calls are safe.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let connection = self
             .connection
             .lock()
-            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
-        if let Some(connection) = connection.take() {
-            connection
-                .close()
-                .map_err(|(_, error)| map_sqlite_error(error))?;
-        }
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?
+            .take();
+        py.detach(|| drop(connection));
         Ok(())
     }
 }
@@ -243,7 +268,9 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "OperationalError",
         module.py().get_type::<OperationalError>(),
     )?;
+    module.add("TimeoutError", module.py().get_type::<TimeoutError>())?;
     module.add_class::<NativeEngine>()?;
+    module.add_class::<NativeConnection>()?;
     module.add_class::<NativeResult>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
     module.add(
@@ -257,8 +284,10 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "IntegrityError",
             "ProgrammingError",
             "OperationalError",
+            "TimeoutError",
             "sqlite_text",
             "NativeEngine",
+            "NativeConnection",
             "NativeResult",
         ],
     )?;
@@ -356,6 +385,17 @@ fn python_to_sqlite(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         Err(PyErr::new::<PyTypeError, _>(
             "SQLite parameters must be None, bool, int, float, str, or bytes",
         ))
+    }
+}
+
+fn map_pool_error(error: PoolError) -> PyErr {
+    match error {
+        PoolError::Exhausted => TimeoutError::new_err("SQLite connection pool is exhausted"),
+        PoolError::Closed => OperationalError::new_err("Engine is disposed"),
+        PoolError::Sqlite(error) => map_sqlite_error(error),
+        PoolError::Poisoned => {
+            OperationalError::new_err("SQLite connection pool lock was poisoned")
+        }
     }
 }
 

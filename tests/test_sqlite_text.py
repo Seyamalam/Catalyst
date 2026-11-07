@@ -7,7 +7,11 @@ import pytest
 from catalyst import (
     IntegrityError,
     ProgrammingError,
+    SQLAlchemyError,
     sqlite_text,
+)
+from catalyst import (
+    TimeoutError as CatalystTimeoutError,
 )
 from catalyst import (
     create_engine as catalyst_create_engine,
@@ -15,6 +19,8 @@ from catalyst import (
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlalchemy.exc import ProgrammingError as SAProgrammingError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
+from sqlalchemy.pool import QueuePool
 
 
 def test_parameterized_select_matches_sqlalchemy() -> None:
@@ -66,6 +72,88 @@ def test_engine_database_lifecycle_matches_memory_and_file_sqlite() -> None:
         with reopened.connect() as connection:
             assert connection.execute("SELECT value FROM items").fetchone() == (11,)
         reopened.dispose()
+
+
+def test_file_engine_checks_out_independent_connections() -> None:
+    """Concurrent file checkouts use separate connections and both remain usable."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "pool.sqlite"
+        engine = catalyst_create_engine(path)
+        with engine.connect() as setup:
+            setup.execute("CREATE TABLE items (value INTEGER)")
+
+        first = engine.connect()
+        second = engine.connect()
+        first.execute("CREATE TEMP TABLE local_state (value INTEGER)")
+        second.execute("CREATE TEMP TABLE local_state (value INTEGER)")
+        first.execute("INSERT INTO local_state VALUES (?)", [10])
+        second.execute("INSERT INTO local_state VALUES (?)", [20])
+        first.execute("INSERT INTO items VALUES (?)", [1])
+        second.execute("INSERT INTO items VALUES (?)", [2])
+        assert first.execute("SELECT value FROM local_state").fetchone() == (10,)
+        assert second.execute("SELECT value FROM local_state").fetchone() == (20,)
+        assert first.execute("SELECT value FROM items ORDER BY value").fetchall() == [(1,), (2,)]
+        assert second.execute("SELECT value FROM items ORDER BY value").fetchall() == [(1,), (2,)]
+        first.close()
+        second.close()
+        engine.dispose()
+
+
+def test_memory_engine_shares_schema_and_data_between_connections() -> None:
+    """The in-memory pool is a singleton so each checkout sees the same database."""
+    engine = catalyst_create_engine(":memory:")
+    first = engine.connect()
+    first.execute("CREATE TABLE items (value INTEGER)")
+    first.execute("INSERT INTO items VALUES (?)", [17])
+    second = engine.connect()
+    assert second.execute("SELECT value FROM items").fetchone() == (17,)
+    first.close()
+    second.close()
+    engine.dispose()
+
+
+def test_close_returns_connection_to_pool() -> None:
+    """Closing a file checkout allows a later connection to reuse the slot."""
+    with tempfile.TemporaryDirectory() as directory:
+        engine = catalyst_create_engine(Path(directory) / "pool_return.sqlite")
+        with engine.connect() as first:
+            first.execute("CREATE TABLE items (value INTEGER)")
+            first.execute("CREATE TEMP TABLE marker (value INTEGER)")
+        # A TEMP table is per-connection, so it surviving here proves the same
+        # physical connection was reused rather than a new one being opened.
+        with engine.connect() as returned:
+            assert returned.execute("SELECT COUNT(*) FROM marker").fetchone() == (0,)
+        engine.dispose()
+
+
+def test_exhausted_pool_raises_sqlalchemy_timeout_class() -> None:
+    """Catalyst and SQLAlchemy report pool exhaustion with matching class names."""
+    with tempfile.TemporaryDirectory() as directory:
+        engine = catalyst_create_engine(Path(directory) / "exhausted.sqlite")
+        connections = [engine.connect() for _ in range(5)]
+        try:
+            with pytest.raises(CatalystTimeoutError) as catalyst_error:
+                engine.connect()
+            sqlalchemy_engine = create_engine(
+                "sqlite://",
+                poolclass=QueuePool,
+                pool_size=1,
+                max_overflow=0,
+                pool_timeout=0.01,
+            )
+            sqlalchemy_connections = [sqlalchemy_engine.connect()]
+            try:
+                with pytest.raises(SATimeoutError) as sqlalchemy_error:
+                    sqlalchemy_engine.connect()
+                assert type(catalyst_error.value).__name__ == type(sqlalchemy_error.value).__name__
+                assert isinstance(catalyst_error.value, SQLAlchemyError)
+            finally:
+                sqlalchemy_connections[0].close()
+                sqlalchemy_engine.dispose()
+        finally:
+            for connection in connections:
+                connection.close()
+            engine.dispose()
 
 
 def test_connection_and_engine_reject_use_after_close() -> None:

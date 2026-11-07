@@ -20,12 +20,14 @@ from ._catalyst import (
     DatabaseError,
     DBAPIError,
     IntegrityError,
+    NativeConnection,
     NativeEngine,
     NativeResult,
     OperationalError,
     ProgrammingError,
     SQLAlchemyError,
     StatementError,
+    TimeoutError,
     sqlite_text,
 )
 from .engine import Connection, CursorResult, Engine, create_engine
@@ -38,6 +40,7 @@ __all__ = [
     "OperationalError",
     "ProgrammingError",
     "StatementError",
+    "TimeoutError",
     "SQLAlchemyError",
     "sqlite_text",
     "Engine",
@@ -45,5 +48,6 @@ __all__ = [
     "CursorResult",
     "create_engine",
     "NativeEngine",
+    "NativeConnection",
     "NativeResult",
 ]

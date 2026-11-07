@@ -11,8 +11,10 @@ __all__ = [
     "IntegrityError",
     "ProgrammingError",
     "OperationalError",
+    "TimeoutError",
     "sqlite_text",
     "NativeEngine",
+    "NativeConnection",
     "NativeResult",
 ]
 
@@ -29,6 +31,13 @@ class NativeEngine:
     """Native SQLite engine used by the public Python Engine wrapper."""
 
     def __new__(cls, path: str) -> NativeEngine: ...
+    def connect(self) -> NativeConnection: ...
+    def close(self) -> None: ...
+
+@final
+class NativeConnection:
+    """Native SQLite connection checked out from an engine pool."""
+
     def execute(self, sql: str, parameters: list[object]) -> NativeResult: ...
     def close(self) -> None: ...
 
@@ -60,3 +69,6 @@ class ProgrammingError(DatabaseError):
 
 class OperationalError(DatabaseError):
     """Database operation failure, such as a connection error."""
+
+class TimeoutError(CatalystError):
+    """Connection pool checkout timed out or was exhausted."""
