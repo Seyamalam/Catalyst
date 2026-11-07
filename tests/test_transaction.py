@@ -210,3 +210,146 @@ def test_native_rejects_foreign_savepoint_names() -> None:
         with pytest.raises(InvalidRequestError):
             connection._native.release_savepoint("not_a_real_savepoint")
     engine.dispose()
+
+
+def test_memory_shared_handle_transaction_interleave_matches_sqlalchemy() -> None:
+    """:memory: checkouts serialize on one wire and share transaction boundaries."""
+    catalyst_engine = catalyst_create_engine(":memory:")
+    sqlalchemy_engine = create_engine("sqlite://")
+    for engine, statement in (
+        (catalyst_engine, catalyst_text),
+        (sqlalchemy_engine, text),
+    ):
+        with engine.connect() as setup:
+            setup.execute(statement("CREATE TABLE items (value INTEGER)"))
+            setup.commit()
+
+        # A sibling execute joins an open transaction; sibling commit commits
+        # work done through both logical handles.
+        with engine.connect() as outer:
+            outer.begin()
+            outer.execute(statement("INSERT INTO items VALUES (1)"))
+            with engine.connect() as sibling:
+                sibling.execute(statement("INSERT INTO items VALUES (2)"))
+                sibling.commit()
+            outer.execute(statement("INSERT INTO items VALUES (3)"))
+            outer.commit()
+        with engine.connect() as check:
+            assert check.execute(statement("SELECT value FROM items ORDER BY value")).all() == [
+                (1,),
+                (2,),
+                (3,),
+            ]
+            check.rollback()
+
+        # A sibling rollback also ends the shared root transaction, including
+        # writes made by the outer handle.
+        with engine.connect() as outer:
+            outer.begin()
+            outer.execute(statement("INSERT INTO items VALUES (4)"))
+            with engine.connect() as sibling:
+                sibling.execute(statement("INSERT INTO items VALUES (5)"))
+                sibling.rollback()
+            outer.rollback()
+        with engine.connect() as check:
+            assert check.execute(statement("SELECT value FROM items ORDER BY value")).all() == [
+                (1,),
+                (2,),
+                (3,),
+            ]
+            check.rollback()
+
+        # Savepoint bookkeeping is physical-slot state too: a savepoint opened
+        # through one wrapper can be rolled back through its nested handle.
+        with engine.connect() as outer:
+            outer.begin()
+            outer.execute(statement("INSERT INTO items VALUES (6)"))
+            with engine.connect() as sibling:
+                nested = sibling.begin_nested()
+                sibling.execute(statement("INSERT INTO items VALUES (7)"))
+                nested.rollback()
+                outer.commit()
+        with engine.connect() as check:
+            assert check.execute(statement("SELECT value FROM items ORDER BY value")).all() == [
+                (1,),
+                (2,),
+                (3,),
+                (6,),
+            ]
+            check.rollback()
+
+    catalyst_engine.dispose()
+    sqlalchemy_engine.dispose()
+
+
+def test_file_engine_checkouts_keep_transactions_independent(tmp_path: Path) -> None:
+    path = tmp_path / "independent.sqlite"
+    catalyst_engine = catalyst_create_engine(path, pool_size=2, max_overflow=0)
+    sqlalchemy_engine = create_engine(f"sqlite:///{tmp_path / 'sa-independent.sqlite'}")
+    for engine, statement in (
+        (catalyst_engine, catalyst_text),
+        (sqlalchemy_engine, text),
+    ):
+        with engine.connect() as setup:
+            setup.execute(statement("CREATE TABLE items (value INTEGER)"))
+            setup.commit()
+        with engine.connect() as outer:
+            outer.execute(statement("INSERT INTO items VALUES (1)"))
+            with engine.connect() as sibling:
+                assert sibling.execute(statement("SELECT COUNT(*) FROM items")).fetchone() == (0,)
+                sibling.rollback()
+            outer.rollback()
+    catalyst_engine.dispose()
+    sqlalchemy_engine.dispose()
+
+
+def test_fresh_holder_operations_do_not_end_the_shared_transaction() -> None:
+    """A holder with no own transaction is a no-op, like SQLAlchemy.
+
+    On the shared ``:memory:`` wire, SQLAlchemy only lets a holder that has its
+    own transaction (explicit or autobegin) touch commit/rollback/close.
+    """
+    catalyst_engine = catalyst_create_engine(":memory:")
+    sqlalchemy_engine = create_engine("sqlite://")
+    for engine, statement in (
+        (catalyst_engine, catalyst_text),
+        (sqlalchemy_engine, text),
+    ):
+        with engine.connect() as holder:
+            transaction = holder.begin()
+            holder.execute(statement("CREATE TABLE items (value INTEGER)"))
+            holder.execute(statement("INSERT INTO items VALUES (1)"))
+            # Fresh holder operations must not end the shared transaction.
+            fresh = engine.connect()
+            fresh.commit()
+            fresh.rollback()
+            fresh.close()
+            assert holder.execute(statement("SELECT COUNT(*) FROM items")).fetchone() == (1,)
+            holder.commit()
+            assert holder.execute(statement("SELECT COUNT(*) FROM items")).fetchone() == (1,)
+            transaction = None  # noqa: F841 - transaction already ended by holder commit
+    catalyst_engine.dispose()
+    sqlalchemy_engine.dispose()
+
+
+def test_holder_begin_on_busy_shared_wire_joins_and_close_rolls_back() -> None:
+    """begin() on a busy shared wire joins; its close rolls the shared wire back."""
+    catalyst_engine = catalyst_create_engine(":memory:")
+    sqlalchemy_engine = create_engine("sqlite://")
+    for engine, statement in (
+        (catalyst_engine, catalyst_text),
+        (sqlalchemy_engine, text),
+    ):
+        with engine.connect() as setup:
+            setup.execute(statement("CREATE TABLE items (value INTEGER)"))
+            setup.commit()
+        with engine.connect() as holder:
+            transaction = holder.begin()
+            holder.execute(statement("INSERT INTO items VALUES (1)"))
+            joiner = engine.connect()
+            joiner.begin()  # joins the busy shared wire, like SQLAlchemy
+            joiner.close()  # holder with a transaction: close rolls the wire back
+            assert holder.execute(statement("SELECT COUNT(*) FROM items")).fetchone() == (0,)
+            transaction = None  # noqa: F841 - transaction ended by the joiner's close
+    catalyst_engine.dispose()
+    sqlalchemy_engine.dispose()

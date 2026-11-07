@@ -6,8 +6,8 @@ import logging
 import math
 import re
 import warnings
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -232,6 +232,139 @@ class SavepointTransaction:
         # raising in this path (documented parity difference).
 
 
+class AsyncConnection:
+    """A logical async connection using Tokio for native SQLite work."""
+
+    def __init__(self, native: NativeConnection, *, echo: bool = False) -> None:
+        self._native = native
+        self._closed = False
+        self._echo = echo
+
+    async def execute(
+        self,
+        statement: str | TextClause,
+        parameters: Sequence[object] | Mapping[str, object] | None = None,
+    ) -> CursorResult:
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        if isinstance(statement, TextClause):
+            sql = statement.text
+            if parameters is not None and not isinstance(parameters, Mapping):
+                raise ArgumentError("List argument must consist only of dictionaries")
+            bindings: Sequence[object] | Mapping[str, object] = (
+                {} if parameters is None else parameters
+            )
+        else:
+            sql = statement
+            if parameters is not None and isinstance(parameters, Mapping):
+                raise ArgumentError("Mapping is only supported with text() statements")
+            bindings = () if parameters is None else parameters
+        native_parameters: dict[str, object] | list[object]
+        if isinstance(bindings, Mapping):
+            native_parameters = dict(bindings)
+        else:
+            native_parameters = list(bindings)
+        if self._echo:
+            _logger.info("%s", sql)
+        result = await self._native.async_execute(
+            sql, native_parameters, isinstance(statement, TextClause)
+        )
+        return CursorResult(result)
+
+    async def begin(self) -> None:
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        await self._native.async_transaction("begin")
+
+    async def commit(self) -> None:
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        await self._native.async_transaction("commit")
+
+    async def rollback(self) -> None:
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        await self._native.async_transaction("rollback")
+
+    async def close(self) -> None:
+        if not self._closed:
+            await self._native.async_transaction("close")
+            self._closed = True
+
+    async def __aenter__(self) -> AsyncConnection:
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        await self.close()
+
+
+class _AsyncConnectContext:
+    """Awaitable connection checkout that also supports ``async with``."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+        self._connection: AsyncConnection | None = None
+
+    def __await__(self) -> Any:
+        return self._engine.connect_async().__await__()
+
+    async def __aenter__(self) -> AsyncConnection:
+        self._connection = await self._engine.connect_async()
+        return self._connection
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+
+
+class AsyncEngine:
+    """Async SQLite engine with synchronous driver work isolated on Tokio."""
+
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        timeout: float = 5.0,
+        echo: bool = False,
+    ) -> None:
+        self._native = NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
+        self._echo = echo
+        self._disposed = False
+
+    def connect(self) -> _AsyncConnectContext:
+        """Return an awaitable checkout and async context manager."""
+        return _AsyncConnectContext(self)
+
+    async def connect_async(self) -> AsyncConnection:
+        if self._disposed:
+            raise RuntimeError("Engine is disposed")
+        return AsyncConnection(await self._native.async_connect(), echo=self._echo)
+
+    @asynccontextmanager
+    async def begin(self) -> AsyncGenerator[AsyncConnection, None]:
+        connection = await self.connect_async()
+        try:
+            await connection.begin()
+            yield connection
+        except BaseException:
+            await connection.rollback()
+            raise
+        else:
+            await connection.commit()
+        finally:
+            await connection.close()
+
+    async def dispose(self) -> None:
+        if not self._disposed:
+            await self._native.async_close()
+            self._disposed = True
+
+
 class Engine:
     """A small synchronous SQLite engine facade.
 
@@ -299,19 +432,32 @@ def text(sql: str) -> TextClause:
 
 def create_engine(url: str | Path, **options: Any) -> Engine:
     """Create a synchronous SQLite engine with SQLAlchemy-style URL options."""
+    database, config = _parse_engine_options(url, options, "create_engine")
+    return Engine(database, **config)
+
+
+def create_async_engine(url: str | Path, **options: Any) -> AsyncEngine:
+    """Create an asynchronous SQLite engine backed by Tokio and buffered results."""
+    database, config = _parse_engine_options(url, options, "create_async_engine")
+    return AsyncEngine(database, **config)
+
+
+def _parse_engine_options(
+    url: str | Path, options: Mapping[str, Any], function_name: str
+) -> tuple[str, dict[str, Any]]:
     database, url_options = _parse_database_url(str(url))
     merged: dict[str, Any] = dict(url_options)
     merged.update(options)
     # SQLAlchemy rejects only falsy ``future`` values; truthy strings pass.
     if not merged.pop("future", True):
         raise ArgumentError(
-            "The 'future' parameter passed to create_engine() may only be set to True."
+            f"The 'future' parameter passed to {function_name}() may only be set to True."
         )
     accepted = {"pool_size", "max_overflow", "pool_timeout", "echo", "timeout"}
     unknown = sorted(set(merged) - accepted)
     if unknown:
         names = ", ".join(repr(item) for item in unknown)
-        raise TypeError(f"Invalid argument(s) {names} sent to create_engine()")
+        raise TypeError(f"Invalid argument(s) {names} sent to {function_name}()")
     try:
         pool_size = int(merged.get("pool_size", 5))
         max_overflow = int(merged.get("max_overflow", 10))
@@ -326,14 +472,13 @@ def create_engine(url: str | Path, **options: Any) -> Engine:
     if not (math.isfinite(pool_timeout) and math.isfinite(timeout)):
         raise ArgumentError("Engine timeouts must be finite numbers")
     echo = _asbool(merged.get("echo", False))
-    return Engine(
-        database,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_timeout=pool_timeout,
-        timeout=timeout,
-        echo=echo,
-    )
+    return database, {
+        "pool_size": pool_size,
+        "max_overflow": max_overflow,
+        "pool_timeout": pool_timeout,
+        "timeout": timeout,
+        "echo": echo,
+    }
 
 
 def _asbool(value: object) -> bool:

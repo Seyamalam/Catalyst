@@ -8,9 +8,10 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString};
 use rusqlite::{Connection, params_from_iter, types::Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use pool::{DEFAULT_POOL_SIZE, Pool, PoolError, PooledConnection};
+use pool::{DEFAULT_POOL_SIZE, Pool, PoolError, PooledConnection, TransactionState};
 
 create_exception!(
     _catalyst,
@@ -99,14 +100,11 @@ struct NativeEngine {
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeConnection {
     connection: Mutex<Option<PooledConnection>>,
-    transaction: Mutex<TransactionState>,
-}
-
-#[derive(Default)]
-struct TransactionState {
-    active: bool,
-    savepoints: Vec<String>,
-    next_savepoint: u64,
+    /// Whether THIS checkout object has an open transaction (explicit or
+    /// autobegin). SQLAlchemy scopes wire-level commit/rollback/close to the
+    /// holder's own transaction, so a fresh holder cannot end a sibling's
+    /// shared transaction on the in-memory singleton wire.
+    holder_active: AtomicBool,
 }
 
 /// A buffered result set hydrated from one native query execution.
@@ -150,13 +148,44 @@ impl NativeEngine {
         let connection = py.detach(|| self.pool.checkout()).map_err(map_pool_error)?;
         Ok(NativeConnection {
             connection: Mutex::new(Some(connection)),
-            transaction: Mutex::new(TransactionState::default()),
+            holder_active: AtomicBool::new(false),
         })
     }
 
     /// Dispose idle pool connections. Checked-out connections close on return.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.pool.close()).map_err(map_pool_error)
+    }
+
+    /// Asynchronously check out a connection without blocking the event loop.
+    fn async_connect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let connection = tokio::task::spawn_blocking(move || pool.checkout())
+                .await
+                .map_err(|error| OperationalError::new_err(error.to_string()))?
+                .map_err(map_pool_error)?;
+            Python::attach(|py| {
+                Py::new(
+                    py,
+                    NativeConnection {
+                        connection: Mutex::new(Some(connection)),
+                        holder_active: AtomicBool::new(false),
+                    },
+                )
+            })
+        })
+    }
+
+    /// Asynchronously dispose the pool on Tokio's blocking executor.
+    fn async_close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || pool.close())
+                .await
+                .map_err(|error| OperationalError::new_err(error.to_string()))?
+                .map_err(map_pool_error)
+        })
     }
 }
 
@@ -174,15 +203,21 @@ impl NativeConnection {
             .as_ref()
             .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
         let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        let transaction = checkout.transaction_handle().map_err(map_pool_error)?;
         drop(connection_guard);
         py.detach(move || {
-            let mut state = self
-                .transaction
+            let mut state = transaction
                 .lock()
                 .map_err(|_| OperationalError::new_err("Transaction state lock was poisoned"))?;
             let connection = connection
                 .lock()
                 .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+            if connection.is_autocommit() {
+                state.active = false;
+                state.savepoints.clear();
+            } else {
+                state.active = true;
+            }
             operation(&connection, &mut state)
         })
     }
@@ -275,9 +310,10 @@ impl NativeConnection {
             .as_ref()
             .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
         let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        let transaction_state = checkout.transaction_handle().map_err(map_pool_error)?;
+        let holder_active = &self.holder_active;
         drop(connection_guard);
 
-        let transaction_state = &self.transaction;
         let (columns, buffered_rows, rowcount) = py.detach(move || {
             let mut state = transaction_state
                 .lock()
@@ -285,10 +321,16 @@ impl NativeConnection {
             let connection = connection
                 .lock()
                 .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
-            if !state.active {
+            if connection.is_autocommit() {
+                state.active = false;
+                state.savepoints.clear();
                 connection.execute_batch("BEGIN").map_err(map_sqlite_error)?;
                 state.active = true;
+            } else {
+                // Another checkout may have opened the transaction on this shared wire.
+                state.active = true;
             }
+            holder_active.store(true, Ordering::Release);
             let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
             let columns = statement
                 .column_names()
@@ -367,45 +409,105 @@ impl NativeConnection {
         })
     }
 
-    /// Start an explicit root transaction unless execution already autobegan one.
+    /// Execute a statement in a Tokio blocking task and return its buffered result.
+    fn async_execute<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        sql: String,
+        parameters: Py<PyAny>,
+        text_mode: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let connection = slf.borrow(py);
+                    let result = connection.execute(&sql, parameters.bind(py), text_mode, py)?;
+                    Py::new(py, result)
+                })
+            })
+            .await
+            .map_err(|error| OperationalError::new_err(error.to_string()))?
+        })
+    }
+
+    /// Run transaction control in a Tokio blocking task.
+    fn async_transaction<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        operation: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let operation = operation.to_owned();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let connection = slf.borrow(py);
+                    match operation.as_str() {
+                        "begin" => connection.begin(py),
+                        "commit" => connection.commit(py),
+                        "rollback" => connection.rollback(py),
+                        "close" => connection.close(py),
+                        _ => Err(InvalidRequestError::new_err("Unknown async operation")),
+                    }
+                })
+            })
+            .await
+            .map_err(|error| OperationalError::new_err(error.to_string()))?
+        })
+    }
+
+    /// Start an explicit root transaction for this holder unless it has one.
     fn begin(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_transaction(py, |connection, state| {
-            if state.active {
+        let holder_active = &self.holder_active;
+        self.with_transaction(py, move |connection, state| {
+            if holder_active.load(Ordering::Acquire) {
                 return Err(InvalidRequestError::new_err(
                     "This connection already has an active transaction",
                 ));
             }
-            connection
-                .execute_batch("BEGIN")
-                .map_err(map_sqlite_error)?;
-            state.active = true;
+            if connection.is_autocommit() {
+                connection
+                    .execute_batch("BEGIN")
+                    .map_err(map_sqlite_error)?;
+                state.active = true;
+            }
+            // On a shared busy wire the holder joins the open transaction,
+            // matching SQLAlchemy's begin() on the shared sqlite :memory: wire.
+            holder_active.store(true, Ordering::Release);
             Ok(())
         })
     }
 
-    /// Commit the current root or implicit transaction. No active transaction is a no-op.
+    /// Commit this holder's transaction; a fresh holder is a no-op like SQLAlchemy.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_transaction(py, |connection, state| {
-            if state.active {
-                connection
-                    .execute_batch("COMMIT")
-                    .map_err(map_sqlite_error)?;
+        let holder_active = &self.holder_active;
+        self.with_transaction(py, move |connection, state| {
+            if holder_active.load(Ordering::Acquire) {
+                if !connection.is_autocommit() {
+                    connection
+                        .execute_batch("COMMIT")
+                        .map_err(map_sqlite_error)?;
+                }
                 state.active = false;
                 state.savepoints.clear();
+                holder_active.store(false, Ordering::Release);
             }
             Ok(())
         })
     }
 
-    /// Roll back the current root or implicit transaction. No active transaction is a no-op.
+    /// Roll back this holder's transaction; a fresh holder is a no-op like SQLAlchemy.
     fn rollback(&self, py: Python<'_>) -> PyResult<()> {
-        self.with_transaction(py, |connection, state| {
-            if state.active {
-                connection
-                    .execute_batch("ROLLBACK")
-                    .map_err(map_sqlite_error)?;
+        let holder_active = &self.holder_active;
+        self.with_transaction(py, move |connection, state| {
+            if holder_active.load(Ordering::Acquire) {
+                if !connection.is_autocommit() {
+                    connection
+                        .execute_batch("ROLLBACK")
+                        .map_err(map_sqlite_error)?;
+                }
                 state.active = false;
                 state.savepoints.clear();
+                holder_active.store(false, Ordering::Release);
             }
             Ok(())
         })
@@ -413,19 +515,23 @@ impl NativeConnection {
 
     /// Create a uniquely named SQLite savepoint, autobeginning a root if needed.
     fn begin_savepoint(&self, py: Python<'_>) -> PyResult<String> {
-        self.with_transaction(py, |connection, state| {
-            if !state.active {
+        let holder_active = &self.holder_active;
+        self.with_transaction(py, move |connection, state| {
+            if connection.is_autocommit() {
+                state.active = false;
+                state.savepoints.clear();
                 connection
                     .execute_batch("BEGIN")
                     .map_err(map_sqlite_error)?;
-                state.active = true;
             }
+            state.active = true;
             let name = format!("catalyst_sp_{}", state.next_savepoint);
             state.next_savepoint += 1;
             connection
                 .execute_batch(&format!("SAVEPOINT {name}"))
                 .map_err(map_sqlite_error)?;
             state.savepoints.push(name.clone());
+            holder_active.store(true, Ordering::Release);
             Ok(name)
         })
     }
@@ -440,12 +546,9 @@ impl NativeConnection {
         self.finish_savepoint(name, true, py)
     }
 
-    /// Whether a transaction is open on this connection.
+    /// Whether this holder has an open transaction (explicit or autobegin).
     fn is_active(&self) -> bool {
-        self.transaction
-            .lock()
-            .map(|state| state.active)
-            .unwrap_or(false)
+        self.holder_active.load(Ordering::Acquire)
     }
 
     /// Return the checked-out connection to the pool, rolling back first if needed.
@@ -536,6 +639,9 @@ fn sqlite_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 /// The native extension module for Catalyst.
 #[pymodule]
 fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    pyo3_async_runtimes::tokio::init(runtime_builder);
     module.add("SQLAlchemyError", module.py().get_type::<SQLAlchemyError>())?;
     module.add("CatalystError", module.py().get_type::<SQLAlchemyError>())?;
     module.add("ArgumentError", module.py().get_type::<ArgumentError>())?;

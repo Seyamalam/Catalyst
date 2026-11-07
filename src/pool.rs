@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 pub(crate) const DEFAULT_POOL_SIZE: usize = 5;
 
 struct PoolState {
-    idle: Vec<Arc<Mutex<Connection>>>,
-    memory_connection: Option<Arc<Mutex<Connection>>>,
+    idle: Vec<PoolSlot>,
+    memory_slot: Option<PoolSlot>,
     total: usize,
     closed: bool,
 }
@@ -23,14 +23,28 @@ struct PoolInner {
     available: Condvar,
 }
 
+/// Transaction bookkeeping belongs to the physical pool slot, not a Python checkout.
+#[derive(Default)]
+pub(crate) struct TransactionState {
+    pub(crate) active: bool,
+    pub(crate) savepoints: Vec<String>,
+    pub(crate) next_savepoint: u64,
+}
+
+struct PoolSlot {
+    connection: Arc<Mutex<Connection>>,
+    transaction: Arc<Mutex<TransactionState>>,
+}
+
 /// A bounded SQLite connection pool. In-memory engines intentionally use one connection.
+#[derive(Clone)]
 pub(crate) struct Pool {
     inner: Arc<PoolInner>,
 }
 
 /// An exclusive checkout. Dropping it returns the connection to its pool.
 pub(crate) struct PooledConnection {
-    connection: Option<Arc<Mutex<Connection>>>,
+    slot: Option<PoolSlot>,
     pool: Arc<PoolInner>,
     shared: bool,
 }
@@ -62,19 +76,18 @@ impl Pool {
         timeout: Duration,
         sqlite_timeout: Duration,
     ) -> Result<Self, PoolError> {
-        let memory_connection = if path == ":memory:" {
-            Some(Arc::new(Mutex::new(
-                Connection::open_in_memory().map_err(PoolError::Sqlite)?,
-            )))
+        let memory_slot = if path == ":memory:" {
+            Some(PoolSlot {
+                connection: Arc::new(Mutex::new(
+                    Connection::open_in_memory().map_err(PoolError::Sqlite)?,
+                )),
+                transaction: Arc::new(Mutex::new(TransactionState::default())),
+            })
         } else {
             None
         };
-        let pool_size = if memory_connection.is_some() {
-            1
-        } else {
-            pool_size
-        };
-        let max_overflow = if memory_connection.is_some() {
+        let pool_size = if memory_slot.is_some() { 1 } else { pool_size };
+        let max_overflow = if memory_slot.is_some() {
             0
         } else {
             max_overflow
@@ -89,7 +102,7 @@ impl Pool {
                 available: Condvar::new(),
                 state: Mutex::new(PoolState {
                     idle: Vec::new(),
-                    memory_connection,
+                    memory_slot,
                     total: 0,
                     closed: false,
                 }),
@@ -104,16 +117,19 @@ impl Pool {
             if state.closed {
                 return Err(PoolError::Closed);
             }
-            if let Some(connection) = &state.memory_connection {
+            if let Some(slot) = &state.memory_slot {
                 return Ok(PooledConnection {
-                    connection: Some(Arc::clone(connection)),
+                    slot: Some(PoolSlot {
+                        connection: Arc::clone(&slot.connection),
+                        transaction: Arc::clone(&slot.transaction),
+                    }),
                     pool: Arc::clone(&self.inner),
                     shared: true,
                 });
             }
-            if let Some(connection) = state.idle.pop() {
+            if let Some(slot) = state.idle.pop() {
                 return Ok(PooledConnection {
-                    connection: Some(connection),
+                    slot: Some(slot),
                     pool: Arc::clone(&self.inner),
                     shared: false,
                 });
@@ -150,7 +166,10 @@ impl Pool {
         })();
         match opened {
             Ok(connection) => Ok(PooledConnection {
-                connection: Some(Arc::new(Mutex::new(connection))),
+                slot: Some(PoolSlot {
+                    connection: Arc::new(Mutex::new(connection)),
+                    transaction: Arc::new(Mutex::new(TransactionState::default())),
+                }),
                 pool: Arc::clone(&self.inner),
                 shared: false,
             }),
@@ -169,7 +188,7 @@ impl Pool {
         state.closed = true;
         state.total = state.total.saturating_sub(state.idle.len());
         state.idle.clear();
-        state.memory_connection.take();
+        state.memory_slot.take();
         self.inner.available.notify_all();
         Ok(())
     }
@@ -177,34 +196,54 @@ impl Pool {
 
 impl PooledConnection {
     pub(crate) fn connection_handle(&self) -> Result<Arc<Mutex<Connection>>, PoolError> {
-        self.connection.as_ref().cloned().ok_or(PoolError::Closed)
+        self.slot
+            .as_ref()
+            .map(|slot| Arc::clone(&slot.connection))
+            .ok_or(PoolError::Closed)
+    }
+
+    pub(crate) fn transaction_handle(&self) -> Result<Arc<Mutex<TransactionState>>, PoolError> {
+        self.slot
+            .as_ref()
+            .map(|slot| Arc::clone(&slot.transaction))
+            .ok_or(PoolError::Closed)
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        let Some(connection) = self.connection.take() else {
+        let Some(slot) = self.slot.take() else {
             return;
         };
         if self.shared {
+            // The in-memory singleton is shared by every holder; a single
+            // holder returning must not roll back transactions other holders
+            // opened (SQLAlchemy's SingletonThreadPool behaves the same).
             return;
         }
         // Reset-on-return: roll back any transaction the previous holder left
-        // open so no dirty state survives the checkout boundary. This must live
-        // here (not on the pyobject) because holders may be dropped without
-        // calling close(); the pool slot is the single source of truth.
-        if let Ok(guard) = connection.lock()
-            && !guard.is_autocommit()
-        {
-            let _ = guard.execute_batch("ROLLBACK");
+        // open so no dirty state survives the checkout boundary. Acquire locks
+        // in the same transaction-then-connection order as native operations.
+        if let Ok(mut transaction) = slot.transaction.lock() {
+            if let Ok(guard) = slot.connection.lock()
+                && !guard.is_autocommit()
+            {
+                let _ = guard.execute_batch("ROLLBACK");
+            }
+            transaction.active = false;
+            transaction.savepoints.clear();
         }
+        let connection = slot.connection;
         let Ok(mut state) = self.pool.state.lock() else {
             return;
         };
         if state.closed || state.total > self.pool.pool_size {
             state.total = state.total.saturating_sub(1);
         } else {
-            state.idle.push(connection);
+            state.idle.push(PoolSlot {
+                connection,
+                transaction: slot.transaction,
+            });
         }
         self.pool.available.notify_one();
     }
@@ -244,9 +283,25 @@ mod tests {
                 "CREATE TEMP TABLE marker (value INTEGER); INSERT INTO marker VALUES (7)",
             )
             .expect("create temp table");
+        // Leave an open transaction on the slot; reset-on-return must roll the
+        // wire back and clear the bookkeeping so the next checkout is clean.
+        reused
+            .connection_handle()
+            .expect("connection")
+            .lock()
+            .expect("connection lock")
+            .execute_batch("BEGIN")
+            .expect("begin transaction");
         drop(reused);
 
         let second = pool.checkout().expect("checkout after return");
+        second
+            .connection_handle()
+            .expect("connection")
+            .lock()
+            .expect("connection lock")
+            .execute_batch("BEGIN")
+            .expect("wire was reset on return; a fresh BEGIN must succeed");
         let value: i64 = second
             .connection_handle()
             .expect("connection")

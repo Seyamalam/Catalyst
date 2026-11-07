@@ -4,6 +4,9 @@ All notable changes to Catalyst are recorded here.
 
 ## Unreleased
 
+- Add a Tokio-backed SQLite async engine skeleton (`create_async_engine`, async connection execution/transactions, context managers, and disposal). Async results reuse the natively buffered `CursorResult`; no async streaming or full SQLAlchemy async parity is claimed.
+- Store transaction/savepoint bookkeeping on physical pool slots, aligning serialized SQLite `:memory:` checkout interleaving and shared commit/rollback behavior with SQLAlchemy; retain independent file connections and add async checkout exhaustion coverage.
+
 - Bootstrap the Rust workspace and Python package metadata for PyO3/maturin with the Python 3.10 stable ABI.
 - Add a tested SQLAlchemy-style native exception hierarchy, Python API, and stubs.
 - Add a foundation rusqlite-backed positional `sqlite_text` helper with bulk result conversion and parity tests.
