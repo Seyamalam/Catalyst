@@ -1,5 +1,7 @@
 """Type information for Catalyst's native extension."""
 
+from typing import final
+
 __all__ = [
     "SQLAlchemyError",
     "CatalystError",
@@ -10,6 +12,8 @@ __all__ = [
     "ProgrammingError",
     "OperationalError",
     "sqlite_text",
+    "NativeEngine",
+    "NativeResult",
 ]
 
 class SQLAlchemyError(Exception):
@@ -19,6 +23,25 @@ CatalystError = SQLAlchemyError
 
 def sqlite_text(sql: str, parameters: list[object]) -> list[list[object]]:
     """Execute parameterized SQL on Catalyst's persistent process-local SQLite database."""
+
+@final
+class NativeEngine:
+    """Native SQLite engine used by the public Python Engine wrapper."""
+
+    def __new__(cls, path: str) -> NativeEngine: ...
+    def execute(self, sql: str, parameters: list[object]) -> NativeResult: ...
+    def close(self) -> None: ...
+
+@final
+class NativeResult:
+    """Buffered results from native execution."""
+
+    @property
+    def keys(self) -> list[str]: ...
+    @property
+    def rowcount(self) -> int: ...
+    def fetchall(self) -> list[tuple[object, ...]]: ...
+    def fetchone(self) -> tuple[object, ...] | None: ...
 
 class StatementError(CatalystError):
     """Base class for SQL statement errors."""

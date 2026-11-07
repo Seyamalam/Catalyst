@@ -57,6 +57,175 @@ create_exception!(
     "Raised when a database operation cannot be completed due to a connection issue."
 );
 
+/// A native SQLite engine connection owned by a public Python Engine.
+#[pyclass(module = "catalyst._catalyst")]
+struct NativeEngine {
+    connection: Mutex<Option<Connection>>,
+}
+
+/// A buffered result set hydrated from one native query execution.
+#[pyclass(module = "catalyst._catalyst")]
+struct NativeResult {
+    columns: Vec<String>,
+    rows: Vec<Vec<Py<PyAny>>>,
+    next_row: usize,
+    rowcount: u64,
+}
+
+#[pymethods]
+impl NativeEngine {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        let connection = if path == ":memory:" {
+            Connection::open_in_memory()
+        } else {
+            Connection::open(path)
+        }
+        .map_err(map_sqlite_error)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(map_sqlite_error)?;
+
+        Ok(Self {
+            connection: Mutex::new(Some(connection)),
+        })
+    }
+
+    /// Execute SQL with a positional parameter batch and buffer rows natively.
+    fn execute(
+        &self,
+        sql: &str,
+        parameters: Vec<Py<PyAny>>,
+        py: Python<'_>,
+    ) -> PyResult<NativeResult> {
+        let values = parameters
+            .iter()
+            .map(|value| python_to_sqlite(value.bind(py)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let sql = sql.to_owned();
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+        let connection = connection
+            .as_mut()
+            .ok_or_else(|| OperationalError::new_err("Engine is disposed"))?;
+
+        let (columns, buffered_rows, rowcount) = py.detach(|| {
+            let transaction = connection.transaction().map_err(map_sqlite_error)?;
+            let mut statement = transaction.prepare(&sql).map_err(map_sqlite_error)?;
+            let columns = statement
+                .column_names()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>();
+            let mut rows = statement
+                .query(params_from_iter(values.iter()))
+                .map_err(map_sqlite_error)?;
+            let mut buffered_rows = Vec::new();
+            while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+                let mut result = Vec::with_capacity(columns.len());
+                for index in 0..columns.len() {
+                    result.push(row.get::<_, Value>(index).map_err(map_sqlite_error)?);
+                }
+                buffered_rows.push(result);
+            }
+            drop(rows);
+            drop(statement);
+            let rowcount = transaction.changes();
+            transaction.commit().map_err(map_sqlite_error)?;
+            Ok::<_, PyErr>((columns, buffered_rows, rowcount))
+        })?;
+
+        let rows = Python::attach(|py| {
+            buffered_rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|value| sqlite_to_python(py, value))
+                        .collect::<PyResult<Vec<_>>>()
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })?;
+
+        Ok(NativeResult {
+            columns,
+            rows,
+            next_row: 0,
+            rowcount,
+        })
+    }
+
+    /// Close the connection. Repeated calls are safe.
+    fn close(&self) -> PyResult<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+        if let Some(connection) = connection.take() {
+            connection
+                .close()
+                .map_err(|(_, error)| map_sqlite_error(error))?;
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl NativeResult {
+    #[getter]
+    fn keys(&self) -> Vec<String> {
+        self.columns.clone()
+    }
+
+    #[getter]
+    fn rowcount(&self) -> u64 {
+        self.rowcount
+    }
+
+    /// Return all remaining rows as a batch.
+    fn fetchall(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let rows = self.rows[self.next_row..]
+            .iter()
+            .map(|row| row.iter().map(|value| value.clone_ref(py)).collect())
+            .collect::<Vec<Vec<_>>>();
+        self.next_row = self.rows.len();
+        rows.into_iter().map(row_to_python_tuple).collect()
+    }
+
+    /// Return the next row, if present.
+    fn fetchone(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if self.next_row == self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.next_row]
+            .iter()
+            .map(|value| value.clone_ref(py))
+            .collect();
+        self.next_row += 1;
+        Ok(Some(row_to_python_tuple(row)?))
+    }
+}
+
+fn row_to_python_tuple(row: Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| Ok(pyo3::types::PyTuple::new(py, row)?.into_any().unbind()))
+}
+
+/// Convert a SQLite value into a Python-owned object.
+fn sqlite_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
+    Ok(match value {
+        Value::Null => py.None(),
+        Value::Integer(value) => value.into_pyobject(py)?.to_owned().unbind().into_any(),
+        Value::Real(value) => value.into_pyobject(py)?.to_owned().unbind().into_any(),
+        Value::Text(value) => value.into_pyobject(py)?.to_owned().unbind().into_any(),
+        Value::Blob(value) => PyBytes::new(py, &value)
+            .into_pyobject(py)?
+            .to_owned()
+            .unbind()
+            .into_any(),
+    })
+}
+
 /// The native extension module for Catalyst.
 #[pymodule]
 fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -74,6 +243,8 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "OperationalError",
         module.py().get_type::<OperationalError>(),
     )?;
+    module.add_class::<NativeEngine>()?;
+    module.add_class::<NativeResult>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
     module.add(
         "__all__",
@@ -87,16 +258,17 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "ProgrammingError",
             "OperationalError",
             "sqlite_text",
+            "NativeEngine",
+            "NativeResult",
         ],
     )?;
     Ok(())
 }
 
-/// Execute one parameterized SQL statement against an in-memory SQLite database.
+/// Execute one parameterized statement against the process-local SQLite database.
 ///
-/// This foundation helper exists to validate parameter binding before the public
-/// engine and `text()` APIs land. The complete SQL statement and parameter batch
-/// cross the FFI together; rows are returned as batches of Python values.
+/// Kept temporarily as a compatibility/testing helper while the public `Engine`
+/// API is introduced. The SQL and parameter batch cross the FFI together.
 #[pyfunction]
 fn sqlite_text(
     sql: &str,

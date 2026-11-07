@@ -5,11 +5,14 @@ This foundation release includes only basic positional SQLite statement executio
 and the initial database error hierarchy.
 
 Examples:
-    >>> from catalyst import CatalystError, sqlite_text
+    >>> from catalyst import CatalystError, create_engine
     >>> issubclass(CatalystError, Exception)
     True
-    >>> sqlite_text("SELECT ?", [42])
-    [[42]]
+    >>> engine = create_engine(":memory:")
+    >>> with engine.connect() as connection:
+    ...     connection.execute("SELECT ?", [42]).fetchone()
+    (42,)
+    >>> engine.dispose()
 """
 
 from ._catalyst import (
@@ -17,12 +20,15 @@ from ._catalyst import (
     DatabaseError,
     DBAPIError,
     IntegrityError,
+    NativeEngine,
+    NativeResult,
     OperationalError,
     ProgrammingError,
     SQLAlchemyError,
     StatementError,
     sqlite_text,
 )
+from .engine import Connection, CursorResult, Engine, create_engine
 
 __all__ = [
     "CatalystError",
@@ -34,4 +40,10 @@ __all__ = [
     "StatementError",
     "SQLAlchemyError",
     "sqlite_text",
+    "Engine",
+    "Connection",
+    "CursorResult",
+    "create_engine",
+    "NativeEngine",
+    "NativeResult",
 ]

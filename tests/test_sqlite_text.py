@@ -1,7 +1,17 @@
 """Behavior and error parity tests for the foundation SQLite helper."""
 
+import tempfile
+from pathlib import Path
+
 import pytest
-from catalyst import IntegrityError, ProgrammingError, sqlite_text
+from catalyst import (
+    IntegrityError,
+    ProgrammingError,
+    sqlite_text,
+)
+from catalyst import (
+    create_engine as catalyst_create_engine,
+)
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 from sqlalchemy.exc import ProgrammingError as SAProgrammingError
@@ -34,6 +44,52 @@ def test_unsupported_parameter_type_is_rejected_before_execution() -> None:
     """Only SQLite's supported scalar types cross the native boundary."""
     with pytest.raises(TypeError, match="parameters must be"):
         sqlite_text("SELECT ?", [object()])
+
+
+def test_engine_database_lifecycle_matches_memory_and_file_sqlite() -> None:
+    """Engine connections share state and dispose cleanly for memory and files."""
+    with catalyst_create_engine(":memory:") as engine:
+        with engine.connect() as connection:
+            connection.execute("CREATE TABLE items (value INTEGER)")
+        with engine.connect() as connection:
+            connection.execute("INSERT INTO items VALUES (?)", [9])
+            assert connection.execute("SELECT value FROM items").fetchone() == (9,)
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "items.sqlite"
+        engine = catalyst_create_engine(path)
+        with engine.connect() as connection:
+            connection.execute("CREATE TABLE items (value INTEGER)")
+            connection.execute("INSERT INTO items VALUES (?)", [11])
+        engine.dispose()
+        reopened = catalyst_create_engine(path)
+        with reopened.connect() as connection:
+            assert connection.execute("SELECT value FROM items").fetchone() == (11,)
+        reopened.dispose()
+
+
+def test_connection_and_engine_reject_use_after_close() -> None:
+    """Closed logical handles and disposed engines fail deterministically."""
+    engine = catalyst_create_engine(":memory:")
+    connection = engine.connect()
+    connection.close()
+    with pytest.raises(RuntimeError, match="Connection is closed"):
+        connection.execute("SELECT 1")
+    engine.dispose()
+    with pytest.raises(RuntimeError, match="Engine is disposed"):
+        engine.connect()
+
+
+def test_result_fetch_methods_track_position_and_column_names() -> None:
+    """Buffered result navigation and labels are stable across fetch methods."""
+    engine = catalyst_create_engine(":memory:")
+    with engine.connect() as connection:
+        result = connection.execute("SELECT 1 AS one UNION ALL SELECT 2 AS one")
+        assert result.keys == ("one",)
+        assert result.fetchone() == (1,)
+        assert result.fetchall() == [(2,)]
+        assert result.fetchone() is None
+    engine.dispose()
 
 
 def test_integrity_error_maps_to_matching_exception() -> None:
