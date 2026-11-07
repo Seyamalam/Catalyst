@@ -21,6 +21,7 @@ from ._catalyst import (
     DatabaseError,
     DBAPIError,
     IntegrityError,
+    InvalidRequestError,
     NativeConnection,
     NativeEngine,
     NativeResult,
@@ -31,7 +32,16 @@ from ._catalyst import (
     TimeoutError,
     sqlite_text,
 )
-from .engine import Connection, CursorResult, Engine, TextClause, create_engine, text
+from .engine import (
+    Connection,
+    CursorResult,
+    Engine,
+    RootTransaction,
+    SavepointTransaction,
+    TextClause,
+    create_engine,
+    text,
+)
 
 __all__ = [
     "CatalystError",
@@ -43,10 +53,13 @@ __all__ = [
     "ProgrammingError",
     "StatementError",
     "TimeoutError",
+    "InvalidRequestError",
     "SQLAlchemyError",
     "sqlite_text",
     "Engine",
     "Connection",
+    "RootTransaction",
+    "SavepointTransaction",
     "CursorResult",
     "TextClause",
     "text",

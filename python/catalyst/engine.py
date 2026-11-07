@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ._catalyst import ArgumentError, NativeConnection, NativeEngine, NativeResult
+from ._catalyst import (
+    ArgumentError,
+    InvalidRequestError,
+    NativeConnection,
+    NativeEngine,
+    NativeResult,
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -89,8 +96,34 @@ class Connection:
             self._native.execute(sql, native_parameters, isinstance(statement, TextClause))
         )
 
+    def begin(self) -> RootTransaction:
+        """Begin an explicit root transaction on this connection."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        self._native.begin()
+        return RootTransaction(self._native)
+
+    def begin_nested(self) -> SavepointTransaction:
+        """Begin a nested transaction implemented by a SQLite savepoint."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        name = self._native.begin_savepoint()
+        return SavepointTransaction(self._native, name)
+
+    def commit(self) -> None:
+        """Commit the current explicit or implicitly begun transaction."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        self._native.commit()
+
+    def rollback(self) -> None:
+        """Roll back the current explicit or implicitly begun transaction."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        self._native.rollback()
+
     def close(self) -> None:
-        """Release this logical connection handle."""
+        """Roll back any open transaction and release this logical connection."""
         if not self._closed:
             self._native.close()
             self._closed = True
@@ -102,6 +135,91 @@ class Connection:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+class RootTransaction:
+    """Thin handle for a native root transaction."""
+
+    def __init__(self, native: NativeConnection) -> None:
+        self.native = native
+        self._finished = False
+
+    def commit(self) -> None:
+        """Commit and finish this transaction."""
+        if self._finished or not self.native.is_active():
+            raise InvalidRequestError("This transaction is inactive")
+        self.native.commit()
+        self._finished = True
+
+    def rollback(self) -> None:
+        """Roll back and finish this transaction."""
+        if self._finished or not self.native.is_active():
+            raise InvalidRequestError("This transaction is inactive")
+        self.native.rollback()
+        self._finished = True
+
+    def close(self) -> None:
+        """Roll back this transaction if it is still active."""
+        if not self._finished:
+            self.rollback()
+
+    def __enter__(self) -> RootTransaction:
+        if self._finished:
+            raise InvalidRequestError("This transaction is no longer active")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if exc_type is None and self.native.is_active():
+            self.commit()
+        elif self.native.is_active():
+            self.rollback()
+        # An already-ended transaction no-ops here; SQLAlchemy warns instead
+        # of raising in this path (documented parity difference).
+
+
+class SavepointTransaction:
+    """Thin handle for a native SQLite savepoint."""
+
+    def __init__(self, native: NativeConnection, name: str) -> None:
+        self.native = native
+        self._name = name
+        self._finished = False
+
+    def commit(self) -> None:
+        """Release this savepoint."""
+        if self._finished:
+            raise InvalidRequestError("This savepoint is no longer active")
+        self.native.release_savepoint(self._name)
+        self._finished = True
+
+    def release(self) -> None:
+        """Release this savepoint."""
+        self.commit()
+
+    def rollback(self) -> None:
+        """Roll back to this savepoint and release it."""
+        if self._finished:
+            raise InvalidRequestError("This savepoint is no longer active")
+        self.native.rollback_savepoint(self._name)
+        self._finished = True
+
+    def close(self) -> None:
+        """Roll back this savepoint if it is still active."""
+        if not self._finished:
+            self.rollback()
+
+    def __enter__(self) -> SavepointTransaction:
+        if self._finished:
+            raise InvalidRequestError("This savepoint is no longer active")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if exc_type is None and self.native.is_active():
+            self.commit()
+        elif self.native.is_active():
+            self.rollback()
+        # An already-ended savepoint no-ops here; SQLAlchemy warns instead of
+        # raising in this path (documented parity difference).
 
 
 class Engine:
@@ -128,6 +246,16 @@ class Engine:
         if self._disposed:
             raise RuntimeError("Engine is disposed")
         return Connection(self._native.connect())
+
+    @contextmanager
+    def begin(self) -> Generator[Connection, None, None]:
+        """Yield a connection in a root transaction, committing or rolling back."""
+        connection = self.connect()
+        try:
+            with connection.begin():
+                yield connection
+        finally:
+            connection.close()
 
     def dispose(self) -> None:
         """Close the native database connection; repeated calls are safe."""

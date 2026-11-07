@@ -57,8 +57,10 @@ def test_engine_database_lifecycle_matches_memory_and_file_sqlite() -> None:
     with catalyst_create_engine(":memory:") as engine:
         with engine.connect() as connection:
             connection.execute("CREATE TABLE items (value INTEGER)")
+            connection.commit()
         with engine.connect() as connection:
             connection.execute("INSERT INTO items VALUES (?)", [9])
+            connection.commit()
             assert connection.execute("SELECT value FROM items").fetchone() == (9,)
 
     with tempfile.TemporaryDirectory() as directory:
@@ -67,6 +69,7 @@ def test_engine_database_lifecycle_matches_memory_and_file_sqlite() -> None:
         with engine.connect() as connection:
             connection.execute("CREATE TABLE items (value INTEGER)")
             connection.execute("INSERT INTO items VALUES (?)", [11])
+            connection.commit()
         engine.dispose()
         reopened = catalyst_create_engine(path)
         with reopened.connect() as connection:
@@ -81,6 +84,7 @@ def test_file_engine_checks_out_independent_connections() -> None:
         engine = catalyst_create_engine(path)
         with engine.connect() as setup:
             setup.execute("CREATE TABLE items (value INTEGER)")
+            setup.commit()
 
         first = engine.connect()
         second = engine.connect()
@@ -89,7 +93,11 @@ def test_file_engine_checks_out_independent_connections() -> None:
         first.execute("INSERT INTO local_state VALUES (?)", [10])
         second.execute("INSERT INTO local_state VALUES (?)", [20])
         first.execute("INSERT INTO items VALUES (?)", [1])
+        first.commit()
         second.execute("INSERT INTO items VALUES (?)", [2])
+        second.commit()
+        first.commit()
+        second.commit()
         assert first.execute("SELECT value FROM local_state").fetchone() == (10,)
         assert second.execute("SELECT value FROM local_state").fetchone() == (20,)
         assert first.execute("SELECT value FROM items ORDER BY value").fetchall() == [(1,), (2,)]
@@ -105,6 +113,7 @@ def test_memory_engine_shares_schema_and_data_between_connections() -> None:
     first = engine.connect()
     first.execute("CREATE TABLE items (value INTEGER)")
     first.execute("INSERT INTO items VALUES (?)", [17])
+    first.commit()
     second = engine.connect()
     assert second.execute("SELECT value FROM items").fetchone() == (17,)
     first.close()
@@ -119,6 +128,7 @@ def test_close_returns_connection_to_pool() -> None:
         with engine.connect() as first:
             first.execute("CREATE TABLE items (value INTEGER)")
             first.execute("CREATE TEMP TABLE marker (value INTEGER)")
+            first.commit()
         # A TEMP table is per-connection, so it surviving here proves the same
         # physical connection was reused rather than a new one being opened.
         with engine.connect() as returned:

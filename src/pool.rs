@@ -140,6 +140,15 @@ impl Drop for PooledConnection {
         if self.shared {
             return;
         }
+        // Reset-on-return: roll back any transaction the previous holder left
+        // open so no dirty state survives the checkout boundary. This must live
+        // here (not on the pyobject) because holders may be dropped without
+        // calling close(); the pool slot is the single source of truth.
+        if let Ok(guard) = connection.lock()
+            && !guard.is_autocommit()
+        {
+            let _ = guard.execute_batch("ROLLBACK");
+        }
         let Ok(mut state) = self.pool.state.lock() else {
             return;
         };

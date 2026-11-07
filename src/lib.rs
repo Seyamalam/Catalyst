@@ -75,6 +75,13 @@ create_exception!(
     "Raised when a connection pool checkout times out or is exhausted."
 );
 
+create_exception!(
+    _catalyst,
+    InvalidRequestError,
+    SQLAlchemyError,
+    "Raised when a connection transaction operation is invalid."
+);
+
 /// A native SQLite engine owning a bounded connection pool.
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeEngine {
@@ -85,6 +92,14 @@ struct NativeEngine {
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeConnection {
     connection: Mutex<Option<PooledConnection>>,
+    transaction: Mutex<TransactionState>,
+}
+
+#[derive(Default)]
+struct TransactionState {
+    active: bool,
+    savepoints: Vec<String>,
+    next_savepoint: u64,
 }
 
 /// A buffered result set hydrated from one native query execution.
@@ -110,12 +125,75 @@ impl NativeEngine {
         let connection = py.detach(|| self.pool.checkout()).map_err(map_pool_error)?;
         Ok(NativeConnection {
             connection: Mutex::new(Some(connection)),
+            transaction: Mutex::new(TransactionState::default()),
         })
     }
 
     /// Dispose idle pool connections. Checked-out connections close on return.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.pool.close()).map_err(map_pool_error)
+    }
+}
+
+impl NativeConnection {
+    fn with_transaction<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: impl FnOnce(&rusqlite::Connection, &mut TransactionState) -> PyResult<T> + Send,
+    ) -> PyResult<T> {
+        let connection_guard = self
+            .connection
+            .lock()
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+        let checkout = connection_guard
+            .as_ref()
+            .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+        let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        drop(connection_guard);
+        py.detach(move || {
+            let mut state = self
+                .transaction
+                .lock()
+                .map_err(|_| OperationalError::new_err("Transaction state lock was poisoned"))?;
+            let connection = connection
+                .lock()
+                .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+            operation(&connection, &mut state)
+        })
+    }
+
+    fn finish_savepoint(&self, name: &str, rollback: bool, py: Python<'_>) -> PyResult<()> {
+        // Savepoint statements cannot be parameterized; only accept the names
+        // this module generates so arbitrary strings cannot be interpolated.
+        let serial = name
+            .strip_prefix("catalyst_sp_")
+            .and_then(|rest| rest.parse::<u64>().ok());
+        if serial.is_none() {
+            return Err(InvalidRequestError::new_err(
+                "Savepoint is no longer active",
+            ));
+        }
+        let name = name.to_owned();
+        self.with_transaction(py, move |connection, state| {
+            let index = state
+                .savepoints
+                .iter()
+                .position(|candidate| candidate == &name)
+                .ok_or_else(|| InvalidRequestError::new_err("Savepoint is no longer active"))?;
+            if rollback {
+                connection
+                    .execute_batch(&format!(
+                        "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                    ))
+                    .map_err(map_sqlite_error)?;
+            } else {
+                connection
+                    .execute_batch(&format!("RELEASE SAVEPOINT {name}"))
+                    .map_err(map_sqlite_error)?;
+            }
+            state.savepoints.truncate(index);
+            Ok(())
+        })
     }
 }
 
@@ -174,12 +252,19 @@ impl NativeConnection {
         let connection = checkout.connection_handle().map_err(map_pool_error)?;
         drop(connection_guard);
 
+        let transaction_state = &self.transaction;
         let (columns, buffered_rows, rowcount) = py.detach(move || {
-            let mut connection = connection
+            let mut state = transaction_state
+                .lock()
+                .map_err(|_| OperationalError::new_err("Transaction state lock was poisoned"))?;
+            let connection = connection
                 .lock()
                 .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
-            let transaction = connection.transaction().map_err(map_sqlite_error)?;
-            let mut statement = transaction.prepare(&sql).map_err(map_sqlite_error)?;
+            if !state.active {
+                connection.execute_batch("BEGIN").map_err(map_sqlite_error)?;
+                state.active = true;
+            }
+            let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
             let columns = statement
                 .column_names()
                 .iter()
@@ -223,12 +308,18 @@ impl NativeConnection {
             }
             drop(rows);
             drop(statement);
-            let rowcount = if columns.is_empty() {
-                transaction.changes() as i64
+            // Match SQLAlchemy rowcount: DML statements report the affected
+            // row count, everything else (SELECT, DDL, PRAGMA) reports -1.
+            // CTE-prefixed DML (WITH ...) is classified as non-DML here.
+            let trimmed = sql.trim_start().to_ascii_lowercase();
+            let rowcount = if ["insert", "update", "delete", "replace"]
+                .iter()
+                .any(|keyword| trimmed.starts_with(keyword))
+            {
+                connection.changes() as i64
             } else {
                 -1
             };
-            transaction.commit().map_err(map_sqlite_error)?;
             Ok::<_, PyErr>((columns, buffered_rows, rowcount))
         })?;
 
@@ -251,15 +342,114 @@ impl NativeConnection {
         })
     }
 
-    /// Return the checked-out connection to the pool. Repeated calls are safe.
+    /// Start an explicit root transaction unless execution already autobegan one.
+    fn begin(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_transaction(py, |connection, state| {
+            if state.active {
+                return Err(InvalidRequestError::new_err(
+                    "This connection already has an active transaction",
+                ));
+            }
+            connection
+                .execute_batch("BEGIN")
+                .map_err(map_sqlite_error)?;
+            state.active = true;
+            Ok(())
+        })
+    }
+
+    /// Commit the current root or implicit transaction. No active transaction is a no-op.
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_transaction(py, |connection, state| {
+            if state.active {
+                connection
+                    .execute_batch("COMMIT")
+                    .map_err(map_sqlite_error)?;
+                state.active = false;
+                state.savepoints.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// Roll back the current root or implicit transaction. No active transaction is a no-op.
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_transaction(py, |connection, state| {
+            if state.active {
+                connection
+                    .execute_batch("ROLLBACK")
+                    .map_err(map_sqlite_error)?;
+                state.active = false;
+                state.savepoints.clear();
+            }
+            Ok(())
+        })
+    }
+
+    /// Create a uniquely named SQLite savepoint, autobeginning a root if needed.
+    fn begin_savepoint(&self, py: Python<'_>) -> PyResult<String> {
+        self.with_transaction(py, |connection, state| {
+            if !state.active {
+                connection
+                    .execute_batch("BEGIN")
+                    .map_err(map_sqlite_error)?;
+                state.active = true;
+            }
+            let name = format!("catalyst_sp_{}", state.next_savepoint);
+            state.next_savepoint += 1;
+            connection
+                .execute_batch(&format!("SAVEPOINT {name}"))
+                .map_err(map_sqlite_error)?;
+            state.savepoints.push(name.clone());
+            Ok(name)
+        })
+    }
+
+    /// Release a savepoint and any nested savepoints beneath it.
+    fn release_savepoint(&self, name: &str, py: Python<'_>) -> PyResult<()> {
+        self.finish_savepoint(name, false, py)
+    }
+
+    /// Roll back to and release a savepoint.
+    fn rollback_savepoint(&self, name: &str, py: Python<'_>) -> PyResult<()> {
+        self.finish_savepoint(name, true, py)
+    }
+
+    /// Whether a transaction is open on this connection.
+    fn is_active(&self) -> bool {
+        self.transaction
+            .lock()
+            .map(|state| state.active)
+            .unwrap_or(false)
+    }
+
+    /// Return the checked-out connection to the pool, rolling back first if needed.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        // Idempotent: skip rollback when the handle was already returned.
+        let needs_rollback = {
+            let connection_guard = self
+                .connection
+                .lock()
+                .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+            connection_guard.is_some()
+        };
+        // Capture rollback failure and return the handle regardless so a
+        // driver error cannot strand the checkout from the pool.
+        let rollback_error = if needs_rollback {
+            self.rollback(py).err()
+        } else {
+            None
+        };
         let connection = self
             .connection
             .lock()
             .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?
             .take();
         py.detach(|| drop(connection));
-        Ok(())
+        match rollback_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -337,6 +527,10 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.py().get_type::<OperationalError>(),
     )?;
     module.add("TimeoutError", module.py().get_type::<TimeoutError>())?;
+    module.add(
+        "InvalidRequestError",
+        module.py().get_type::<InvalidRequestError>(),
+    )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
     module.add_class::<NativeResult>()?;
@@ -354,6 +548,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "ProgrammingError",
             "OperationalError",
             "TimeoutError",
+            "InvalidRequestError",
             "sqlite_text",
             "NativeEngine",
             "NativeConnection",
