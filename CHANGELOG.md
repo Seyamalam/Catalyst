@@ -9,3 +9,4 @@ All notable changes to Catalyst are recorded here.
 - Add a foundation rusqlite-backed positional `sqlite_text` helper with bulk result conversion and parity tests.
 - Record Rust-first architecture, driver/docs decisions, parity status, and local CI instructions.
 - Remove the generated GitHub Actions workflow per project direction; CI is local only.
+- Add a synchronous SQLite engine facade: Rust `NativeEngine`/`NativeResult` (buffered results, GIL-released execution) behind Python `create_engine`, `Engine`, `Connection`, and `CursorResult` with context managers, dispose lifecycle, use-after-close guards, and parity tests.

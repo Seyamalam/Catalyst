@@ -4,4 +4,4 @@ A `done` status requires a passing test that compares Catalyst with SQLAlchemy b
 
 ## Initial status
 
-At the foundation baseline, engine, statement, and ORM behavior is not started. Exception names and inheritance are a partial, tested slice; no query or database-engine parity is claimed. As the suite grows, generate status from explicit test metadata/results to prevent stale claims.
+At the foundation baseline, exception names and SQLite text execution plus a minimal synchronous engine facade are partial, tested slices; no pooling, transactions, query AST, dialect compilation, or ORM parity is claimed. As the suite grows, generate status from explicit test metadata/results to prevent stale claims.

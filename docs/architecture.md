@@ -63,4 +63,6 @@ stateDiagram-v2
 
 ## Current implementation
 
-The native extension defines a SQLAlchemy-style exception hierarchy and a foundation `sqlite_text` helper. The helper executes SQL with a positional parameter batch against a process-local SQLite connection and returns rows in bulk. A public engine API, pool, query AST/dialect compiler, and async APIs are not yet implemented. Update this section alongside verified code changes.
+The native extension defines a SQLAlchemy-style exception hierarchy, a foundation `sqlite_text` helper, and a `NativeEngine`/`NativeResult` pair. `NativeEngine` owns one SQLite database handle (in-memory or file) whose blocking driver calls run with the GIL released; `NativeResult` buffers all rows and exposes `keys`, `rowcount`, and positional `fetchone`/`fetchall`. The helper executes SQL with a positional parameter batch against a process-local SQLite connection and returns rows in bulk.
+
+Python-side runtime logic (documented per the FFI rule above): `catalyst.engine` is a user-facing shell only — `create_engine` parses `:memory:`, filesystem paths, and `sqlite:///` URLs; `Engine`/`Connection` delegate all execution to the native core and add context-manager and use-after-close guards; `CursorResult` adapts the buffered native result. No query building, transactions, pooling, async APIs, or dialect compilation exist yet.
