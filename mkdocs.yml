@@ -10,6 +10,8 @@ nav:
   - Decisions:
       - Driver selection: decisions/0001-driver-selection.md
       - Documentation tooling: decisions/0002-documentation-tooling.md
+      - PostgreSQL driver: decisions/0003-postgresql-driver.md
+      - MySQL driver: decisions/0004-mysql-driver.md
   - Parity:
       - Overview: parity/index.md
       - Core: parity/core.md

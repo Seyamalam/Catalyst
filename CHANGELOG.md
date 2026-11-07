@@ -14,3 +14,4 @@ All notable changes to Catalyst are recorded here.
 - Add Python `text()`/`TextClause` and Rust-native SQLite named binds (`:name`, `@name`, `$name`), escaped literal colons, positional execution compatibility, and result/error parity tests.
 - Add Rust-native SQLite commit-as-you-go transactions and arbitrary nested savepoints, Python root/savepoint transaction shells and `Engine.begin()`, rollback-on-close, and SQLAlchemy parity tests.
 - Add SQLAlchemy-style SQLite URL and engine option parsing, dialect error registry, configurable pool size/overflow and condition-variable checkout timeout, SQL echo logging, and parity tests.
+- Select planned PostgreSQL (`tokio-postgres`) and MySQL (`mysql_async`) clients in ADRs 0003/0004 and add a Docker-backed plaintext protocol harness; no non-SQLite driver code or parity is implemented.

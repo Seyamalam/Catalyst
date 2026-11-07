@@ -45,6 +45,7 @@ features = ["pyo3/extension-module"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: optional checks against real database services"]
 
 [tool.ruff]
 target-version = "py310"

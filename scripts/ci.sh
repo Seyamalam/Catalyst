@@ -42,6 +42,11 @@ else
   PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" pytest tests/
   echo "NOTE: pytest-cov is not installed; Python coverage not measured" >&2
 fi
+
+if [[ "${CATALYST_INTEGRATION:-0}" == "1" ]]; then
+  scripts/integration.sh
+fi
+
 mkdocs build --strict
 
 if command -v cargo-llvm-cov >/dev/null 2>&1; then
