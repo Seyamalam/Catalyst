@@ -17,4 +17,11 @@ cleanup() {
 trap cleanup EXIT
 docker compose up -d --wait --wait-timeout 120
 
-PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" python -m pytest -m integration tests/test_integration_infra.py -q
+# Use the project virtualenv explicitly so the script works outside an
+# activated shell (ci.sh requires VIRTUAL_ENV; this script must not).
+PYTHON="$ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+  echo "Project virtualenv missing at .venv; create it first." >&2
+  exit 2
+fi
+PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m pytest -m integration tests/test_integration_infra.py -q
