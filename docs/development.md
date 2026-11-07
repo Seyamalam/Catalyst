@@ -14,7 +14,7 @@ source .venv/bin/activate
 
 ## Local CI
 
-Run `./scripts/ci.sh`. The script stops at the first failure and runs formatting, Clippy, Rust tests, release extension build, Python lint/type/stub checks, pytest with coverage, strict documentation build, and Rust coverage when the relevant tools are installed. Install development dependencies first so tool checks do not skip. The script reports missing optional check tools; do not report skipped checks as passing.
+Run `./scripts/ci.sh`. The script stops at the first failure and runs formatting, Clippy, Rust tests, release extension build, Python lint/type/stub checks, pytest with coverage when available, and strict documentation build. Rust coverage is opt-in with `CATALYST_COVERAGE=1`; the Criterion suite is opt-in with `CATALYST_BENCH=1`. The standalone commands are `scripts/coverage.sh` and `scripts/bench.sh`. Install Rust coverage tooling with `cargo install cargo-llvm-cov --locked`. Install development dependencies first so tool checks do not skip. The script reports missing optional check tools; do not report skipped checks as passing.
 
 ## Database services
 
