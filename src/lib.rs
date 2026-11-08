@@ -1,5 +1,6 @@
 #![deny(clippy::all, unsafe_code)]
 
+mod expr;
 mod pool;
 
 use pyo3::create_exception;
@@ -260,11 +261,13 @@ impl NativeConnection {
 #[pymethods]
 impl NativeConnection {
     /// Execute SQL with positional values or a named mapping, buffering rows natively.
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None))]
     fn execute(
         &self,
         sql: &str,
         parameters: &Bound<'_, PyAny>,
         text_mode: bool,
+        statement_kind: Option<&str>,
         py: Python<'_>,
     ) -> PyResult<NativeResult> {
         let named_values = if let Ok(mapping) = parameters.cast::<PyDict>() {
@@ -302,6 +305,7 @@ impl NativeConnection {
         } else {
             sql.to_owned()
         };
+        let statement_kind = statement_kind.map(str::to_owned);
         let connection_guard = self
             .connection
             .lock()
@@ -379,14 +383,13 @@ impl NativeConnection {
             // row count, everything else (SELECT, DDL, PRAGMA) reports -1.
             // CTE-prefixed DML (WITH ...) is classified as non-DML here.
             let trimmed = sql.trim_start().to_ascii_lowercase();
-            let rowcount = if ["insert", "update", "delete", "replace"]
-                .iter()
-                .any(|keyword| trimmed.starts_with(keyword))
-            {
-                connection.changes() as i64
-            } else {
-                -1
-            };
+            let dml = statement_kind.as_deref().map_or_else(
+                || ["insert", "update", "delete", "replace"]
+                    .iter()
+                    .any(|keyword| trimmed.starts_with(keyword)),
+                |kind| matches!(kind, "insert" | "update" | "delete"),
+            );
+            let rowcount = if dml { connection.changes() as i64 } else { -1 };
             Ok::<_, PyErr>((columns, buffered_rows, rowcount))
         })?;
 
@@ -410,18 +413,26 @@ impl NativeConnection {
     }
 
     /// Execute a statement in a Tokio blocking task and return its buffered result.
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None))]
     fn async_execute<'py>(
         slf: Py<Self>,
         py: Python<'py>,
         sql: String,
         parameters: Py<PyAny>,
         text_mode: bool,
+        statement_kind: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
                 Python::attach(|py| {
                     let connection = slf.borrow(py);
-                    let result = connection.execute(&sql, parameters.bind(py), text_mode, py)?;
+                    let result = connection.execute(
+                        &sql,
+                        parameters.bind(py),
+                        text_mode,
+                        statement_kind.as_deref(),
+                        py,
+                    )?;
                     Py::new(py, result)
                 })
             })
@@ -670,6 +681,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeConnection>()?;
     module.add_class::<NativeResult>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
+    module.add_function(wrap_pyfunction!(expr::compile_expression, module)?)?;
     module.add(
         "__all__",
         [
@@ -686,6 +698,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "TimeoutError",
             "InvalidRequestError",
             "sqlite_text",
+            "compile_expression",
             "NativeEngine",
             "NativeConnection",
             "NativeResult",

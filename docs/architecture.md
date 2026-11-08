@@ -34,7 +34,11 @@ sequenceDiagram
 
 ## FFI and ownership
 
-The Python/Rust boundary is for query and parameter batches, never per row or column. Blocking work must release the GIL using PyO3 `Python::detach`; async work uses Tokio and `pyo3-async-runtimes`. The SQLite implementation is planned to isolate synchronous driver calls from Python execution. There is no intentional unsafe code; unsafe remains denied.
+The Python/Rust boundary is for query and parameter batches, never per row or column. Blocking work must release the GIL using PyO3 `Python::detach`; async work uses Tokio and `pyo3-async-runtimes`. The SQLite implementation isolates synchronous driver calls from Python execution. There is no intentional unsafe code; unsafe remains denied.
+
+## Core expression AST lifecycle
+
+`catalyst.expression` supplies Python metadata holders (`MetaData`, `Table`, `Column`), type markers, immutable expression/statement shells, and compact tagged-tuple serialization. Python is responsible only for ergonomic constructors/operators; one `compile_expression` PyO3 call hands the entire statement tree to Rust. Rust validates/deserializes the tagged form into typed statement/expression enums, compiles SQLite SQL and a deterministic ordered bind sequence, and returns SQL, a named params mapping for inspection, statement kind, and positional values. This keeps recursive AST work and SQL rendering native while preserving one batch crossing per compile. The engine accepts the statement, compiles it once, and sends SQL, ordered values, and known statement kind through the existing single execute crossing; Rust binds values and buffers SELECT results. Both compile and native execute work run with the GIL detached. Identifier quoting follows SQLite/SQLAlchemy behavior for bare lowercase identifiers, and double-quotes reserved words, mixed/upper-case identifiers, punctuation, and other non-bare identifiers, escaping embedded double-quotes. Types are declarative metadata only: DDL generation is not included. Current compiler limitations are listed in `docs/parity/core.md`.
 
 Python-side runtime logic is limited to the declarative/user-facing shell and URL/configuration parsing where Python APIs are the compatibility surface. Document any additional Python runtime logic with its reason here.
 

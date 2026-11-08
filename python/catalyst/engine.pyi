@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, final
 
 from ._catalyst import NativeConnection, NativeResult
+from .expression import Compiled, Delete, Insert, Select, Update
 
 @final
 class TextClause:
@@ -31,7 +32,7 @@ class Connection:
     def __init__(self, native: NativeConnection, *, echo: bool = False) -> None: ...
     def execute(
         self,
-        statement: str | TextClause,
+        statement: str | TextClause | Compiled | Select | Insert | Update | Delete,
         parameters: Sequence[object] | Mapping[str, object] | None = None,
     ) -> CursorResult: ...
     def begin(self) -> RootTransaction: ...
@@ -67,7 +68,7 @@ class AsyncConnection:
     async def begin(self) -> None: ...
     async def execute(
         self,
-        statement: str | TextClause,
+        statement: str | TextClause | Compiled | Select | Insert | Update | Delete,
         parameters: Sequence[object] | Mapping[str, object] | None = None,
     ) -> CursorResult: ...
     async def commit(self) -> None: ...

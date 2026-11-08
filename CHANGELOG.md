@@ -4,6 +4,7 @@ All notable changes to Catalyst are recorded here.
 
 ## Unreleased
 
+- Add a Rust-backed SQLite Core expression AST/compiler with SQLAlchemy-shaped table/column metadata, select/insert/update/delete construction, per-column scalar/expanding bind names, operator-aware negation, scalar `IS`, escaped `LIKE`, duplicate-column labels, empty `IN` handling, and a native expression-depth guard; document partial parity and unsupported AST features.
 - Add a Tokio-backed SQLite async engine skeleton (`create_async_engine`, async connection execution/transactions, context managers, and disposal). Async results reuse the natively buffered `CursorResult`; no async streaming or full SQLAlchemy async parity is claimed.
 - Store transaction/savepoint bookkeeping on physical pool slots, aligning serialized SQLite `:memory:` checkout interleaving and shared commit/rollback behavior with SQLAlchemy; retain independent file connections and add async checkout exhaustion coverage.
 

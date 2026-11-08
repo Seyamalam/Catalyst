@@ -17,6 +17,7 @@ __all__ = [
     "TimeoutError",
     "InvalidRequestError",
     "sqlite_text",
+    "compile_expression",
     "NativeEngine",
     "NativeConnection",
     "NativeResult",
@@ -29,6 +30,10 @@ CatalystError = SQLAlchemyError
 
 def sqlite_text(sql: str, parameters: list[object]) -> list[list[object]]:
     """Execute parameterized SQL on Catalyst's persistent process-local SQLite database."""
+
+def compile_expression(
+    value: object,
+) -> tuple[str, dict[str, object], str, list[object]]: ...
 
 @final
 class NativeEngine:
@@ -52,10 +57,18 @@ class NativeConnection:
     """Native SQLite connection checked out from an engine pool."""
 
     def execute(
-        self, sql: str, parameters: list[object] | dict[str, object], text_mode: bool
+        self,
+        sql: str,
+        parameters: list[object] | dict[str, object],
+        text_mode: bool,
+        statement_kind: str | None = ...,
     ) -> NativeResult: ...
     def async_execute(
-        self, sql: str, parameters: list[object] | dict[str, object], text_mode: bool
+        self,
+        sql: str,
+        parameters: list[object] | dict[str, object],
+        text_mode: bool,
+        statement_kind: str | None = ...,
     ) -> Awaitable[NativeResult]: ...
     def async_transaction(self, operation: str) -> Awaitable[None]: ...
     def begin(self) -> None: ...

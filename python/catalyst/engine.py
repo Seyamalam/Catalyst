@@ -20,6 +20,7 @@ from ._catalyst import (
     NativeEngine,
     NativeResult,
 )
+from .expression import Compiled, Delete, Insert, Select, Update
 
 _logger = logging.getLogger(__name__)
 
@@ -78,32 +79,38 @@ class Connection:
 
     def execute(
         self,
-        statement: str | TextClause,
+        statement: str | TextClause | Compiled | Select | Insert | Update | Delete,
         parameters: Sequence[object] | Mapping[str, object] | None = None,
     ) -> CursorResult:
         """Execute SQL with positional values or a mapping for named binds."""
         if self._closed:
             raise RuntimeError("Connection is closed")
-        if isinstance(statement, TextClause):
+        if isinstance(statement, (Select, Insert, Update, Delete)):
+            statement = statement.compile()
+        kind: str | None = None
+        if isinstance(statement, Compiled):
+            sql = statement.string
+            bindings: Sequence[object] | Mapping[str, object] = statement._ordered
+            kind = statement.statement_kind
+        elif isinstance(statement, TextClause):
             sql = statement.text
             if parameters is not None and not isinstance(parameters, Mapping):
                 raise ArgumentError("List argument must consist only of dictionaries")
-            bindings: Sequence[object] | Mapping[str, object] = (
-                {} if parameters is None else parameters
-            )
+            bindings = {} if parameters is None else parameters
         else:
             sql = statement
             if parameters is not None and isinstance(parameters, Mapping):
                 raise ArgumentError("Mapping is only supported with text() statements")
             bindings = () if parameters is None else parameters
+        native_parameters: dict[str, object] | list[object]
         if isinstance(bindings, Mapping):
-            native_parameters: dict[str, object] | list[object] = dict(bindings)
+            native_parameters = dict(bindings)
         else:
             native_parameters = list(bindings)
         if self._echo:
             _logger.info("%s", sql)
         return CursorResult(
-            self._native.execute(sql, native_parameters, isinstance(statement, TextClause))
+            self._native.execute(sql, native_parameters, isinstance(statement, TextClause), kind)
         )
 
     def begin(self) -> RootTransaction:
@@ -242,18 +249,23 @@ class AsyncConnection:
 
     async def execute(
         self,
-        statement: str | TextClause,
+        statement: str | TextClause | Compiled | Select | Insert | Update | Delete,
         parameters: Sequence[object] | Mapping[str, object] | None = None,
     ) -> CursorResult:
         if self._closed:
             raise RuntimeError("Connection is closed")
-        if isinstance(statement, TextClause):
+        if isinstance(statement, (Select, Insert, Update, Delete)):
+            statement = statement.compile()
+        kind: str | None = None
+        if isinstance(statement, Compiled):
+            sql = statement.string
+            bindings: Sequence[object] | Mapping[str, object] = statement._ordered
+            kind = statement.statement_kind
+        elif isinstance(statement, TextClause):
             sql = statement.text
             if parameters is not None and not isinstance(parameters, Mapping):
                 raise ArgumentError("List argument must consist only of dictionaries")
-            bindings: Sequence[object] | Mapping[str, object] = (
-                {} if parameters is None else parameters
-            )
+            bindings = {} if parameters is None else parameters
         else:
             sql = statement
             if parameters is not None and isinstance(parameters, Mapping):
@@ -267,7 +279,7 @@ class AsyncConnection:
         if self._echo:
             _logger.info("%s", sql)
         result = await self._native.async_execute(
-            sql, native_parameters, isinstance(statement, TextClause)
+            sql, native_parameters, isinstance(statement, TextClause), kind
         )
         return CursorResult(result)
 
