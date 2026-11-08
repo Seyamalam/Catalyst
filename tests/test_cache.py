@@ -172,9 +172,7 @@ def test_async_path_shares_the_cache(tables: tuple[Table, Table]) -> None:
             await connection.execute(insert(table).values(id=1, name="a", score=5))
             await connection.commit()
             for _ in range(2):
-                result = await connection.execute(
-                    select(table.c.name).where(table.c.id == 1)
-                )
+                result = await connection.execute(select(table.c.name).where(table.c.id == 1))
                 assert result.fetchall() == [("a",)]
         await engine.dispose()
 
