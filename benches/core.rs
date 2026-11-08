@@ -112,5 +112,42 @@ fn benchmark_sqlite_core(c: &mut Criterion) {
     let _ = std::fs::remove_file(path);
 }
 
-criterion_group!(benches, benchmark_pool_checkout, benchmark_sqlite_core);
+fn benchmark_statement_cache(c: &mut Criterion) {
+    let connection = rusqlite::Connection::open_in_memory().expect("open memory connection");
+    connection
+        .execute_batch("CREATE TABLE t (v INTEGER NOT NULL); INSERT INTO t VALUES (7);")
+        .expect("seed");
+
+    let mut group = c.benchmark_group("statement_cache");
+    group.bench_function("prepare_each_execute", |b| {
+        b.iter(|| {
+            let mut statement = connection
+                .prepare("SELECT v FROM t WHERE v > ?")
+                .expect("prepare");
+            let value: i64 = statement
+                .query_row([black_box(1i64)], |row| row.get(0))
+                .expect("query");
+            black_box(value);
+        });
+    });
+    group.bench_function("prepare_cached_execute", |b| {
+        b.iter(|| {
+            let mut statement = connection
+                .prepare_cached("SELECT v FROM t WHERE v > ?")
+                .expect("prepare_cached");
+            let value: i64 = statement
+                .query_row([black_box(1i64)], |row| row.get(0))
+                .expect("query");
+            black_box(value);
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    benchmark_pool_checkout,
+    benchmark_sqlite_core,
+    benchmark_statement_cache
+);
 criterion_main!(benches);

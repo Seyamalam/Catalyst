@@ -162,6 +162,8 @@ impl Pool {
             connection
                 .busy_timeout(self.inner.sqlite_timeout)
                 .map_err(PoolError::Sqlite)?;
+            // Connection-scoped prepared-statement cache, per ADR 0003.
+            connection.set_prepared_statement_cache_capacity(128);
             Ok(connection)
         })();
         match opened {

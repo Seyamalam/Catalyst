@@ -5,9 +5,40 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
 
 from ._catalyst import ArgumentError, compile_expression
+
+# Compiled statements are deterministic: memoize by the serialized form of the
+# frozen statement. Keys that are not hashable (arbitrary Python objects in
+# bind values) bypass the cache. Compiled results are rebuilt per call so the
+# shared cache entry is never exposed mutably.
+_COMPILE_CACHE_SIZE = 512
+
+
+@lru_cache(maxsize=_COMPILE_CACHE_SIZE)
+def _compile_cached(
+    serialized: tuple[object, ...],
+) -> tuple[str, tuple[tuple[str, object], ...], str]:
+    sql, params, kind, _ordered = compile_expression(serialized)
+    return sql, tuple(params.items()), kind
+
+
+def _compiled_from_cache(
+    serialized: tuple[object, ...],
+) -> tuple[str, dict[str, object], str, list[object]]:
+    try:
+        sql, items, kind = _compile_cached(serialized)
+    except TypeError:
+        # Bind values may be unhashable objects; compile directly without caching.
+        sql, params, kind, ordered = compile_expression(serialized)
+        return sql, params, kind, list(ordered)
+    # Rebuild per call so the shared cache entry is never exposed mutably.
+    params = dict(items)
+    ordered = [value for _key, value in items]
+    return sql, params, kind, ordered
+
 
 if TYPE_CHECKING:
     from .engine import AsyncEngine, Engine
@@ -556,7 +587,7 @@ class Select:
     def compile(self) -> Compiled:
         serialized = self._serialize()
         _check_node_depth(serialized)
-        sql, params, kind, ordered = compile_expression(serialized)
+        sql, params, kind, ordered = _compiled_from_cache(serialized)
         return Compiled(sql, params, kind, ordered)
 
     def __str__(self) -> str:
@@ -582,7 +613,7 @@ class Insert:
             for column in self.table.columns
             if column.name in self.values_map
         }
-        sql, params, kind, ordered = compile_expression(("insert", self.table.name, values))
+        sql, params, kind, ordered = _compiled_from_cache(("insert", self.table.name, values))
         return Compiled(sql, params, kind, ordered)
 
     def __str__(self) -> str:
@@ -622,7 +653,7 @@ class Update:
             if column.name in self.values_map
         }
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered = compile_expression(
+        sql, params, kind, ordered = _compiled_from_cache(
             ("update", self.table.name, values, predicate)
         )
         return Compiled(sql, params, kind, ordered)
@@ -650,7 +681,7 @@ class Delete:
 
     def compile(self) -> Compiled:
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered = compile_expression(("delete", self.table.name, predicate))
+        sql, params, kind, ordered = _compiled_from_cache(("delete", self.table.name, predicate))
         return Compiled(sql, params, kind, ordered)
 
     def __str__(self) -> str:

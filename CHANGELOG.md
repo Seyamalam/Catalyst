@@ -4,6 +4,8 @@ All notable changes to Catalyst are recorded here.
 
 ## Unreleased
 
+- Add a two-layer deterministic plan cache: Python-side LRU memoization of compiled Core statements keyed by the serialized statement, and Rust-side bounded per-connection prepared-statement caching (capacity 128) via rusqlite; measured ~4.5x faster repeated execution.
+
 - Add native SQLite DDL compilation: SQLAlchemy-exact `CREATE TABLE`/`DROP TABLE` text in Rust (types, single/composite primary keys, NOT NULL, column-level UNIQUE, string `server_default` literals), `NativeConnection.has_table` probes matching SQLAlchemy's sqlite checkfirst pragmas, and Python `MetaData.create_all`/`drop_all` plus `Table.create`/`drop` for sync and async engine binds with checkfirst semantics and commit handling.
 - Finish expression-compiler divergences: SQLAlchemy `is_precedent`/natural-self-precedent parenthesization for arithmetic and boolean groups, the SQLite `left / (right + 0.0)` true-division rewrite, `anon_N` labels for unlabeled non-column select items, empty `select()`, dropped empty `and_()`/`or_()` with SQLAlchemy's deprecation message (as `DeprecationWarning`), and `NOT` grouping for arithmetic/nested-negation shapes; `not_` now also reverses `not_in`/`not_like_escape`/`not_between`.
 - Map SQLite prepare-time driver errors (`SqlInputError`) to `OperationalError` (constraint violations to `IntegrityError`), matching SQLAlchemy's sqlite DBAPI classification for errors such as "table already exists".

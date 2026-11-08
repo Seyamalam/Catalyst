@@ -335,7 +335,9 @@ impl NativeConnection {
                 state.active = true;
             }
             holder_active.store(true, Ordering::Release);
-            let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
+            let mut statement = connection
+                .prepare_cached(&sql)
+                .map_err(map_sqlite_error)?;
             let columns = statement
                 .column_names()
                 .iter()
@@ -783,7 +785,7 @@ fn sqlite_text(
         let connection = database
             .lock()
             .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
-        let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
+        let mut statement = connection.prepare_cached(&sql).map_err(map_sqlite_error)?;
         let column_count = statement.column_count();
         let mut rows = statement
             .query(params_from_iter(values.iter()))
