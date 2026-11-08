@@ -576,7 +576,11 @@ impl Compiler {
                     lines.push(format!("UNIQUE ({})", quote_identifier(&column.name)));
                 }
                 self.sql.push_str(&lines.join(", \n\t"));
-                self.sql.push_str("\n)\n\n");
+                if lines.is_empty() {
+                    self.sql.push_str(")\n\n");
+                } else {
+                    self.sql.push_str("\n)\n\n");
+                }
                 "create_table"
             }
             Statement::DropTable { table } => {
