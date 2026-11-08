@@ -20,7 +20,7 @@ from ._catalyst import (
     NativeEngine,
     NativeResult,
 )
-from .expression import Compiled, Delete, Insert, Select, Update
+from .expression import Compiled, Delete, Insert, Select, Table, Update
 
 _logger = logging.getLogger(__name__)
 
@@ -119,6 +119,12 @@ class Connection:
             raise RuntimeError("Connection is closed")
         self._native.begin()
         return RootTransaction(self._native)
+
+    def has_table(self, name: str) -> bool:
+        """Return whether a table exists, checking main and temp schemas."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        return self._native.has_table(name)
 
     def begin_nested(self) -> SavepointTransaction:
         """Begin a nested transaction implemented by a SQLite savepoint."""
@@ -293,6 +299,12 @@ class AsyncConnection:
             raise RuntimeError("Connection is closed")
         await self._native.async_transaction("commit")
 
+    async def has_table(self, name: str) -> bool:
+        """Return whether a table exists, checking main and temp schemas."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        return bool(await self._native.async_has_table(name))
+
     async def rollback(self) -> None:
         if self._closed:
             raise RuntimeError("Connection is closed")
@@ -440,6 +452,50 @@ class Engine:
 def text(sql: str) -> TextClause:
     """Construct a SQL text statement for execution with named parameters."""
     return TextClause(sql)
+
+
+def run_ddl(
+    bind: Engine | AsyncEngine,
+    tables: Sequence[Table],
+    statements: Sequence[Compiled],
+    checkfirst: bool,
+    *,
+    drop: bool = False,
+) -> Any:
+    """Execute compiled DDL with SQLAlchemy ``checkfirst`` semantics.
+
+    Create statements run when the table is missing; drop statements run when
+    it exists. Existence is checked with SQLAlchemy's sqlite ``has_table``
+    probes (``PRAGMA main/temp.table_info``). The synchronous path executes
+    immediately and commits; an ``AsyncEngine`` bind returns a coroutine.
+    """
+    if isinstance(bind, AsyncEngine):
+        return run_ddl_async(bind, tables, statements, checkfirst, drop)
+    with bind.connect() as connection:
+        for table, statement in zip(tables, statements, strict=True):
+            exists = connection.has_table(table.name)
+            if not checkfirst or (exists if drop else not exists):
+                connection.execute(statement)
+        connection.commit()
+    return None
+
+
+async def run_ddl_async(
+    bind: AsyncEngine,
+    tables: Sequence[Table],
+    statements: Sequence[Compiled],
+    checkfirst: bool,
+    drop: bool,
+) -> None:
+    connection = await bind.connect_async()
+    try:
+        for table, statement in zip(tables, statements, strict=True):
+            exists = await connection.has_table(table.name)
+            if not checkfirst or (exists if drop else not exists):
+                await connection.execute(statement)
+        await connection.commit()
+    finally:
+        await connection.close()
 
 
 def create_engine(url: str | Path, **options: Any) -> Engine:

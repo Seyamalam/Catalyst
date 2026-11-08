@@ -4,7 +4,7 @@ This package exposes Catalyst's public Python API and typed declarations over th
 
 ## Current API
 
-The current public API includes a foundation-only `sqlite_text(sql, parameters)` helper for parameterized SQL against a process-local SQLite connection and the Catalyst/SQLAlchemy-style error hierarchy. Engine pooling, persistent connections, engine factories, ORM, and sessions are not implemented yet. See the repository [parity matrix](../../docs/parity/index.md) before relying on a feature.
+The current public API includes the Catalyst/SQLAlchemy-style error hierarchy, SQLite engines and connections (`create_engine`, `create_async_engine`, pooling, transactions, savepoints), Core expression construction (`select`, `insert`, `update`, `delete`, table/column metadata), native SQLite SQL compilation, and DDL execution (`MetaData.create_all`/`drop_all`, `Table.create`/`drop` with SQLAlchemy `checkfirst` semantics). Sessions and the ORM are not implemented yet. See the repository [parity matrix](../../docs/parity/index.md) before relying on a feature; each capability lists its remaining gaps.
 
 ## Development
 

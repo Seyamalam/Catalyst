@@ -466,6 +466,24 @@ impl NativeConnection {
         })
     }
 
+    /// Check for an existing table in a Tokio blocking task.
+    fn async_has_table<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| {
+                    let connection = slf.borrow(py);
+                    connection.has_table(&name, py)
+                })
+            })
+            .await
+            .map_err(|error| OperationalError::new_err(error.to_string()))?
+        })
+    }
+
     /// Start an explicit root transaction for this holder unless it has one.
     fn begin(&self, py: Python<'_>) -> PyResult<()> {
         let holder_active = &self.holder_active;
@@ -560,6 +578,36 @@ impl NativeConnection {
     /// Whether this holder has an open transaction (explicit or autobegin).
     fn is_active(&self) -> bool {
         self.holder_active.load(Ordering::Acquire)
+    }
+
+    /// SQLAlchemy sqlite ``has_table`` semantics: check ``PRAGMA
+    /// main.table_info`` first, then ``PRAGMA temp.table_info``.
+    fn has_table(&self, name: &str, py: Python<'_>) -> PyResult<bool> {
+        let connection_guard = self
+            .connection
+            .lock()
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+        let checkout = connection_guard
+            .as_ref()
+            .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+        let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        drop(connection_guard);
+        let quoted = name.replace('"', "\"\"");
+        py.detach(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+            for target in ["main", "temp"] {
+                let mut statement = connection
+                    .prepare(&format!("PRAGMA {target}.table_info({quoted})"))
+                    .map_err(map_sqlite_error)?;
+                let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+                if rows.next().map_err(map_sqlite_error)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
     }
 
     /// Return the checked-out connection to the pool, rolling back first if needed.
@@ -820,6 +868,12 @@ fn map_sqlite_error(error: rusqlite::Error) -> PyErr {
             IntegrityError::new_err(error.to_string())
         }
         rusqlite::Error::SqliteFailure(_, _) => OperationalError::new_err(error.to_string()),
+        rusqlite::Error::SqlInputError { error: inner, .. } => match inner.code {
+            ErrorCode::ConstraintViolation => IntegrityError::new_err(error.to_string()),
+            // sqlite3 maps prepare failures like "table ... already exists"
+            // and "no such table" to OperationalError, as SQLAlchemy reports.
+            _ => OperationalError::new_err(error.to_string()),
+        },
         rusqlite::Error::InvalidParameterName(_) | rusqlite::Error::InvalidParameterCount(_, _) => {
             ProgrammingError::new_err(error.to_string())
         }

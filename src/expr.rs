@@ -8,6 +8,17 @@ use crate::{ArgumentError, python_to_sqlite};
 
 type CompiledExpression = (String, Py<PyDict>, String, Vec<Py<PyAny>>);
 
+/// A DDL column definition serialized from Python `Column` metadata. The
+/// SQL type name is rendered in Rust at parse time.
+#[derive(Clone)]
+struct ColumnDdl {
+    name: String,
+    type_name: String,
+    not_null: bool,
+    unique: bool,
+    default: Option<String>,
+}
+
 #[derive(Clone)]
 enum Expr {
     Column(String, String),
@@ -28,6 +39,7 @@ enum Expr {
     NotLikeEscape(Box<Expr>, Box<Expr>, String),
     Function(String, Vec<Expr>),
     Order(Box<Expr>, bool),
+    Neg(Box<Expr>),
 }
 
 #[derive(Clone)]
@@ -53,6 +65,61 @@ enum Statement {
         table: String,
         predicate: Option<Expr>,
     },
+    CreateTable {
+        table: String,
+        columns: Vec<ColumnDdl>,
+        primary_key: Vec<String>,
+    },
+    DropTable {
+        table: String,
+    },
+}
+
+/// SQLAlchemy operator precedences (``sqlalchemy.sql.operators._PRECEDENCE``).
+fn precedence(operator: &str) -> u8 {
+    match operator {
+        "*" | "/" => 8,
+        "+" | "-" => 7,
+        "AND" => 3,
+        "OR" => 2,
+        // Comparisons, IS, IN, BETWEEN, LIKE, and NOT all bind at 5.
+        _ => 5,
+    }
+}
+
+/// Operators that do not parenthesize a same-operator child (SA's
+/// ``_natural_self_precedent``: the associative set).
+fn natural_self_precedent(operator: &str) -> bool {
+    matches!(operator, "+" | "*" | "AND" | "OR")
+}
+
+/// SQLAlchemy ``operators.is_precedent``: whether a child operator needs
+/// parenthesization against its parent operator. Equal precedence groups
+/// unless the child is its own natural-self-precedent operator.
+fn is_precedent(child: &str, parent: &str) -> bool {
+    if child == parent && natural_self_precedent(child) {
+        false
+    } else {
+        precedence(child) <= precedence(parent)
+    }
+}
+
+/// Whether rendering ``expr`` produces nothing (an empty and_/or_ group).
+fn renders_empty(expr: &Expr) -> bool {
+    match expr {
+        Expr::Group(_, items) => items.iter().all(renders_empty),
+        _ => false,
+    }
+}
+
+/// Quote an identifier with double quotes when it is not a bare lowercase
+/// SQLite identifier.
+pub(crate) fn quote_identifier(value: &str) -> String {
+    if needs_quote(value) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 struct Compiler {
@@ -61,6 +128,7 @@ struct Compiler {
     bind_counts: HashMap<String, usize>,
     function_counts: HashMap<String, usize>,
     column_labels: HashMap<String, usize>,
+    anon_count: usize,
 }
 
 impl Compiler {
@@ -71,6 +139,7 @@ impl Compiler {
             bind_counts: HashMap::new(),
             function_counts: HashMap::new(),
             column_labels: HashMap::new(),
+            anon_count: 0,
         }
     }
 
@@ -118,7 +187,7 @@ impl Compiler {
                 ));
                 self.sql.push('?');
             } else {
-                self.expr(value, 0);
+                self.expr(value, None);
             }
         }
     }
@@ -129,7 +198,9 @@ impl Compiler {
         self.sql.push('\'');
     }
 
-    fn expr(&mut self, expr: &Expr, parent_precedence: u8) {
+    /// Render one expression. ``against`` is the parent operator (``None`` at
+    /// statement level); a child self-groups like SQLAlchemy's ``self_group``.
+    fn expr(&mut self, expr: &Expr, against: Option<&str>) {
         match expr {
             Expr::Column(table, column) => {
                 if !table.is_empty() {
@@ -145,38 +216,40 @@ impl Compiler {
                 self.sql.push_str(if *value { "1 = 1" } else { "0 = 1" });
             }
             Expr::Binary(left, op, right) => {
-                let precedence = if op == "*" || op == "/" {
-                    5
-                } else if op == "+" || op == "-" {
-                    4
+                if op == "/" {
+                    // SQLAlchemy's SQLite dialect rewrites true division as
+                    // ``left / (right + 0.0)``; the right operand renders
+                    // inside its own grouping.
+                    self.render_child(left, Some(op.as_str()));
+                    self.sql.push_str(" / (");
+                    self.render_child(right, Some(op.as_str()));
+                    self.sql.push_str(" + 0.0)");
                 } else {
-                    3
-                };
-                let parens = precedence < parent_precedence;
-                if parens {
-                    self.sql.push('(');
-                }
-                self.expr(left, precedence);
-                self.sql.push(' ');
-                self.sql.push_str(op);
-                self.sql.push(' ');
-                self.expr(right, precedence + 1);
-                if parens {
-                    self.sql.push(')');
+                    self.render_child(left, Some(op.as_str()));
+                    self.sql.push(' ');
+                    self.sql.push_str(op);
+                    self.sql.push(' ');
+                    self.render_child(right, Some(op.as_str()));
                 }
             }
             Expr::Group(op, items) => {
-                let precedence = if op == "AND" { 2 } else { 1 };
-                let parens = precedence < parent_precedence;
+                let parens = against.is_some_and(|parent| is_precedent(op, parent));
                 if parens {
                     self.sql.push('(');
                 }
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
+                let mut emitted = false;
+                for item in items {
+                    // Empty and_/or_ groups flatten away like SQLAlchemy's
+                    // BooleanClauseList.
+                    if renders_empty(item) {
+                        continue;
+                    }
+                    if emitted {
                         self.sql
                             .push_str(if op == "AND" { " AND " } else { " OR " });
                     }
-                    self.expr(item, precedence);
+                    self.render_child(item, Some(op.as_str()));
+                    emitted = true;
                 }
                 if parens {
                     self.sql.push(')');
@@ -184,12 +257,18 @@ impl Compiler {
             }
             Expr::Not(inner) => {
                 self.sql.push_str("NOT ");
-                if let Expr::Group(_, _) = inner.as_ref() {
+                // SQLAlchemy wraps the negated element in a Grouping whenever
+                // it is not a plain column/parameter/function operand.
+                let parens = matches!(
+                    inner.as_ref(),
+                    Expr::Group(_, _) | Expr::Binary(_, _, _) | Expr::Not(_)
+                );
+                if parens {
                     self.sql.push('(');
-                    self.expr(inner, 0);
+                    self.expr(inner, None);
                     self.sql.push(')');
                 } else {
-                    self.expr(inner, 0);
+                    self.expr(inner, None);
                 }
             }
             Expr::In(inner, values) | Expr::NotIn(inner, values) => {
@@ -197,7 +276,7 @@ impl Compiler {
                 if negated {
                     self.sql.push('(');
                 }
-                self.expr(inner, 3);
+                self.render_child(inner, Some("IN"));
                 if values.is_empty() {
                     self.sql.push_str(if negated {
                         " NOT IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)"
@@ -215,41 +294,41 @@ impl Compiler {
                 }
             }
             Expr::IsScalar(inner, value) | Expr::IsNotScalar(inner, value) => {
-                self.expr(inner, 3);
+                self.render_child(inner, Some("IS"));
                 self.sql
                     .push_str(if matches!(expr, Expr::IsNotScalar(_, _)) {
                         " IS NOT "
                     } else {
                         " IS "
                     });
-                self.expr(value, 0);
+                self.expr(value, None);
             }
             Expr::IsNull(inner, negated) => {
-                self.expr(inner, 3);
+                self.render_child(inner, Some("IS"));
                 self.sql
                     .push_str(if *negated { " IS NOT NULL" } else { " IS NULL" });
             }
             Expr::Between(inner, low, high) | Expr::NotBetween(inner, low, high) => {
-                self.expr(inner, 3);
+                self.render_child(inner, Some("BETWEEN"));
                 self.sql
                     .push_str(if matches!(expr, Expr::NotBetween(_, _, _)) {
                         " NOT BETWEEN "
                     } else {
                         " BETWEEN "
                     });
-                self.expr(low, 0);
+                self.expr(low, None);
                 self.sql.push_str(" AND ");
-                self.expr(high, 0);
+                self.expr(high, None);
             }
             Expr::LikeEscape(inner, value, escape) | Expr::NotLikeEscape(inner, value, escape) => {
-                self.expr(inner, 3);
+                self.render_child(inner, Some("LIKE"));
                 self.sql
                     .push_str(if matches!(expr, Expr::NotLikeEscape(_, _, _)) {
                         " NOT LIKE "
                     } else {
                         " LIKE "
                     });
-                self.expr(value, 0);
+                self.expr(value, None);
                 self.render_escape(escape);
             }
             Expr::Function(name, args) => {
@@ -262,14 +341,44 @@ impl Compiler {
                     if i > 0 {
                         self.sql.push_str(", ");
                     }
-                    self.expr(arg, 0);
+                    self.expr(arg, None);
                 }
                 self.sql.push(')');
             }
             Expr::Order(inner, ascending) => {
-                self.expr(inner, 0);
+                self.expr(inner, None);
                 self.sql.push_str(if *ascending { " ASC" } else { " DESC" });
             }
+            Expr::Neg(inner) => {
+                self.sql.push('-');
+                match inner.as_ref() {
+                    Expr::Column(_, _) => self.expr(inner, None),
+                    _ => {
+                        self.sql.push('(');
+                        self.expr(inner, None);
+                        self.sql.push(')');
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render ``expr`` as a child of a parent operator, parenthesizing it when
+    /// its own operator is precedent against the parent (SQLAlchemy's
+    /// ``self_group(against=...)`` behavior).
+    fn render_child(&mut self, expr: &Expr, against: Option<&str>) {
+        let parens = match (expr, against) {
+            (Expr::Binary(_, child_op, _), Some(parent))
+            | (Expr::Group(child_op, _), Some(parent)) => is_precedent(child_op, parent),
+            (Expr::Not(_), Some(parent)) => is_precedent("NOT", parent),
+            _ => false,
+        };
+        if parens {
+            self.sql.push('(');
+            self.expr(expr, None);
+            self.sql.push(')');
+        } else {
+            self.expr(expr, against);
         }
     }
 
@@ -284,27 +393,38 @@ impl Compiler {
     }
 
     fn select_expr(&mut self, expr: &Expr) {
-        self.expr(expr, 0);
-        if let Expr::Column(_, label) = expr {
-            let duplicate = {
-                let count = self.column_labels.entry(label.clone()).or_insert(0);
-                let duplicate = (*count > 0).then_some(*count);
-                *count += 1;
-                duplicate
-            };
-            if let Some(count) = duplicate {
-                self.sql.push_str(" AS ");
-                self.ident(&format!("{label}__{count}"));
+        self.expr(expr, None);
+        match expr {
+            // A negated plain column stays column-like: SQLAlchemy emits no label.
+            Expr::Neg(inner) if matches!(inner.as_ref(), Expr::Column(_, _)) => {}
+            Expr::Column(_, label) => {
+                let duplicate = {
+                    let count = self.column_labels.entry(label.clone()).or_insert(0);
+                    let duplicate = (*count > 0).then_some(*count);
+                    *count += 1;
+                    duplicate
+                };
+                if let Some(count) = duplicate {
+                    self.sql.push_str(" AS ");
+                    self.ident(&format!("{label}__{count}"));
+                }
             }
-        }
-        if let Expr::Function(name, _) = expr {
-            let count = {
-                let count = self.function_counts.entry(name.clone()).or_insert(0);
-                *count += 1;
-                *count
-            };
-            self.sql.push_str(" AS ");
-            self.ident(&format!("{name}_{count}"));
+            Expr::Function(name, _) => {
+                let count = {
+                    let count = self.function_counts.entry(name.clone()).or_insert(0);
+                    *count += 1;
+                    *count
+                };
+                self.sql.push_str(" AS ");
+                self.ident(&format!("{name}_{count}"));
+            }
+            // Unlabeled non-column select items receive SQLAlchemy's anon_N
+            // series with its own per-compile counter.
+            _ => {
+                self.anon_count += 1;
+                self.sql.push_str(" AS ");
+                self.ident(&format!("anon_{}", self.anon_count));
+            }
         }
     }
 
@@ -318,20 +438,25 @@ impl Compiler {
                 limit,
                 offset,
             } => {
-                self.sql.push_str("SELECT ");
-                for (i, column) in columns.iter().enumerate() {
-                    if i > 0 {
-                        self.sql.push_str(", ");
+                self.sql.push_str("SELECT");
+                if !columns.is_empty() {
+                    self.sql.push(' ');
+                    for (i, column) in columns.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.select_expr(column);
                     }
-                    self.select_expr(column);
                 }
                 if let Some(table) = table {
                     self.sql.push_str(" \nFROM ");
                     self.ident(table);
                 }
-                if let Some(predicate) = predicate {
+                if let Some(predicate) = predicate
+                    && !renders_empty(predicate)
+                {
                     self.sql.push_str(" \nWHERE ");
-                    self.expr(predicate, 0);
+                    self.expr(predicate, None);
                 }
                 if !order.is_empty() {
                     self.sql.push_str(" ORDER BY ");
@@ -339,19 +464,19 @@ impl Compiler {
                         if i > 0 {
                             self.sql.push_str(", ");
                         }
-                        self.expr(value, 0);
+                        self.expr(value, None);
                     }
                 }
                 if limit.is_some() || offset.is_some() {
                     self.sql.push_str("\n LIMIT ");
                     if let Some(limit) = limit {
-                        self.expr(limit, 0);
+                        self.expr(limit, None);
                     } else {
                         self.sql.push_str("-1");
                     }
                     self.sql.push_str(" OFFSET ");
                     if let Some(offset) = offset {
-                        self.expr(offset, 0);
+                        self.expr(offset, None);
                     } else {
                         self.sql.push('0');
                     }
@@ -373,7 +498,7 @@ impl Compiler {
                     if i > 0 {
                         self.sql.push_str(", ");
                     }
-                    self.expr(value, 0);
+                    self.expr(value, None);
                 }
                 self.sql.push(')');
                 "insert"
@@ -392,11 +517,11 @@ impl Compiler {
                     }
                     self.ident(name);
                     self.sql.push('=');
-                    self.expr(value, 0);
+                    self.expr(value, None);
                 }
                 if let Some(predicate) = predicate {
                     self.sql.push_str(" WHERE ");
-                    self.expr(predicate, 0);
+                    self.expr(predicate, None);
                 }
                 "update"
             }
@@ -405,9 +530,60 @@ impl Compiler {
                 self.ident(table);
                 if let Some(predicate) = predicate {
                     self.sql.push_str(" WHERE ");
-                    self.expr(predicate, 0);
+                    self.expr(predicate, None);
                 }
                 "delete"
+            }
+            Statement::CreateTable {
+                table,
+                columns,
+                primary_key,
+            } => {
+                self.sql.push('\n');
+                self.sql.push_str("CREATE TABLE ");
+                self.ident(table);
+                if columns.is_empty() {
+                    self.sql.push_str(" (\n");
+                } else {
+                    self.sql.push_str(" (\n\t");
+                }
+                let mut lines: Vec<String> = columns
+                    .iter()
+                    .map(|column| {
+                        let mut line = quote_identifier(&column.name);
+                        line.push(' ');
+                        line.push_str(&column.type_name);
+                        if let Some(default) = &column.default {
+                            line.push_str(" DEFAULT '");
+                            line.push_str(&default.replace('\'', "''"));
+                            line.push('\'');
+                        }
+                        if column.not_null {
+                            line.push_str(" NOT NULL");
+                        }
+                        line
+                    })
+                    .collect();
+                if !primary_key.is_empty() {
+                    let keys = primary_key
+                        .iter()
+                        .map(|key| quote_identifier(key))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!("PRIMARY KEY ({keys})"));
+                }
+                for column in columns.iter().filter(|column| column.unique) {
+                    lines.push(format!("UNIQUE ({})", quote_identifier(&column.name)));
+                }
+                self.sql.push_str(&lines.join(", \n\t"));
+                self.sql.push_str("\n)\n\n");
+                "create_table"
+            }
+            Statement::DropTable { table } => {
+                self.sql.push('\n');
+                self.sql.push_str("DROP TABLE ");
+                self.ident(table);
+                "drop_table"
             }
         };
         (self.sql, self.params, kind)
@@ -693,6 +869,10 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?),
             item(value, 2)?.extract()?,
         )),
+        "neg" => Ok(Expr::Neg(Box::new(parse_expr_at_depth(
+            &item(value, 1)?,
+            child_depth,
+        )?))),
         _ => Err(ArgumentError::new_err(format!(
             "Unknown expression node '{name}'"
         ))),
@@ -706,6 +886,50 @@ fn parse_values(value: &Bound<'_, PyAny>) -> PyResult<Vec<(String, Expr)>> {
         result.push((key.extract()?, parse_expr(&value)?));
     }
     Ok(result)
+}
+
+/// Map a Python type-marker tag to its SQLite DDL type name (SQLAlchemy's
+/// SQLite type compiler rendering for the equivalent type).
+fn render_type_name(tag: &str, length: Option<u64>) -> PyResult<String> {
+    match tag {
+        "integer" => Ok("INTEGER".to_owned()),
+        "string" => {
+            Ok(length.map_or_else(|| "VARCHAR".to_owned(), |size| format!("VARCHAR({size})")))
+        }
+        "text" => Ok("TEXT".to_owned()),
+        "boolean" => Ok("BOOLEAN".to_owned()),
+        "float" => Ok("FLOAT".to_owned()),
+        "datetime" => Ok("DATETIME".to_owned()),
+        other => Err(ArgumentError::new_err(format!(
+            "Unsupported DDL column type '{other}'"
+        ))),
+    }
+}
+
+fn parse_column_def(value: &Bound<'_, PyAny>) -> PyResult<ColumnDdl> {
+    let name = string_at(value, 0)?;
+    let type_tag = string_at(value, 1)?;
+    let length_value = item(value, 2)?;
+    let length = if length_value.is_none() {
+        None
+    } else {
+        Some(length_value.extract::<u64>()?)
+    };
+    let not_null = item(value, 3)?.extract()?;
+    let unique = item(value, 4)?.extract()?;
+    let default_value = item(value, 5)?;
+    let default = if default_value.is_none() {
+        None
+    } else {
+        Some(default_value.extract::<String>()?)
+    };
+    Ok(ColumnDdl {
+        name,
+        type_name: render_type_name(&type_tag, length)?,
+        not_null,
+        unique,
+        default,
+    })
 }
 
 fn parse_statement(value: &Bound<'_, PyAny>) -> PyResult<Statement> {
@@ -780,6 +1004,24 @@ fn parse_statement(value: &Bound<'_, PyAny>) -> PyResult<Statement> {
                 },
             })
         }
+        "create_table" => {
+            let columns = seq(&item(value, 2)?)?
+                .iter()
+                .map(parse_column_def)
+                .collect::<PyResult<Vec<_>>>()?;
+            let primary_key = seq(&item(value, 3)?)?
+                .iter()
+                .map(|key| key.extract())
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(Statement::CreateTable {
+                table: string_at(value, 1)?,
+                columns,
+                primary_key,
+            })
+        }
+        "drop_table" => Ok(Statement::DropTable {
+            table: string_at(value, 1)?,
+        }),
         _ => Err(ArgumentError::new_err(format!(
             "Unknown statement '{name}'"
         ))),
@@ -805,12 +1047,66 @@ pub(crate) fn compile_expression(
 
 #[cfg(test)]
 mod tests {
-    use super::needs_quote;
+    use super::{is_precedent, natural_self_precedent, needs_quote, precedence, renders_empty};
+
     #[test]
     fn identifier_rules_quote_reserved_and_mixed_case() {
         assert!(!needs_quote("simple_name2"));
         assert!(needs_quote("MixedCase"));
         assert!(needs_quote("order"));
         assert!(needs_quote("has-dash"));
+    }
+
+    #[test]
+    fn precedence_matches_sqlalchemy_operator_table() {
+        assert_eq!(precedence("*"), 8);
+        assert_eq!(precedence("/"), 8);
+        assert_eq!(precedence("+"), 7);
+        assert_eq!(precedence("-"), 7);
+        assert_eq!(precedence("="), 5);
+        assert_eq!(precedence("AND"), 3);
+        assert_eq!(precedence("OR"), 2);
+    }
+
+    #[test]
+    fn self_precedent_matches_sqlalchemy() {
+        // Associative operators do not parenthesize same-operator children.
+        assert!(!is_precedent("+", "+"));
+        assert!(!is_precedent("*", "*"));
+        assert!(!is_precedent("AND", "AND"));
+        // Subtraction and division do (SQLAlchemy left-associativity).
+        assert!(is_precedent("-", "-"));
+        assert!(is_precedent("/", "/"));
+        // Equal precedence with a different operator still groups.
+        assert!(is_precedent("*", "/"));
+        assert!(is_precedent("+", "-"));
+        // Tighter children of looser parents group; the reverse does not.
+        assert!(is_precedent("OR", "AND"));
+        assert!(!is_precedent("AND", "OR"));
+        assert!(!is_precedent("+", "="));
+        assert!(!is_precedent("*", "+"));
+    }
+
+    #[test]
+    fn natural_self_precedent_covers_associative_operators() {
+        assert!(natural_self_precedent("+"));
+        assert!(natural_self_precedent("*"));
+        assert!(natural_self_precedent("AND"));
+        assert!(natural_self_precedent("OR"));
+        assert!(!natural_self_precedent("-"));
+        assert!(!natural_self_precedent("/"));
+    }
+
+    #[test]
+    fn empty_boolean_groups_render_empty() {
+        assert!(renders_empty(&super::Expr::Group(
+            "AND".to_owned(),
+            Vec::new()
+        )));
+        assert!(renders_empty(&super::Expr::Group(
+            "OR".to_owned(),
+            vec![super::Expr::Group("AND".to_owned(), Vec::new())]
+        )));
+        assert!(!renders_empty(&super::Expr::BooleanWord(true)));
     }
 }

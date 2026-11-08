@@ -369,6 +369,216 @@ def test_direct_ffi_expression_depth_guard_is_catchable() -> None:
         compile_expression(("select", (node,), "records", None, (), None, None))
 
 
+@pytest.mark.parametrize(
+    ("build", "sa_build"),
+    [
+        (
+            lambda t: select(t.c.id + t.c.id),
+            lambda t: sa_select(t.c.id + t.c.id),
+        ),
+        (
+            lambda t: select((t.c.id + t.c.id) * t.c.id),
+            lambda t: sa_select((t.c.id + t.c.id) * t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id + (t.c.id * t.c.id)),
+            lambda t: sa_select(t.c.id + (t.c.id * t.c.id)),
+        ),
+        (
+            lambda t: select((t.c.id - t.c.id) - t.c.id),
+            lambda t: sa_select((t.c.id - t.c.id) - t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id - (t.c.id - t.c.id)),
+            lambda t: sa_select(t.c.id - (t.c.id - t.c.id)),
+        ),
+        (
+            lambda t: select(t.c.id + t.c.id + t.c.id + t.c.id),
+            lambda t: sa_select(t.c.id + t.c.id + t.c.id + t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id - t.c.id - t.c.id - t.c.id),
+            lambda t: sa_select(t.c.id - t.c.id - t.c.id - t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id - t.c.id + t.c.id),
+            lambda t: sa_select(t.c.id - t.c.id + t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id - (t.c.id + t.c.id)),
+            lambda t: sa_select(t.c.id - (t.c.id + t.c.id)),
+        ),
+        (
+            lambda t: select((t.c.id * t.c.id) + (t.c.id * t.c.id)),
+            lambda t: sa_select((t.c.id * t.c.id) + (t.c.id * t.c.id)),
+        ),
+        (
+            lambda t: select(t.c.id * t.c.id - t.c.id),
+            lambda t: sa_select(t.c.id * t.c.id - t.c.id),
+        ),
+        (
+            lambda t: select((t.c.id + t.c.id) * 2 == 4),
+            lambda t: sa_select((t.c.id + t.c.id) * 2 == 4),
+        ),
+    ],
+    ids=[
+        "plus-select-item",
+        "grouped-plus-times-column",
+        "plus-times-right",
+        "minus-left-group",
+        "minus-right-group",
+        "plus-chain",
+        "minus-chain",
+        "minus-then-plus",
+        "minus-right-plus",
+        "mul-groups",
+        "mul-minus",
+        "grouped-plus-in-select",
+    ],
+)
+def test_arithmetic_select_items_match_sqlalchemy(build: object, sa_build: object) -> None:
+    table, sa_table = _tables()
+    _assert_parity(build(table), sa_build(sa_table))  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("build", "sa_build"),
+    [
+        (
+            lambda t: select(t.c.id / t.c.id),
+            lambda t: sa_select(t.c.id / t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id / 2),
+            lambda t: sa_select(t.c.id / 2),
+        ),
+        (
+            lambda t: select((t.c.id + t.c.id) / t.c.id),
+            lambda t: sa_select((t.c.id + t.c.id) / t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id / (t.c.id + t.c.id)),
+            lambda t: sa_select(t.c.id / (t.c.id + t.c.id)),
+        ),
+        (
+            lambda t: select(t.c.id / (t.c.id * t.c.id)),
+            lambda t: sa_select(t.c.id / (t.c.id * t.c.id)),
+        ),
+        (
+            lambda t: select(t.c.id / t.c.id * t.c.id),
+            lambda t: sa_select(t.c.id / t.c.id * t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id * t.c.id / t.c.id),
+            lambda t: sa_select(t.c.id * t.c.id / t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id / t.c.id / t.c.id),
+            lambda t: sa_select(t.c.id / t.c.id / t.c.id),
+        ),
+        (
+            lambda t: select(t.c.id).where(t.c.score / t.c.id > 1),
+            lambda t: sa_select(t.c.id).where(t.c.score / t.c.id > 1),
+        ),
+    ],
+    ids=[
+        "truediv-columns",
+        "truediv-literal",
+        "truediv-left-group",
+        "truediv-right-group",
+        "truediv-right-mul",
+        "truediv-times-column",
+        "mul-truediv",
+        "truediv-chain",
+        "truediv-where",
+    ],
+)
+def test_truediv_rendering_matches_sqlalchemy(build: object, sa_build: object) -> None:
+    """SQLAlchemy's SQLite dialect rewrites ``/`` as ``left / (right + 0.0)``."""
+    table, sa_table = _tables()
+    _assert_parity(build(table), sa_build(sa_table))  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("build", "sa_build"),
+    [
+        (
+            lambda t: select(t.c.id + 1, t.c.id * 2, func.count(t.c.id)),
+            lambda t: sa_select(t.c.id + 1, t.c.id * 2, sa_func.count(t.c.id)),
+        ),
+        (
+            lambda t: select(func.count(t.c.id), func.count(t.c.name), t.c.id + 1),
+            lambda t: sa_select(sa_func.count(t.c.id), sa_func.count(t.c.name), t.c.id + 1),
+        ),
+        (
+            lambda t: select(t.c.id, t.c.id, t.c.id + 1),
+            lambda t: sa_select(t.c.id, t.c.id, t.c.id + 1),
+        ),
+    ],
+    ids=["anon-and-func", "funcs-then-anon", "dup-cols-then-anon"],
+)
+def test_unlabeled_select_item_labels_match_sqlalchemy(build: object, sa_build: object) -> None:
+    table, sa_table = _tables()
+    _assert_parity(build(table), sa_build(sa_table))  # type: ignore[operator]
+
+
+def test_empty_select_matches_sqlalchemy() -> None:
+    assert str(select()) == "SELECT"
+    compiled = select().compile()
+    assert compiled.params == {}
+
+
+@pytest.mark.parametrize(("catalyst_construct", "sa_construct"), [(and_, sa_and), (or_, sa_or)])
+def test_empty_boolean_groups_drop_where_clause(
+    catalyst_construct: object, sa_construct: object
+) -> None:
+    table, sa_table = _tables()
+    with pytest.warns(DeprecationWarning):
+        catalyst_statement = select(table.c.id).where(catalyst_construct())  # type: ignore[operator]
+    with pytest.warns(DeprecationWarning):
+        sqlalchemy_statement = sa_select(sa_table.c.id).where(sa_construct())  # type: ignore[operator]
+    _assert_parity(catalyst_statement, sqlalchemy_statement)
+    # A later where() chains past the empty group like SQLAlchemy's flatten.
+    _assert_parity(
+        select(table.c.id).where(catalyst_construct()).where(table.c.id == 1),  # type: ignore[operator]
+        sa_select(sa_table.c.id).where(sa_construct()).where(sa_table.c.id == 1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("build", "sa_build"),
+    [
+        (
+            lambda t: not_(t.c.id + 1),
+            lambda t: sa_not(t.c.id + 1),
+        ),
+        (
+            lambda t: not_(not_(t.c.id + 1)),
+            lambda t: sa_not(sa_not(t.c.id + 1)),
+        ),
+        (
+            lambda t: not_(and_(t.c.id == 1, t.c.id == 2)),
+            lambda t: sa_not(sa_and(t.c.id == 1, t.c.id == 2)),
+        ),
+        (
+            lambda t: not_(or_(t.c.id == 1, t.c.id == 2)),
+            lambda t: sa_not(sa_or(t.c.id == 1, t.c.id == 2)),
+        ),
+        (
+            lambda t: not_(not_(t.c.id.in_([1, 2]))),
+            lambda t: sa_not(sa_not(t.c.id.in_([1, 2]))),
+        ),
+    ],
+    ids=["not-arith", "not-not-arith", "not-and-group", "not-or-group", "double-not-in"],
+)
+def test_not_uncovered_shapes_match_sqlalchemy(build: object, sa_build: object) -> None:
+    table, sa_table = _tables()
+    _assert_parity(
+        select(table.c.id).where(build(table)),
+        sa_select(sa_table.c.id).where(sa_build(sa_table)),
+    )
+
+
 def test_compile_parameters_and_execution_rowcount() -> None:
     table = Table(
         "items", MetaData(), Column("id", Integer, primary_key=True), Column("name", String)
@@ -397,3 +607,31 @@ def test_compile_parameters_and_execution_rowcount() -> None:
             assert connection.execute(delete(table).where(table.c.id == 1)).rowcount == 1
     finally:
         engine.dispose()
+
+
+def test_unary_minus_matches_sqlalchemy() -> None:
+    """Unary negation rendering: bare column, compound parens, nested negation."""
+    table, sa_table = _tables()
+    negated_column = -table.c.id
+    sa_negated_column = -sa_table.c.id
+    cases = [
+        select(-table.c.id),
+        select(-(table.c.id + 1)),
+        select(-negated_column),
+        select(-table.c.id + 3),
+        select(table.c.id).where(-table.c.id < 0),
+    ]
+    sa_cases = [
+        sa_select(-sa_table.c.id),
+        sa_select(-(sa_table.c.id + 1)),
+        sa_select(-sa_negated_column),
+        sa_select(-sa_table.c.id + 3),
+        sa_select(sa_table.c.id).where(-sa_table.c.id < 0),
+    ]
+    for catalyst_stmt, sa_stmt in zip(cases, sa_cases, strict=True):
+        catalyst_compiled = catalyst_stmt.compile()
+        sa_compiled = sa_stmt.compile(
+            dialect=sqlite.dialect(), compile_kwargs={"render_postcompile": True}
+        )
+        assert catalyst_compiled.string.replace("\n", " ") == str(sa_compiled).replace("\n", " ")
+        assert dict(catalyst_compiled.params) == dict(sa_compiled.params)

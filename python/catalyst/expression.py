@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ._catalyst import ArgumentError, compile_expression
+
+if TYPE_CHECKING:
+    from .engine import AsyncEngine, Engine
 
 
 class TypeEngine:
@@ -43,7 +47,14 @@ class Column:
     name: str
     type: object = None
     primary_key: bool = False
-    nullable: bool = True
+    # SQLAlchemy treats an unspecified ``nullable`` as False for primary key
+    # columns and True otherwise.
+    nullable: bool | None = None
+    unique: bool = False
+    # Client-side insert default (metadata only; never rendered in DDL,
+    # matching SQLAlchemy's ``Column.default``).
+    default: object = None
+    server_default: str | None = None
     table_name: str = field(default="", init=False, repr=False, compare=False)
     owner: Table | None = field(default=None, init=False, repr=False, compare=False)
 
@@ -84,6 +95,9 @@ class Column:
 
     def __truediv__(self, other: object) -> Expression:
         return self._binary("/", other)
+
+    def __neg__(self) -> Expression:
+        return Expression(("neg", self.serialize()))
 
     def in_(self, values: Sequence[object]) -> Expression:
         candidate = cast(object, values)
@@ -144,10 +158,35 @@ class _ColumnCollection:
 
 
 class MetaData:
-    """Container for table metadata (DDL is not implemented)."""
+    """Container for table metadata with SQLAlchemy-style DDL creation."""
 
     def __init__(self) -> None:
         self.tables: dict[str, Table] = {}
+
+    def create_all(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
+        """Create every table in this metadata in declaration order.
+
+        Returns a coroutine when ``bind`` is an :class:`AsyncEngine`; the
+        synchronous path creates tables immediately.
+        """
+        from .engine import run_ddl
+
+        tables = list(self.tables.values())
+        return run_ddl(
+            bind, tables, [table.compile_ddl() for table in tables], checkfirst, drop=False
+        )
+
+    def drop_all(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
+        """Drop every table in this metadata in reverse declaration order.
+
+        Returns a coroutine when ``bind`` is an :class:`AsyncEngine`.
+        """
+        from .engine import run_ddl
+
+        tables = list(reversed(list(self.tables.values())))
+        return run_ddl(
+            bind, tables, [table.compile_drop() for table in tables], checkfirst, drop=True
+        )
 
 
 class Table:
@@ -163,7 +202,15 @@ class Table:
         self.metadata = metadata
         bound_columns: list[Column] = []
         for column in columns:
-            bound = Column(column.name, column.type, column.primary_key, column.nullable)
+            bound = Column(
+                column.name,
+                column.type,
+                column.primary_key,
+                column.nullable,
+                column.unique,
+                column.default,
+                column.server_default,
+            )
             object.__setattr__(bound, "table_name", name)
             object.__setattr__(bound, "owner", self)
             bound_columns.append(bound)
@@ -173,6 +220,41 @@ class Table:
 
     def __iter__(self) -> Iterator[Column]:
         return iter(self.columns)
+
+    def compile_ddl(self) -> Compiled:
+        """Compile this table's ``CREATE TABLE`` statement natively."""
+        columns = tuple(
+            (
+                column.name,
+                *_type_node(column.type),
+                not _is_nullable(column),
+                bool(column.unique),
+                column.server_default,
+            )
+            for column in self.columns
+        )
+        primary_key = tuple(column.name for column in self.columns if column.primary_key)
+        sql, _params, kind, _ordered = compile_expression(
+            ("create_table", self.name, columns, primary_key)
+        )
+        return Compiled(sql, {}, kind, [])
+
+    def compile_drop(self) -> Compiled:
+        """Compile this table's ``DROP TABLE`` statement natively."""
+        sql, _params, kind, _ordered = compile_expression(("drop_table", self.name))
+        return Compiled(sql, {}, kind, [])
+
+    def create(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
+        """Create this table; returns a coroutine for an :class:`AsyncEngine`."""
+        from .engine import run_ddl
+
+        return run_ddl(bind, [self], [self.compile_ddl()], checkfirst, drop=False)
+
+    def drop(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
+        """Drop this table; returns a coroutine for an :class:`AsyncEngine`."""
+        from .engine import run_ddl
+
+        return run_ddl(bind, [self], [self.compile_drop()], checkfirst, drop=True)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -193,6 +275,9 @@ class Expression:
 
     def __ne__(self, other: object) -> Expression:  # type: ignore[override]
         return self._binary("!=", other)
+
+    def __neg__(self) -> Expression:
+        return Expression(("neg", self.node))
 
     def _binary(self, operator: str, other: object) -> Expression:
         return Expression(("binary", self.node, operator, _value(other)))
@@ -242,6 +327,33 @@ def _check_node_depth(node: object) -> None:
             _check_node_depth(child)
 
 
+_TYPE_TAGS = {
+    "Integer": "integer",
+    "String": "string",
+    "Text": "text",
+    "Boolean": "boolean",
+    "Float": "float",
+    "DateTime": "datetime",
+}
+
+
+def _type_node(type_obj: object) -> tuple[str, int | None]:
+    """Map a Catalyst type marker to the native DDL type tag and length."""
+    marker = type_obj if isinstance(type_obj, type) else type(type_obj)
+    tag = _TYPE_TAGS.get(marker.__name__)
+    if tag is None:
+        raise ArgumentError(f"Unsupported DDL column type '{marker.__name__}'")
+    length = None if isinstance(type_obj, type) else getattr(type_obj, "length", None)
+    return tag, length
+
+
+def _is_nullable(column: Column) -> bool:
+    """Resolve SQLAlchemy's nullable default (False for primary key columns)."""
+    if column.nullable is not None:
+        return column.nullable
+    return not column.primary_key
+
+
 def _source_table(node: object) -> str | None:
     if not isinstance(node, tuple):
         return None
@@ -256,14 +368,38 @@ def _source_table(node: object) -> str | None:
 
 
 def and_(*clauses: Column | Expression) -> Expression:
+    if not clauses:
+        warnings.warn(
+            "Invoking and_() without arguments is deprecated, and will be disallowed "
+            "in a future release.   For an empty and_() construct, use "
+            "'and_(true(), *args)' or 'and_(True, *args)'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return Expression(("and", tuple(_node(clause) for clause in clauses)))
 
 
 def or_(*clauses: Column | Expression) -> Expression:
+    if not clauses:
+        warnings.warn(
+            "Invoking or_() without arguments is deprecated, and will be disallowed "
+            "in a future release.   For an empty or_() construct, use "
+            "'or_(false(), *args)' or 'or_(False, *args)'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return Expression(("or", tuple(_node(clause) for clause in clauses)))
 
 
-_NEGATIONS = {"=": "!=", "!=": "=", "<": ">=", ">": "<=", "<=": ">", ">=": "<", "LIKE": "NOT LIKE"}
+_NEGATIONS = {
+    "=": "!=",
+    "!=": "=",
+    "<": ">=",
+    ">": "<=",
+    "<=": ">",
+    ">=": "<",
+    "LIKE": "NOT LIKE",
+}
 
 
 def not_(clause: Column | Expression) -> Expression:
@@ -273,8 +409,16 @@ def not_(clause: Column | Expression) -> Expression:
         return Expression(("binary", node[1], _NEGATIONS[node[2]], node[3]))
     if node[0] == "in":
         return Expression(("not_in", node[1], node[2]))
+    if node[0] == "not_in":
+        return Expression(("in", node[1], node[2]))
     if node[0] == "like_escape":
         return Expression(("not_like_escape", node[1], node[2], node[3]))
+    if node[0] == "not_like_escape":
+        return Expression(("like_escape", node[1], node[2], node[3]))
+    if node[0] == "between":
+        return Expression(("not_between", node[1], node[2], node[3]))
+    if node[0] == "not_between":
+        return Expression(("between", node[1], node[2], node[3]))
     if node[0] == "is":
         return Expression(("is_not", node[1]))
     if node[0] == "is_not":
