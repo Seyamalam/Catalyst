@@ -472,7 +472,11 @@ def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
     if type_tag in {"date", "datetime"}:
         from datetime import date, datetime
 
-        return type_tag if isinstance(value, (date, datetime)) else None
+        if isinstance(value, datetime):
+            return "datetime"
+        if isinstance(value, date):
+            return "date"
+        return None
     if type_tag == "integer":
         return type_tag if isinstance(value, int) and not isinstance(value, bool) else None
     if type_tag == "float":

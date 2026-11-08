@@ -150,9 +150,8 @@ class Connection:
             first = parameters[0]
             first_values = cast(Mapping[str, object], first)
             defaults = dict(statement.values_map)
-            # SQLAlchemy fixes the executemany INSERT shape from the first row;
-            # later-only and unknown keys are ignored. Missing first-row keys
-            # are legal only when supplied by statement-level .values().
+            # SQLAlchemy fixes INSERT shape from the first row plus the
+            # statement-level .values(); later-only and unknown keys are ignored.
             shape_names = set(first_values) | set(defaults)
             required_row_names = set(first_values) - set(defaults)
             for group, row in enumerate(parameters):
@@ -173,6 +172,18 @@ class Connection:
             ]
             insert_shape = {name: defaults.get(name) for name in ordered_names}
             statement = Insert(statement.table).values(insert_shape)
+            compiled_shape = statement.compile()
+            statement_values = dict(compiled_shape.params)
+            statement_values.update(defaults)
+            statement = Compiled(
+                compiled_shape.string,
+                statement_values,
+                compiled_shape.statement_kind,
+                [statement_values[name] for name in compiled_shape._bind_names],
+                compiled_shape._bind_types,
+                compiled_shape._bind_names,
+                compiled_shape._result_types,
+            )
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
         if isinstance(statement, Compiled) and isinstance(parameters, Sequence) and parameters:
@@ -390,9 +401,8 @@ class AsyncConnection:
             first = parameters[0]
             first_values = cast(Mapping[str, object], first)
             defaults = dict(statement.values_map)
-            # SQLAlchemy fixes the executemany INSERT shape from the first row;
-            # later-only and unknown keys are ignored. Missing first-row keys
-            # are legal only when supplied by statement-level .values().
+            # SQLAlchemy fixes INSERT shape from the first row plus the
+            # statement-level .values(); later-only and unknown keys are ignored.
             shape_names = set(first_values) | set(defaults)
             required_row_names = set(first_values) - set(defaults)
             for group, row in enumerate(parameters):
@@ -413,6 +423,18 @@ class AsyncConnection:
             ]
             insert_shape = {name: defaults.get(name) for name in ordered_names}
             statement = Insert(statement.table).values(insert_shape)
+            compiled_shape = statement.compile()
+            statement_values = dict(compiled_shape.params)
+            statement_values.update(defaults)
+            statement = Compiled(
+                compiled_shape.string,
+                statement_values,
+                compiled_shape.statement_kind,
+                [statement_values[name] for name in compiled_shape._bind_names],
+                compiled_shape._bind_types,
+                compiled_shape._bind_names,
+                compiled_shape._result_types,
+            )
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
         if isinstance(statement, Compiled) and isinstance(parameters, Sequence) and parameters:
