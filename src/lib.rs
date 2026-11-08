@@ -5,14 +5,16 @@ mod pool;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple};
 use rusqlite::{Connection, params_from_iter, types::Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use pool::{DEFAULT_POOL_SIZE, Pool, PoolError, PooledConnection, TransactionState};
+
+type TypeMetadata = (Vec<Option<String>>, Vec<String>, Vec<Option<String>>);
 
 create_exception!(
     _catalyst,
@@ -115,6 +117,11 @@ struct NativeResult {
     rows: Vec<Vec<Py<PyAny>>>,
     next_row: usize,
     rowcount: i64,
+}
+
+enum BatchValues {
+    Named(std::collections::HashMap<String, Value>),
+    Positional(Vec<Value>),
 }
 
 #[pymethods]
@@ -260,44 +267,80 @@ impl NativeConnection {
 
 #[pymethods]
 impl NativeConnection {
-    /// Execute SQL with positional values or a named mapping, buffering rows natively.
-    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None))]
+    /// Execute SQL with positional or named binds, including a complete executemany batch.
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None, type_metadata=None))]
     fn execute(
         &self,
         sql: &str,
         parameters: &Bound<'_, PyAny>,
         text_mode: bool,
         statement_kind: Option<&str>,
+        type_metadata: Option<TypeMetadata>,
         py: Python<'_>,
     ) -> PyResult<NativeResult> {
-        let named_values = if let Ok(mapping) = parameters.cast::<PyDict>() {
-            Some(
-                mapping
-                    .iter()
-                    .map(|(key, value)| {
-                        let key = key.extract::<String>().map_err(|_| {
-                            StatementError::new_err(
-                                "Mapping keys must be strings for named bind parameters",
-                            )
-                        })?;
-                        Ok((key, python_to_sqlite(&value)?))
-                    })
-                    .collect::<PyResult<std::collections::HashMap<_, _>>>()?,
-            )
+        let (bind_types, bind_names, result_types) = type_metadata.unwrap_or_default();
+        let mut batch = None;
+        let mut named_values = None;
+        let mut positional_values = None;
+        if let Ok(mapping) = parameters.cast::<PyDict>() {
+            named_values = Some(convert_named_values(
+                mapping,
+                Some((&bind_names, &bind_types)),
+            )?);
+        } else if let Ok(list) = parameters.cast::<PyList>() {
+            if list.is_empty() && text_mode {
+                named_values = Some(std::collections::HashMap::new());
+            } else if !list.is_empty()
+                && (list.get_item(0)?.is_instance_of::<PyDict>()
+                    || list.get_item(0)?.is_instance_of::<PyList>()
+                    || list.get_item(0)?.is_instance_of::<PyTuple>())
+            {
+                let mut rows = Vec::with_capacity(list.len());
+                for row in list.iter() {
+                    if let Ok(mapping) = row.cast::<PyDict>() {
+                        let converted =
+                            convert_named_values(mapping, Some((&bind_names, &bind_types)))?;
+                        if bind_names.is_empty() {
+                            rows.push(BatchValues::Named(converted));
+                        } else {
+                            let values = bind_names
+                                .iter()
+                                .map(|name| {
+                                    converted.get(name).cloned().ok_or_else(|| {
+                                        StatementError::new_err(format!(
+                                            "A value is required for bind parameter '{name}'"
+                                        ))
+                                    })
+                                })
+                                .collect::<PyResult<Vec<_>>>()?;
+                            rows.push(BatchValues::Positional(values));
+                        }
+                    } else {
+                        let values = row
+                            .extract::<Vec<Py<PyAny>>>()?
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| {
+                                python_to_sqlite_typed(
+                                    value.bind(py),
+                                    bind_types.get(index).and_then(Option::as_deref),
+                                )
+                            })
+                            .collect::<PyResult<Vec<_>>>()?;
+                        rows.push(BatchValues::Positional(values));
+                    }
+                }
+                batch = Some(rows);
+            } else {
+                positional_values = Some(convert_positional_values(list, &bind_types, py)?);
+            }
+        } else if let Ok(tuple) = parameters.cast::<PyTuple>() {
+            positional_values = Some(convert_positional_values(tuple, &bind_types, py)?);
         } else {
-            None
-        };
-        let positional_values = if named_values.is_none() {
-            Some(
-                parameters
-                    .extract::<Vec<Py<PyAny>>>()?
-                    .iter()
-                    .map(|value| python_to_sqlite(value.bind(py)))
-                    .collect::<PyResult<Vec<_>>>()?,
-            )
-        } else {
-            None
-        };
+            return Err(PyTypeError::new_err(
+                "parameters must be a mapping or sequence",
+            ));
+        }
         // SQLAlchemy scopes the `\:` literal-colon escape to text() execution;
         // raw-string positional SQL must not be rewritten.
         let sql = if text_mode {
@@ -328,43 +371,47 @@ impl NativeConnection {
             if connection.is_autocommit() {
                 state.active = false;
                 state.savepoints.clear();
-                connection.execute_batch("BEGIN").map_err(map_sqlite_error)?;
+                connection
+                    .execute_batch("BEGIN")
+                    .map_err(map_sqlite_error)?;
                 state.active = true;
             } else {
                 // Another checkout may have opened the transaction on this shared wire.
                 state.active = true;
             }
             holder_active.store(true, Ordering::Release);
-            let mut statement = connection
-                .prepare_cached(&sql)
-                .map_err(map_sqlite_error)?;
+            let mut statement = connection.prepare_cached(&sql).map_err(map_sqlite_error)?;
+            if batch.is_some() {
+                let is_select = statement_kind.as_deref() == Some("select")
+                    || sql.trim_start().to_ascii_lowercase().starts_with("select");
+                if is_select || statement.column_count() > 0 {
+                    return Err(ProgrammingError::new_err(
+                        "executemany() can only execute DML statements.",
+                    ));
+                }
+            }
             let columns = statement
                 .column_names()
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect::<Vec<_>>();
-            let values = if let Some(named) = named_values {
-                let mut ordered = Vec::with_capacity(statement.parameter_count());
-                for index in 1..=statement.parameter_count() {
-                    let name = statement.parameter_name(index).ok_or_else(|| {
-                        ProgrammingError::new_err(
-                            "Named parameters cannot bind anonymous SQLite placeholders",
-                        )
-                    })?;
-                    let key = name.trim_start_matches([':', '@', '$']);
-                    if key.is_empty() || key.starts_with('?') {
-                        return Err(ProgrammingError::new_err(format!(
-                            "Named parameters cannot bind anonymous or numbered placeholder '{name}'"
-                        )));
-                    }
-                    let value = named.get(key).ok_or_else(|| {
-                        StatementError::new_err(format!(
-                            "A value is required for bind parameter '{key}'"
-                        ))
-                    })?;
-                    ordered.push(value.clone());
+            if let Some(rows) = batch {
+                let mut total_changes = 0_i64;
+                for row in rows {
+                    let values = match row {
+                        BatchValues::Named(named) => order_named_values(&statement, &named)?,
+                        BatchValues::Positional(values) => values,
+                    };
+                    statement
+                        .execute(params_from_iter(values.iter()))
+                        .map_err(map_sqlite_error)?;
+                    total_changes += connection.changes() as i64;
                 }
-                ordered
+                drop(statement);
+                return Ok::<_, PyErr>((columns, Vec::new(), total_changes));
+            }
+            let values = if let Some(named) = named_values {
+                order_named_values(&statement, &named)?
             } else {
                 positional_values.unwrap_or_default()
             };
@@ -386,9 +433,11 @@ impl NativeConnection {
             // CTE-prefixed DML (WITH ...) is classified as non-DML here.
             let trimmed = sql.trim_start().to_ascii_lowercase();
             let dml = statement_kind.as_deref().map_or_else(
-                || ["insert", "update", "delete", "replace"]
-                    .iter()
-                    .any(|keyword| trimmed.starts_with(keyword)),
+                || {
+                    ["insert", "update", "delete", "replace"]
+                        .iter()
+                        .any(|keyword| trimmed.starts_with(keyword))
+                },
                 |kind| matches!(kind, "insert" | "update" | "delete"),
             );
             let rowcount = if dml { connection.changes() as i64 } else { -1 };
@@ -396,11 +445,22 @@ impl NativeConnection {
         })?;
 
         let rows = Python::attach(|py| {
+            let builtins = py.import("builtins")?;
+            let datetime = py.import("datetime")?;
             buffered_rows
                 .into_iter()
                 .map(|row| {
                     row.into_iter()
-                        .map(|value| sqlite_to_python(py, value))
+                        .enumerate()
+                        .map(|(index, value)| {
+                            sqlite_to_python_typed(
+                                py,
+                                value,
+                                result_types.get(index).and_then(Option::as_deref),
+                                &builtins,
+                                &datetime,
+                            )
+                        })
                         .collect::<PyResult<Vec<_>>>()
                 })
                 .collect::<PyResult<Vec<_>>>()
@@ -415,7 +475,7 @@ impl NativeConnection {
     }
 
     /// Execute a statement in a Tokio blocking task and return its buffered result.
-    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None))]
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None, type_metadata=None))]
     fn async_execute<'py>(
         slf: Py<Self>,
         py: Python<'py>,
@@ -423,6 +483,7 @@ impl NativeConnection {
         parameters: Py<PyAny>,
         text_mode: bool,
         statement_kind: Option<String>,
+        type_metadata: Option<TypeMetadata>,
     ) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
@@ -433,6 +494,7 @@ impl NativeConnection {
                         parameters.bind(py),
                         text_mode,
                         statement_kind.as_deref(),
+                        type_metadata.clone(),
                         py,
                     )?;
                     Py::new(py, result)
@@ -697,6 +759,398 @@ fn sqlite_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     })
 }
 
+fn sqlite_to_python_typed(
+    py: Python<'_>,
+    value: Value,
+    type_tag: Option<&str>,
+    builtins: &Bound<'_, PyModule>,
+    datetime: &Bound<'_, PyModule>,
+) -> PyResult<Py<PyAny>> {
+    let Some(type_tag) = type_tag else {
+        return sqlite_to_python(py, value);
+    };
+    if value == Value::Null {
+        return Ok(py.None());
+    }
+    let scalar = sqlite_to_python(py, value)?;
+    let value = scalar.bind(py);
+    match type_tag {
+        "integer" => Ok(builtins.getattr("int")?.call1((value,))?.unbind()),
+        "boolean" => Ok(builtins.getattr("bool")?.call1((value,))?.unbind()),
+        "float" => Ok(builtins.getattr("float")?.call1((value,))?.unbind()),
+        "string" | "text" => {
+            let rendered = value.str()?;
+            Ok(rendered
+                .to_string()
+                .into_pyobject(py)?
+                .to_owned()
+                .unbind()
+                .into_any())
+        }
+        "binary" => sqlite_to_python(py, Value::Blob(value.extract::<Vec<u8>>()?)),
+        "datetime" => {
+            let text = value.extract::<String>()?;
+            parse_datetime(py, &text, datetime)
+        }
+        "date" => {
+            let text = value.extract::<String>()?;
+            parse_date(&text, datetime)
+        }
+        _ => sqlite_to_python(py, Value::Text(value.str()?.to_string())),
+    }
+}
+
+pub(crate) fn python_to_sqlite_typed(
+    value: &Bound<'_, PyAny>,
+    type_tag: Option<&str>,
+) -> PyResult<Value> {
+    let Some(type_tag) = type_tag else {
+        return python_to_sqlite(value);
+    };
+    if value.is_none() {
+        return Ok(Value::Null);
+    }
+    match type_tag {
+        "datetime" => {
+            if value.is_instance_of::<PyString>() {
+                let text = value.extract::<String>()?;
+                if !is_formatted_datetime(&text) {
+                    return Err(PyTypeError::new_err(
+                        "SQLite DateTime type only accepts Python datetime and date objects as input.",
+                    ));
+                }
+                Ok(Value::Text(text))
+            } else {
+                Ok(Value::Text(format_datetime(value)?))
+            }
+        }
+        "date" => {
+            if value.is_instance_of::<PyString>() {
+                let text = value.extract::<String>()?;
+                if !is_formatted_date(&text) {
+                    return Err(PyTypeError::new_err(
+                        "SQLite Date type only accepts Python date and datetime objects as input.",
+                    ));
+                }
+                Ok(Value::Text(text))
+            } else {
+                Ok(Value::Text(format_date(value)?))
+            }
+        }
+        "boolean" => {
+            let integer = if value.is_instance_of::<PyBool>() {
+                i64::from(value.extract::<bool>()?)
+            } else {
+                value.extract::<i64>().map_err(|_| {
+                    PyTypeError::new_err(format!("Not a boolean value: {:?}", value))
+                })?
+            };
+            if !matches!(integer, 0 | 1) {
+                return Err(PyTypeError::new_err(format!(
+                    "Not a boolean value: {:?}",
+                    value
+                )));
+            }
+            Ok(Value::Integer(integer))
+        }
+        "integer" => python_to_sqlite(value),
+        "float" => {
+            let number = if value.is_instance_of::<PyInt>() || value.is_instance_of::<PyFloat>() {
+                value.extract::<f64>()?
+            } else {
+                value
+                    .py()
+                    .import("builtins")?
+                    .getattr("float")?
+                    .call1((value,))?
+                    .extract::<f64>()?
+            };
+            Ok(Value::Real(number))
+        }
+        "string" | "text" => python_to_sqlite(value),
+        _ => python_to_sqlite(value),
+    }
+}
+
+fn is_formatted_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn is_formatted_datetime(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 26
+        && is_formatted_date(text.get(..10).unwrap_or_default())
+        && bytes[10] == b' '
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 10 | 13 | 16 | 19) || byte.is_ascii_digit())
+}
+
+fn parse_date(text: &str, datetime: &Bound<'_, PyModule>) -> PyResult<Py<PyAny>> {
+    let parsed = text
+        .split_once('-')
+        .and_then(|(year, rest)| rest.split_once('-').map(|(month, day)| (year, month, day)))
+        .and_then(|(year, month, day)| {
+            Some((
+                year.parse::<i32>().ok()?,
+                month.parse::<u32>().ok()?,
+                day.parse::<u32>().ok()?,
+            ))
+        });
+    if let Some((year, month, day)) = parsed {
+        return Ok(datetime
+            .getattr("date")?
+            .call1((year, month, day))?
+            .unbind());
+    }
+    Err(PyValueError::new_err(format!(
+        "Invalid isoformat string: '{text}'"
+    )))
+}
+
+fn parse_datetime(
+    py: Python<'_>,
+    text: &str,
+    datetime_module: &Bound<'_, PyModule>,
+) -> PyResult<Py<PyAny>> {
+    let bytes = text.as_bytes();
+    let invalid = || {
+        Err(PyValueError::new_err(format!(
+            "Invalid isoformat string: '{text}'"
+        )))
+    };
+    if bytes.len() < 10 {
+        return invalid();
+    }
+    let Some(date_text) = text.get(..10) else {
+        return invalid();
+    };
+    let date = parse_date(date_text, datetime_module);
+    let date = match date {
+        Ok(value) => value,
+        Err(_) => return invalid(),
+    };
+    let (year, month, day) = {
+        let value = date.bind(py);
+        (
+            value.getattr("year")?.extract::<i32>()?,
+            value.getattr("month")?.extract::<u32>()?,
+            value.getattr("day")?.extract::<u32>()?,
+        )
+    };
+    let Some(time) = datetime_time_suffix(text) else {
+        return invalid();
+    };
+    let (time, offset) = split_timezone(time);
+    if time.ends_with('.') {
+        return invalid();
+    }
+    let mut parts = time.splitn(2, '.');
+    let clock = parts.next().unwrap_or_default();
+    let fractional = parts.next().unwrap_or("");
+    let mut fields = clock.split(':');
+    let hour = fields.next().and_then(|part| part.parse::<u32>().ok());
+    let minute = fields.next().and_then(|part| part.parse::<u32>().ok());
+    let second = fields
+        .next()
+        .map_or(Some(0), |part| part.parse::<u32>().ok());
+    if fields.next().is_some()
+        || (!fractional.is_empty() && !fractional.chars().all(|c| c.is_ascii_digit()))
+    {
+        return invalid();
+    }
+    let (Some(hour), Some(minute), Some(second)) = (hour, minute, second) else {
+        return invalid();
+    };
+    let fractional = &fractional[..fractional.len().min(6)];
+    let microsecond = if fractional.is_empty() {
+        0
+    } else {
+        fractional.parse::<u32>().unwrap_or(0) * 10_u32.pow((6 - fractional.len()) as u32)
+    };
+    let datetime = datetime_module.getattr("datetime")?;
+    let args = (year, month, day, hour, minute, second, microsecond);
+    let result = match offset {
+        Some((sign, hours, minutes)) => {
+            let delta = datetime_module
+                .getattr("timedelta")?
+                .call1((0, sign * (hours * 3600 + minutes * 60)))?;
+            let timezone = datetime_module.getattr("timezone")?.call1((delta,))?;
+            datetime.call(
+                (year, month, day, hour, minute, second, microsecond),
+                Some(&{
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("tzinfo", timezone)?;
+                    kwargs
+                }),
+            )?
+        }
+        None => datetime.call1(args)?,
+    };
+    Ok(result.unbind())
+}
+
+fn datetime_time_suffix(text: &str) -> Option<&str> {
+    match text.len() {
+        10 => Some("00:00:00"),
+        11.. => text.get(11..),
+        _ => None,
+    }
+}
+
+fn split_timezone(time: &str) -> (&str, Option<(i32, i32, i32)>) {
+    for (index, character) in time.char_indices().skip(5) {
+        if character == 'Z' && index + 1 == time.len() {
+            return (&time[..index], Some((1, 0, 0)));
+        }
+        if character == '+' || character == '-' {
+            let sign = if character == '+' { 1 } else { -1 };
+            let offset = &time[index + 1..];
+            let mut components = offset.split(':');
+            let hours = components.next().and_then(|value| value.parse().ok());
+            let minutes = components
+                .next()
+                .and_then(|value| value.parse().ok())
+                .or(Some(0));
+            if let (Some(hours), Some(minutes)) = (hours, minutes)
+                && components.next().is_none()
+            {
+                return (&time[..index], Some((sign, hours, minutes)));
+            }
+        }
+    }
+    (time, None)
+}
+
+fn format_date(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let (year, month, day) = (
+        value
+            .getattr("year")
+            .and_then(|part| part.extract::<i32>())
+            .map_err(|_| {
+                PyTypeError::new_err(
+                    "SQLite Date type only accepts Python date and datetime objects as input.",
+                )
+            })?,
+        value
+            .getattr("month")
+            .and_then(|part| part.extract::<u32>())
+            .map_err(|_| {
+                PyTypeError::new_err(
+                    "SQLite Date type only accepts Python date and datetime objects as input.",
+                )
+            })?,
+        value
+            .getattr("day")
+            .and_then(|part| part.extract::<u32>())
+            .map_err(|_| {
+                PyTypeError::new_err(
+                    "SQLite Date type only accepts Python date and datetime objects as input.",
+                )
+            })?,
+    );
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn format_datetime(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let date = format_date(value).map_err(|_| {
+        PyTypeError::new_err(
+            "SQLite DateTime type only accepts Python datetime and date objects as input.",
+        )
+    })?;
+    // SQLAlchemy's SQLite DateTime processor accepts a date and promotes it
+    // to midnight; timezone information is intentionally dropped by sqlite.
+    let get = |name| -> PyResult<u32> {
+        Ok(value
+            .getattr(name)
+            .ok()
+            .and_then(|field| field.extract::<u32>().ok())
+            .unwrap_or(0))
+    };
+    Ok(format!(
+        "{date} {:02}:{:02}:{:02}.{:06}",
+        get("hour")?,
+        get("minute")?,
+        get("second")?,
+        get("microsecond")?
+    ))
+}
+
+fn convert_positional_values(
+    values: &Bound<'_, PyAny>,
+    types: &[Option<String>],
+    py: Python<'_>,
+) -> PyResult<Vec<Value>> {
+    values
+        .extract::<Vec<Py<PyAny>>>()?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            python_to_sqlite_typed(value.bind(py), types.get(index).and_then(Option::as_deref))
+        })
+        .collect()
+}
+
+fn convert_named_values(
+    mapping: &Bound<'_, PyDict>,
+    typed: Option<(&[String], &[Option<String>])>,
+) -> PyResult<std::collections::HashMap<String, Value>> {
+    mapping
+        .iter()
+        .map(|(key, value)| {
+            let key = key.extract::<String>().map_err(|_| {
+                StatementError::new_err("Mapping keys must be strings for named bind parameters")
+            })?;
+            let type_tag = typed.and_then(|(names, types)| {
+                names
+                    .iter()
+                    .position(|name| name == &key)
+                    .and_then(|index| types.get(index))
+                    .and_then(Option::as_deref)
+            });
+            let value = match type_tag {
+                Some(tag) => python_to_sqlite_typed(&value, Some(tag))?,
+                None => python_to_sqlite(&value)?,
+            };
+            Ok((key, value))
+        })
+        .collect()
+}
+
+fn order_named_values(
+    statement: &rusqlite::Statement<'_>,
+    named: &std::collections::HashMap<String, Value>,
+) -> PyResult<Vec<Value>> {
+    let mut ordered = Vec::with_capacity(statement.parameter_count());
+    for index in 1..=statement.parameter_count() {
+        let name = statement.parameter_name(index).ok_or_else(|| {
+            ProgrammingError::new_err("Named parameters cannot bind anonymous SQLite placeholders")
+        })?;
+        let key = name.trim_start_matches([':', '@', '$']);
+        if key.is_empty() || key.starts_with('?') {
+            return Err(ProgrammingError::new_err(format!(
+                "Named parameters cannot bind anonymous or numbered placeholder '{name}'"
+            )));
+        }
+        let value = named.get(key).ok_or_else(|| {
+            StatementError::new_err(format!("A value is required for bind parameter '{key}'"))
+        })?;
+        ordered.push(value.clone());
+    }
+    Ok(ordered)
+}
+
 /// The native extension module for Catalyst.
 #[pymodule]
 fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -880,5 +1334,32 @@ fn map_sqlite_error(error: rusqlite::Error) -> PyErr {
             ProgrammingError::new_err(error.to_string())
         }
         _ => DatabaseError::new_err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod datetime_parser_tests {
+    use super::{datetime_time_suffix, split_timezone};
+
+    #[test]
+    fn datetime_suffix_rejects_non_character_boundary() {
+        assert_eq!(datetime_time_suffix("2020-01-02中"), None);
+        assert_eq!(datetime_time_suffix("2020-01-02"), Some("00:00:00"));
+        assert_eq!(
+            datetime_time_suffix("2020-01-02 03:04:05"),
+            Some("03:04:05")
+        );
+    }
+
+    #[test]
+    fn timezone_parser_preserves_signed_offset_components() {
+        assert_eq!(
+            split_timezone("05:00:00+05:30"),
+            ("05:00:00", Some((1, 5, 30)))
+        );
+        assert_eq!(
+            split_timezone("05:00:00-04:45"),
+            ("05:00:00", Some((-1, 4, 45)))
+        );
     }
 }

@@ -20,24 +20,58 @@ _COMPILE_CACHE_SIZE = 512
 @lru_cache(maxsize=_COMPILE_CACHE_SIZE)
 def _compile_cached(
     serialized: tuple[object, ...],
-) -> tuple[str, tuple[tuple[str, object], ...], str]:
-    sql, params, kind, _ordered = compile_expression(serialized)
-    return sql, tuple(params.items()), kind
+) -> tuple[
+    str,
+    tuple[tuple[str, object], ...],
+    str,
+    tuple[str | None, ...],
+    tuple[str, ...],
+    tuple[str | None, ...],
+]:
+    sql, params, kind, _ordered, bind_types, bind_names, result_types = compile_expression(
+        serialized
+    )
+    return (
+        sql,
+        tuple(params.items()),
+        kind,
+        tuple(bind_types),
+        tuple(bind_names),
+        tuple(result_types),
+    )
 
 
 def _compiled_from_cache(
     serialized: tuple[object, ...],
-) -> tuple[str, dict[str, object], str, list[object]]:
+) -> tuple[
+    str,
+    dict[str, object],
+    str,
+    list[object],
+    list[str | None],
+    list[str],
+    list[str | None],
+]:
     try:
-        sql, items, kind = _compile_cached(serialized)
+        sql, items, kind, bind_types, bind_names, result_types = _compile_cached(serialized)
     except TypeError:
         # Bind values may be unhashable objects; compile directly without caching.
-        sql, params, kind, ordered = compile_expression(serialized)
-        return sql, params, kind, list(ordered)
+        sql, params, kind, ordered, bind_types, bind_names, result_types = compile_expression(
+            serialized
+        )
+        return (
+            sql,
+            params,
+            kind,
+            list(ordered),
+            list(bind_types),
+            list(bind_names),
+            list(result_types),
+        )
     # Rebuild per call so the shared cache entry is never exposed mutably.
     params = dict(items)
     ordered = [value for _key, value in items]
-    return sql, params, kind, ordered
+    return sql, params, kind, ordered, list(bind_types), list(bind_names), list(result_types)
 
 
 if TYPE_CHECKING:
@@ -73,6 +107,14 @@ class DateTime(TypeEngine):
     pass
 
 
+class Date(TypeEngine):
+    pass
+
+
+class LargeBinary(TypeEngine):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class Column:
     name: str
@@ -90,12 +132,19 @@ class Column:
     owner: Table | None = field(default=None, init=False, repr=False, compare=False)
 
     def serialize(self) -> tuple[object, ...]:
-        return ("column", self.table_name, self.name)
+        return ("column", self.table_name, self.name, _column_type_tag(self.type))
 
     def _binary(self, operator: str, other: object) -> Expression:
         if other is None and operator in {"=", "!="}:
             return Expression(("is_not" if operator == "!=" else "is", self.serialize()))
-        return Expression(("binary", self.serialize(), operator, _value(other, self.name)))
+        return Expression(
+            (
+                "binary",
+                self.serialize(),
+                operator,
+                _value(other, self.name, _comparison_type_tag(other, _column_type_tag(self.type))),
+            )
+        )
 
     def __eq__(self, other: object) -> Expression:  # type: ignore[override]
         return self._binary("=", other)
@@ -137,27 +186,64 @@ class Column:
         # Plain base: Rust assigns the SQLAlchemy-style per-column counter
         # (group "id_1", members "id_1_1", "id_1_2", ...).
         return Expression(
-            ("in", self.serialize(), tuple(_value(value, self.name) for value in values))
+            (
+                "in",
+                self.serialize(),
+                tuple(
+                    _value(
+                        value, self.name, _comparison_type_tag(value, _column_type_tag(self.type))
+                    )
+                    for value in values
+                ),
+            )
         )
 
     def is_(self, value: object) -> Expression:
         if value is not None:
-            return Expression(("is_scalar", self.serialize(), _value(value, self.name)))
+            return Expression(
+                (
+                    "is_scalar",
+                    self.serialize(),
+                    _value(
+                        value, self.name, _comparison_type_tag(value, _column_type_tag(self.type))
+                    ),
+                )
+            )
         return Expression(("is", self.serialize()))
 
     def is_not(self, value: object) -> Expression:
         if value is not None:
-            return Expression(("is_not_scalar", self.serialize(), _value(value, self.name)))
+            return Expression(
+                (
+                    "is_not_scalar",
+                    self.serialize(),
+                    _value(
+                        value, self.name, _comparison_type_tag(value, _column_type_tag(self.type))
+                    ),
+                )
+            )
         return Expression(("is_not", self.serialize()))
 
     def like(self, value: object, escape: str | None = None) -> Expression:
         if escape is None:
             return self._binary("LIKE", value)
-        return Expression(("like_escape", self.serialize(), _value(value, self.name), escape))
+        return Expression(
+            (
+                "like_escape",
+                self.serialize(),
+                _value(value, self.name, _comparison_type_tag(value, _column_type_tag(self.type))),
+                escape,
+            )
+        )
 
     def between(self, lower: object, upper: object) -> Expression:
         return Expression(
-            ("between", self.serialize(), _value(lower, self.name), _value(upper, self.name))
+            (
+                "between",
+                self.serialize(),
+                _value(lower, self.name, _comparison_type_tag(lower, _column_type_tag(self.type))),
+                _value(upper, self.name, _comparison_type_tag(upper, _column_type_tag(self.type))),
+            )
         )
 
     def asc(self) -> Expression:
@@ -265,15 +351,17 @@ class Table:
             for column in self.columns
         )
         primary_key = tuple(column.name for column in self.columns if column.primary_key)
-        sql, _params, kind, _ordered = compile_expression(
+        sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
             ("create_table", self.name, columns, primary_key)
         )
-        return Compiled(sql, {}, kind, [])
+        return Compiled(sql, {}, kind, [], [], [], [])
 
     def compile_drop(self) -> Compiled:
         """Compile this table's ``DROP TABLE`` statement natively."""
-        sql, _params, kind, _ordered = compile_expression(("drop_table", self.name))
-        return Compiled(sql, {}, kind, [])
+        sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
+            ("drop_table", self.name)
+        )
+        return Compiled(sql, {}, kind, [], [], [], [])
 
     def create(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
         """Create this table; returns a coroutine for an :class:`AsyncEngine`."""
@@ -338,10 +426,10 @@ class Expression:
         return self._binary("/", other)
 
 
-def _value(value: object, base: str = "param") -> tuple[object, ...]:
+def _value(value: object, base: str = "param", type_tag: str | None = None) -> tuple[object, ...]:
     if isinstance(value, (Column, Expression)):
         return _node(value)
-    return ("literal", value, base)
+    return ("literal", value, base, type_tag)
 
 
 def _node(value: Column | Expression | bool) -> tuple[object, ...]:
@@ -365,7 +453,43 @@ _TYPE_TAGS = {
     "Boolean": "boolean",
     "Float": "float",
     "DateTime": "datetime",
+    "Date": "date",
+    "LargeBinary": "binary",
 }
+
+
+def _column_type_tag(type_obj: object) -> str | None:
+    marker = type_obj if isinstance(type_obj, type) else type(type_obj)
+    return _TYPE_TAGS.get(marker.__name__)
+
+
+def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
+    """Apply a column processor only when SQLAlchemy would bind this value as that type."""
+    if type_tag is None or value is None:
+        return type_tag
+    if type_tag == "boolean":
+        return type_tag if isinstance(value, bool) else None
+    if type_tag in {"date", "datetime"}:
+        from datetime import date, datetime
+
+        return type_tag if isinstance(value, (date, datetime)) else None
+    if type_tag == "integer":
+        return type_tag if isinstance(value, int) and not isinstance(value, bool) else None
+    if type_tag == "float":
+        from decimal import Decimal
+        from numbers import Number
+
+        return (
+            type_tag
+            if (isinstance(value, Number) or isinstance(value, Decimal))
+            and not isinstance(value, (bool, complex))
+            else None
+        )
+    if type_tag in {"string", "text"}:
+        return type_tag if isinstance(value, str) else None
+    if type_tag == "binary":
+        return type_tag if isinstance(value, bytes) else None
+    return None
 
 
 def _type_node(type_obj: object) -> tuple[str, int | None]:
@@ -486,15 +610,25 @@ func = _FunctionGenerator()
 
 
 class Compiled:
-    """SQLite compiled SQL and parameters in execution order."""
+    """SQLite compiled SQL, ordered parameters, and native type metadata."""
 
     def __init__(
-        self, sql: str, params: dict[str, object], kind: str, ordered: list[object]
+        self,
+        sql: str,
+        params: dict[str, object],
+        kind: str,
+        ordered: list[object],
+        bind_types: list[str | None],
+        bind_names: list[str],
+        result_types: list[str | None],
     ) -> None:
         self.string = sql
         self.params = params
         self.statement_kind = kind
         self._ordered = ordered
+        self._bind_types = bind_types
+        self._bind_names = bind_names
+        self._result_types = result_types
 
     def __str__(self) -> str:
         return self.string
@@ -587,8 +721,10 @@ class Select:
     def compile(self) -> Compiled:
         serialized = self._serialize()
         _check_node_depth(serialized)
-        sql, params, kind, ordered = _compiled_from_cache(serialized)
-        return Compiled(sql, params, kind, ordered)
+        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
+            serialized
+        )
+        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -609,12 +745,19 @@ class Insert:
 
     def compile(self) -> Compiled:
         values: dict[str, tuple[object, ...]] = {
-            column.name: ("literal", self.values_map[column.name], f"={column.name}")
+            column.name: (
+                "literal",
+                self.values_map[column.name],
+                f"={column.name}",
+                _column_type_tag(column.type),
+            )
             for column in self.table.columns
             if column.name in self.values_map
         }
-        sql, params, kind, ordered = _compiled_from_cache(("insert", self.table.name, values))
-        return Compiled(sql, params, kind, ordered)
+        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
+            ("insert", self.table.name, values)
+        )
+        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -648,15 +791,20 @@ class Update:
 
     def compile(self) -> Compiled:
         values: dict[str, tuple[object, ...]] = {
-            column.name: ("literal", self.values_map[column.name], f"={column.name}")
+            column.name: (
+                "literal",
+                self.values_map[column.name],
+                f"={column.name}",
+                _column_type_tag(column.type),
+            )
             for column in self.table.columns
             if column.name in self.values_map
         }
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered = _compiled_from_cache(
+        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
             ("update", self.table.name, values, predicate)
         )
-        return Compiled(sql, params, kind, ordered)
+        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -681,8 +829,10 @@ class Delete:
 
     def compile(self) -> Compiled:
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered = _compiled_from_cache(("delete", self.table.name, predicate))
-        return Compiled(sql, params, kind, ordered)
+        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
+            ("delete", self.table.name, predicate)
+        )
+        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())

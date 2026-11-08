@@ -17,6 +17,8 @@ class Boolean(TypeEngine): ...
 class Text(TypeEngine): ...
 class Float(TypeEngine): ...
 class DateTime(TypeEngine): ...
+class Date(TypeEngine): ...
+class LargeBinary(TypeEngine): ...
 
 @final
 class Column:
@@ -113,8 +115,18 @@ class Compiled:
     params: dict[str, object]
     statement_kind: str
     _ordered: list[object]
+    _bind_types: list[str | None]
+    _bind_names: list[str]
+    _result_types: list[str | None]
     def __init__(
-        self, sql: str, params: dict[str, object], kind: str, ordered: list[object]
+        self,
+        sql: str,
+        params: dict[str, object],
+        kind: str,
+        ordered: list[object],
+        bind_types: list[str | None],
+        bind_names: list[str],
+        result_types: list[str | None],
     ) -> None: ...
     def __str__(self) -> str: ...
 

@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Mappi
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from ._catalyst import (
@@ -19,10 +19,53 @@ from ._catalyst import (
     NativeConnection,
     NativeEngine,
     NativeResult,
+    StatementError,
 )
 from .expression import Compiled, Delete, Insert, Select, Table, Update
 
 _logger = logging.getLogger(__name__)
+
+
+def _validate_compiled_parameters(parameters: object) -> None:
+    if isinstance(parameters, Mapping):
+        return
+    if not isinstance(parameters, Sequence):
+        raise ArgumentError("mapping or list expected for parameters")
+    parameter_sequence = cast(Sequence[object], parameters)
+    if any(not isinstance(item, Mapping) for item in parameter_sequence):
+        raise ArgumentError("List argument must consist only of dictionaries")
+
+
+def _validate_text_parameters(parameters: object) -> None:
+    if not isinstance(parameters, Sequence):
+        raise ArgumentError("List argument must consist only of dictionaries")
+    parameter_sequence = cast(Sequence[object], parameters)
+    if any(not isinstance(item, Mapping) for item in parameter_sequence):
+        raise ArgumentError("List argument must consist only of dictionaries")
+
+
+def _merge_compiled_batch(
+    statement: Compiled,
+    parameters: Sequence[object],
+) -> list[dict[str, object]]:
+    """Merge per-row overrides with statement-level compiled defaults."""
+    defaults = dict(statement.params)
+    default_names = set(defaults)
+    merged: list[dict[str, object]] = []
+    for group, row in enumerate(parameters, start=1):
+        if not isinstance(row, Mapping):
+            raise ArgumentError("List argument must consist only of dictionaries")
+        row_values = cast(Mapping[str, object], row)
+        missing = set(statement._bind_names) - default_names - set(row_values)
+        if missing:
+            name = next(name for name in statement._bind_names if name in missing)
+            raise StatementError(
+                f"A value is required for bind parameter '{name}', in parameter group {group}"
+            )
+        values = dict(defaults)
+        values.update(row_values)
+        merged.append(values)
+    return merged
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -82,20 +125,79 @@ class Connection:
         statement: str | TextClause | Compiled | Select | Insert | Update | Delete,
         parameters: Sequence[object] | Mapping[str, object] | None = None,
     ) -> CursorResult:
-        """Execute SQL with positional values or a mapping for named binds."""
+        """Execute SQL with positional, named, or batched parameters."""
         if self._closed:
             raise RuntimeError("Connection is closed")
+        if (
+            isinstance(statement, TextClause)
+            and parameters is not None
+            and not isinstance(parameters, Mapping)
+        ):
+            _validate_text_parameters(parameters)
+        if (
+            isinstance(parameters, Sequence)
+            and not isinstance(parameters, (str, bytes))
+            and not parameters
+            and isinstance(statement, (Compiled, Select, Insert, Update, Delete))
+        ):
+            parameters = None
+        if (
+            isinstance(statement, (Compiled, Select, Insert, Update, Delete))
+            and parameters is not None
+        ):
+            _validate_compiled_parameters(parameters)
+        if isinstance(statement, Insert) and isinstance(parameters, Sequence) and parameters:
+            first = parameters[0]
+            first_values = cast(Mapping[str, object], first)
+            defaults = dict(statement.values_map)
+            # SQLAlchemy fixes the executemany INSERT shape from the first row;
+            # later-only and unknown keys are ignored. Missing first-row keys
+            # are legal only when supplied by statement-level .values().
+            shape_names = set(first_values) | set(defaults)
+            required_row_names = set(first_values) - set(defaults)
+            for group, row in enumerate(parameters):
+                if not isinstance(row, Mapping):
+                    raise ArgumentError("List argument must consist only of dictionaries")
+                row_values = cast(Mapping[str, object], row)
+                missing = required_row_names - set(row_values)
+                if missing:
+                    name = next(
+                        name for name in statement.table.columns if name.name in missing
+                    ).name
+                    raise StatementError(
+                        f"A value is required for bind parameter '{name}', "
+                        f"in parameter group {group}"
+                    )
+            ordered_names = [
+                column.name for column in statement.table.columns if column.name in shape_names
+            ]
+            insert_shape = {name: defaults.get(name) for name in ordered_names}
+            statement = Insert(statement.table).values(insert_shape)
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
+        if isinstance(statement, Compiled) and isinstance(parameters, Sequence) and parameters:
+            parameters = _merge_compiled_batch(statement, parameters)
         kind: str | None = None
+        bind_types: list[str | None] = []
+        bind_names: list[str] = []
+        result_types: list[str | None] = []
         if isinstance(statement, Compiled):
             sql = statement.string
-            bindings: Sequence[object] | Mapping[str, object] = statement._ordered
+            bindings: Sequence[object] | Mapping[str, object] = (
+                statement._ordered
+                if parameters is None or (isinstance(parameters, Sequence) and not parameters)
+                else parameters
+            )
             kind = statement.statement_kind
+            if parameters is not None:
+                bind_types = statement._bind_types
+                bind_names = statement._bind_names
+            result_types = statement._result_types
         elif isinstance(statement, TextClause):
             sql = statement.text
             if parameters is not None and not isinstance(parameters, Mapping):
-                raise ArgumentError("List argument must consist only of dictionaries")
+                if any(not isinstance(item, Mapping) for item in parameters):
+                    raise ArgumentError("List argument must consist only of dictionaries")
             bindings = {} if parameters is None else parameters
         else:
             sql = statement
@@ -110,7 +212,13 @@ class Connection:
         if self._echo:
             _logger.info("%s", sql)
         return CursorResult(
-            self._native.execute(sql, native_parameters, isinstance(statement, TextClause), kind)
+            self._native.execute(
+                sql,
+                native_parameters,
+                isinstance(statement, TextClause),
+                kind,
+                (bind_types, bind_names, result_types),
+            )
         )
 
     def begin(self) -> RootTransaction:
@@ -260,17 +368,76 @@ class AsyncConnection:
     ) -> CursorResult:
         if self._closed:
             raise RuntimeError("Connection is closed")
+        if (
+            isinstance(statement, TextClause)
+            and parameters is not None
+            and not isinstance(parameters, Mapping)
+        ):
+            _validate_text_parameters(parameters)
+        if (
+            isinstance(parameters, Sequence)
+            and not isinstance(parameters, (str, bytes))
+            and not parameters
+            and isinstance(statement, (Compiled, Select, Insert, Update, Delete))
+        ):
+            parameters = None
+        if (
+            isinstance(statement, (Compiled, Select, Insert, Update, Delete))
+            and parameters is not None
+        ):
+            _validate_compiled_parameters(parameters)
+        if isinstance(statement, Insert) and isinstance(parameters, Sequence) and parameters:
+            first = parameters[0]
+            first_values = cast(Mapping[str, object], first)
+            defaults = dict(statement.values_map)
+            # SQLAlchemy fixes the executemany INSERT shape from the first row;
+            # later-only and unknown keys are ignored. Missing first-row keys
+            # are legal only when supplied by statement-level .values().
+            shape_names = set(first_values) | set(defaults)
+            required_row_names = set(first_values) - set(defaults)
+            for group, row in enumerate(parameters):
+                if not isinstance(row, Mapping):
+                    raise ArgumentError("List argument must consist only of dictionaries")
+                row_values = cast(Mapping[str, object], row)
+                missing = required_row_names - set(row_values)
+                if missing:
+                    name = next(
+                        name for name in statement.table.columns if name.name in missing
+                    ).name
+                    raise StatementError(
+                        f"A value is required for bind parameter '{name}', "
+                        f"in parameter group {group}"
+                    )
+            ordered_names = [
+                column.name for column in statement.table.columns if column.name in shape_names
+            ]
+            insert_shape = {name: defaults.get(name) for name in ordered_names}
+            statement = Insert(statement.table).values(insert_shape)
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
+        if isinstance(statement, Compiled) and isinstance(parameters, Sequence) and parameters:
+            parameters = _merge_compiled_batch(statement, parameters)
         kind: str | None = None
+        bind_types: list[str | None] = []
+        bind_names: list[str] = []
+        result_types: list[str | None] = []
         if isinstance(statement, Compiled):
             sql = statement.string
-            bindings: Sequence[object] | Mapping[str, object] = statement._ordered
+            bindings: Sequence[object] | Mapping[str, object] = (
+                statement._ordered
+                if parameters is None or (isinstance(parameters, Sequence) and not parameters)
+                else parameters
+            )
             kind = statement.statement_kind
+            if parameters is not None:
+                bind_types = statement._bind_types
+                bind_names = statement._bind_names
+            result_types = statement._result_types
         elif isinstance(statement, TextClause):
             sql = statement.text
             if parameters is not None and not isinstance(parameters, Mapping):
-                raise ArgumentError("List argument must consist only of dictionaries")
+                if any(not isinstance(item, Mapping) for item in parameters):
+                    raise ArgumentError("List argument must consist only of dictionaries")
             bindings = {} if parameters is None else parameters
         else:
             sql = statement
@@ -285,7 +452,11 @@ class AsyncConnection:
         if self._echo:
             _logger.info("%s", sql)
         result = await self._native.async_execute(
-            sql, native_parameters, isinstance(statement, TextClause), kind
+            sql,
+            native_parameters,
+            isinstance(statement, TextClause),
+            kind,
+            (bind_types, bind_names, result_types),
         )
         return CursorResult(result)
 

@@ -33,7 +33,15 @@ def sqlite_text(sql: str, parameters: list[object]) -> list[list[object]]:
 
 def compile_expression(
     value: object,
-) -> tuple[str, dict[str, object], str, list[object]]: ...
+) -> tuple[
+    str,
+    dict[str, object],
+    str,
+    list[object],
+    list[str | None],
+    list[str],
+    list[str | None],
+]: ...
 
 @final
 class NativeEngine:
@@ -62,6 +70,7 @@ class NativeConnection:
         parameters: list[object] | dict[str, object],
         text_mode: bool,
         statement_kind: str | None = ...,
+        type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
     ) -> NativeResult: ...
     def async_execute(
         self,
@@ -69,6 +78,7 @@ class NativeConnection:
         parameters: list[object] | dict[str, object],
         text_mode: bool,
         statement_kind: str | None = ...,
+        type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
     ) -> Awaitable[NativeResult]: ...
     def async_transaction(self, operation: str) -> Awaitable[None]: ...
     def begin(self) -> None: ...

@@ -6,7 +6,21 @@ use std::collections::HashMap;
 
 use crate::{ArgumentError, python_to_sqlite};
 
-type CompiledExpression = (String, Py<PyDict>, String, Vec<Py<PyAny>>);
+type CompiledExpression = (
+    String,
+    Py<PyDict>,
+    String,
+    Vec<Py<PyAny>>,
+    Vec<Option<String>>,
+    Vec<String>,
+    Vec<Option<String>>,
+);
+type CompiledStatement = (
+    String,
+    Vec<(String, Value, Option<String>)>,
+    &'static str,
+    Vec<Option<String>>,
+);
 
 /// A DDL column definition serialized from Python `Column` metadata. The
 /// SQL type name is rendered in Rust at parse time.
@@ -21,8 +35,8 @@ struct ColumnDdl {
 
 #[derive(Clone)]
 enum Expr {
-    Column(String, String),
-    Literal(Value, String),
+    Column(String, String, Option<String>),
+    Literal(Value, String, Option<String>),
     Boolean(bool),
     BooleanWord(bool),
     Binary(Box<Expr>, String, Box<Expr>),
@@ -124,7 +138,8 @@ pub(crate) fn quote_identifier(value: &str) -> String {
 
 struct Compiler {
     sql: String,
-    params: Vec<(String, Value)>,
+    params: Vec<(String, Value, Option<String>)>,
+    result_types: Vec<Option<String>>,
     bind_counts: HashMap<String, usize>,
     function_counts: HashMap<String, usize>,
     column_labels: HashMap<String, usize>,
@@ -136,6 +151,7 @@ impl Compiler {
         Self {
             sql: String::new(),
             params: Vec::new(),
+            result_types: Vec::new(),
             bind_counts: HashMap::new(),
             function_counts: HashMap::new(),
             column_labels: HashMap::new(),
@@ -150,9 +166,9 @@ impl Compiler {
     }
 
     fn bind(&mut self, value: &Expr) {
-        let (base, value) = match value {
-            Expr::Literal(value, name) => (name.clone(), value.clone()),
-            _ => ("param".to_owned(), Value::Null),
+        let (base, value, type_tag) = match value {
+            Expr::Literal(value, name, type_tag) => (name.clone(), value.clone(), type_tag.clone()),
+            _ => ("param".to_owned(), Value::Null, None),
         };
         let key = if let Some(name) = base.strip_prefix('=') {
             // DML values use their explicit column key.
@@ -160,13 +176,13 @@ impl Compiler {
         } else {
             self.next_bind_name(&base)
         };
-        self.params.push((key, value));
+        self.params.push((key, value, type_tag));
         self.sql.push('?');
     }
 
     fn bind_in_values(&mut self, inner: &Expr, values: &[Expr]) {
         let base = match inner {
-            Expr::Column(_, column) => column.as_str(),
+            Expr::Column(_, column, _) => column.as_str(),
             _ => "param",
         };
         // SQLAlchemy allocates one name for the expanding bind, then uses it
@@ -176,14 +192,22 @@ impl Compiler {
             if index > 0 {
                 self.sql.push_str(", ");
             }
-            if let Expr::Literal(value, _) = value {
-                self.params
-                    .push((format!("{group}_{}", index + 1), value.clone()));
+            if let Expr::Literal(value, _, type_tag) = value {
+                self.params.push((
+                    format!("{group}_{}", index + 1),
+                    value.clone(),
+                    type_tag.clone(),
+                ));
                 self.sql.push('?');
             } else if let Expr::Boolean(value) = value {
+                let type_tag = match inner {
+                    Expr::Column(_, _, type_tag) => type_tag.clone(),
+                    _ => None,
+                };
                 self.params.push((
                     format!("{group}_{}", index + 1),
                     Value::Integer(i64::from(*value)),
+                    type_tag,
                 ));
                 self.sql.push('?');
             } else {
@@ -202,14 +226,14 @@ impl Compiler {
     /// statement level); a child self-groups like SQLAlchemy's ``self_group``.
     fn expr(&mut self, expr: &Expr, against: Option<&str>) {
         match expr {
-            Expr::Column(table, column) => {
+            Expr::Column(table, column, _) => {
                 if !table.is_empty() {
                     self.ident(table);
                     self.sql.push('.');
                 }
                 self.ident(column);
             }
-            Expr::Literal(_, _) => self.bind(expr),
+            Expr::Literal(_, _, _) => self.bind(expr),
             Expr::Boolean(value) => self.sql.push_str(if *value { "1" } else { "0" }),
             // SQLAlchemy renders a bare Python bool predicate as 1 = 1 / 0 = 1.
             Expr::BooleanWord(value) => {
@@ -352,7 +376,7 @@ impl Compiler {
             Expr::Neg(inner) => {
                 self.sql.push('-');
                 match inner.as_ref() {
-                    Expr::Column(_, _) => self.expr(inner, None),
+                    Expr::Column(_, _, _) => self.expr(inner, None),
                     _ => {
                         self.sql.push('(');
                         self.expr(inner, None);
@@ -396,8 +420,11 @@ impl Compiler {
         self.expr(expr, None);
         match expr {
             // A negated plain column stays column-like: SQLAlchemy emits no label.
-            Expr::Neg(inner) if matches!(inner.as_ref(), Expr::Column(_, _)) => {}
-            Expr::Column(_, label) => {
+            Expr::Neg(inner) if matches!(inner.as_ref(), Expr::Column(_, _, _)) => {
+                self.result_types.push(None);
+            }
+            Expr::Column(_, label, type_tag) => {
+                self.result_types.push(type_tag.clone());
                 let duplicate = {
                     let count = self.column_labels.entry(label.clone()).or_insert(0);
                     let duplicate = (*count > 0).then_some(*count);
@@ -410,6 +437,7 @@ impl Compiler {
                 }
             }
             Expr::Function(name, _) => {
+                self.result_types.push(None);
                 let count = {
                     let count = self.function_counts.entry(name.clone()).or_insert(0);
                     *count += 1;
@@ -421,6 +449,7 @@ impl Compiler {
             // Unlabeled non-column select items receive SQLAlchemy's anon_N
             // series with its own per-compile counter.
             _ => {
+                self.result_types.push(None);
                 self.anon_count += 1;
                 self.sql.push_str(" AS ");
                 self.ident(&format!("anon_{}", self.anon_count));
@@ -428,7 +457,7 @@ impl Compiler {
         }
     }
 
-    fn statement(mut self, statement: &Statement) -> (String, Vec<(String, Value)>, &'static str) {
+    fn statement(mut self, statement: &Statement) -> CompiledStatement {
         let kind = match statement {
             Statement::Select {
                 columns,
@@ -486,21 +515,25 @@ impl Compiler {
             Statement::Insert { table, values } => {
                 self.sql.push_str("INSERT INTO ");
                 self.ident(table);
-                self.sql.push_str(" (");
-                for (i, (name, _)) in values.iter().enumerate() {
-                    if i > 0 {
-                        self.sql.push_str(", ");
+                if values.is_empty() {
+                    self.sql.push_str(" DEFAULT VALUES");
+                } else {
+                    self.sql.push_str(" (");
+                    for (i, (name, _)) in values.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.ident(name);
                     }
-                    self.ident(name);
-                }
-                self.sql.push_str(") VALUES (");
-                for (i, (_, value)) in values.iter().enumerate() {
-                    if i > 0 {
-                        self.sql.push_str(", ");
+                    self.sql.push_str(") VALUES (");
+                    for (i, (_, value)) in values.iter().enumerate() {
+                        if i > 0 {
+                            self.sql.push_str(", ");
+                        }
+                        self.expr(value, None);
                     }
-                    self.expr(value, None);
+                    self.sql.push(')');
                 }
-                self.sql.push(')');
                 "insert"
             }
             Statement::Update {
@@ -590,7 +623,7 @@ impl Compiler {
                 "drop_table"
             }
         };
-        (self.sql, self.params, kind)
+        (self.sql, self.params, kind, self.result_types)
     }
 }
 
@@ -773,6 +806,14 @@ fn string_at(value: &Bound<'_, PyAny>, index: usize) -> PyResult<String> {
     item(value, index)?.extract()
 }
 
+fn optional_string_at(value: &Bound<'_, PyAny>, index: usize) -> PyResult<Option<String>> {
+    let items = seq(value)?;
+    match items.get(index) {
+        Some(item) if !item.is_none() => item.extract().map(Some),
+        _ => Ok(None),
+    }
+}
+
 fn parse_expr(value: &Bound<'_, PyAny>) -> PyResult<Expr> {
     parse_expr_at_depth(value, 0)
 }
@@ -788,24 +829,41 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
         .ok_or_else(|| ArgumentError::new_err("Empty expression node"))?
         .extract()?;
     match name.as_str() {
-        "column" => Ok(Expr::Column(string_at(value, 1)?, string_at(value, 2)?)),
+        "column" => Ok(Expr::Column(
+            string_at(value, 1)?,
+            string_at(value, 2)?,
+            optional_string_at(value, 3)?,
+        )),
         "literal" => {
             let literal = item(value, 1)?;
-            if literal.is_instance_of::<PyBool>() {
+            let type_tag = optional_string_at(value, 3)?;
+            if literal.is_instance_of::<PyBool>() && type_tag.is_none() {
                 Ok(Expr::Boolean(literal.extract()?))
             } else {
-                Ok(Expr::Literal(
-                    python_to_sqlite(&literal)?,
-                    string_at(value, 2)?,
-                ))
+                let converted = match type_tag.as_deref() {
+                    Some(tag) => crate::python_to_sqlite_typed(&literal, Some(tag))?,
+                    None => python_to_sqlite(&literal)?,
+                };
+                Ok(Expr::Literal(converted, string_at(value, 2)?, type_tag))
             }
         }
         "boolean_word" => Ok(Expr::BooleanWord(item(value, 1)?.extract()?)),
-        "binary" => Ok(Expr::Binary(
-            Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?),
-            string_at(value, 2)?,
-            Box::new(parse_expr_at_depth(&item(value, 3)?, child_depth)?),
-        )),
+        "binary" => {
+            let left = parse_expr_at_depth(&item(value, 1)?, child_depth)?;
+            let operator = string_at(value, 2)?;
+            let right = parse_expr_at_depth(&item(value, 3)?, child_depth)?;
+            // SQLAlchemy's SQLite Boolean comparator renders typed boolean
+            // constants inline as 1/0 rather than allocating a bind.
+            let right = match right {
+                Expr::Literal(Value::Integer(value), _, Some(tag))
+                    if tag == "boolean" && matches!(value, 0 | 1) =>
+                {
+                    Expr::Boolean(value != 0)
+                }
+                other => other,
+            };
+            Ok(Expr::Binary(Box::new(left), operator, Box::new(right)))
+        }
         "and" | "or" => Ok(Expr::Group(
             if name == "and" { "AND" } else { "OR" }.to_owned(),
             seq(&item(value, 1)?)?
@@ -904,6 +962,8 @@ fn render_type_name(tag: &str, length: Option<u64>) -> PyResult<String> {
         "boolean" => Ok("BOOLEAN".to_owned()),
         "float" => Ok("FLOAT".to_owned()),
         "datetime" => Ok("DATETIME".to_owned()),
+        "date" => Ok("DATE".to_owned()),
+        "binary" => Ok("BLOB".to_owned()),
         other => Err(ArgumentError::new_err(format!(
             "Unsupported DDL column type '{other}'"
         ))),
@@ -1038,15 +1098,28 @@ pub(crate) fn compile_expression(
     py: Python<'_>,
 ) -> PyResult<CompiledExpression> {
     let statement = parse_statement(value)?;
-    let (sql, values, kind) = py.detach(move || Compiler::new().statement(&statement));
+    let (sql, values, kind, result_types) =
+        py.detach(move || Compiler::new().statement(&statement));
     let params = PyDict::new(py);
     let mut ordered = Vec::with_capacity(values.len());
-    for (key, value) in values {
+    let mut bind_types = Vec::with_capacity(values.len());
+    let mut bind_names = Vec::with_capacity(values.len());
+    for (key, value, type_tag) in values {
         let converted = crate::sqlite_to_python(py, value)?;
-        params.set_item(key, converted.clone_ref(py))?;
+        params.set_item(&key, converted.clone_ref(py))?;
         ordered.push(converted);
+        bind_names.push(key);
+        bind_types.push(type_tag);
     }
-    Ok((sql, params.unbind(), kind.to_owned(), ordered))
+    Ok((
+        sql,
+        params.unbind(),
+        kind.to_owned(),
+        ordered,
+        bind_types,
+        bind_names,
+        result_types,
+    ))
 }
 
 #[cfg(test)]
