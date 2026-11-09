@@ -463,8 +463,8 @@ class AsyncConnection:
             raise RuntimeError("Connection is closed")
         if self._postgres and isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile("postgresql")
-        if self._mysql and isinstance(statement, (Select, Insert, Update, Delete, Compiled)):
-            raise ArgumentError("The initial MySQL driver supports text SQL only")
+        if self._mysql and isinstance(statement, (Select, Insert, Update, Delete)):
+            statement = statement.compile("mysql")
         if (
             self._postgres
             and isinstance(statement, Compiled)
@@ -561,7 +561,7 @@ class AsyncConnection:
                 else parameters
             )
             kind = statement.statement_kind
-            if parameters is not None or self._postgres:
+            if parameters is not None or self._postgres or self._mysql:
                 bind_types = statement._bind_types
                 bind_names = statement._bind_names
             result_types = statement._result_types
@@ -576,7 +576,11 @@ class AsyncConnection:
             if parameters is not None and isinstance(parameters, Mapping):
                 raise ArgumentError("Mapping is only supported with text() statements")
             bindings = () if parameters is None else parameters
-        if self._postgres and isinstance(statement, Compiled) and isinstance(bindings, Mapping):
+        if (
+            (self._postgres or self._mysql)
+            and isinstance(statement, Compiled)
+            and isinstance(bindings, Mapping)
+        ):
             mapping_bindings = cast(Mapping[str, object], bindings)
             ordered_bindings: list[object] = []
             for name in statement._bind_names:

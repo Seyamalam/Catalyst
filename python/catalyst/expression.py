@@ -85,12 +85,12 @@ if TYPE_CHECKING:
 def _dialect_name(dialect: str | None) -> str:
     """Normalize the compile-time dialect selector.
 
-    Catalyst accepts dialect names (``"sqlite"``/``"postgresql"``) where
-    SQLAlchemy accepts dialect objects; ``None`` means SQLite.
+    Catalyst accepts dialect names (``"sqlite"``/``"postgresql"``/``"mysql"``)
+    where SQLAlchemy accepts dialect objects; ``None`` means SQLite.
     """
     if dialect is None:
         return "sqlite"
-    if dialect not in {"sqlite", "postgresql"}:
+    if dialect not in {"sqlite", "postgresql", "mysql"}:
         raise ArgumentError(f"Unsupported compilation dialect '{dialect}'")
     return dialect
 
@@ -296,8 +296,6 @@ def _bind_dialect(bind: Engine | AsyncEngine) -> str | None:
     if getattr(bind, "_postgres", False):
         return "postgresql"
     if getattr(bind, "_mysql", False):
-        # MySQL DDL is not implemented yet; the compiler raises a clean
-        # ArgumentError for the unknown dialect rather than emitting SQLite SQL.
         return "mysql"
     return None
 
@@ -748,6 +746,25 @@ class Select:
                 if self.row_offset is not None
                 else None
             )
+        elif dialect == "mysql":
+            # SA's MySQL dialect renders "LIMIT offset, count": the offset
+            # bind appears first, and offset-only queries get the BIGINT max
+            # count with no second bind.
+            limit = (
+                (
+                    "literal",
+                    self.row_limit,
+                    "=param_2" if self.row_offset is not None else "=param_1",
+                    "integer",
+                )
+                if self.row_limit is not None
+                else None
+            )
+            offset = (
+                ("literal", self.row_offset, "=param_1", "integer")
+                if self.row_offset is not None
+                else None
+            )
         else:
             limit = (
                 ("literal", self.row_limit if self.row_limit is not None else -1, "=param_1")
@@ -797,9 +814,9 @@ class Insert:
 
     def compile(self, dialect: str | None = None) -> Compiled:
         name = _dialect_name(dialect)
-        if name == "postgresql" and not self.values_map:
-            # SA's PG dialect renders empty inserts as explicit NULL binds for
-            # every column rather than SQLite's DEFAULT VALUES.
+        if name in {"postgresql", "mysql"} and not self.values_map:
+            # SA's PG and MySQL dialects render empty inserts as explicit NULL
+            # binds for every column rather than SQLite's DEFAULT VALUES.
             values: dict[str, tuple[object, ...]] = {
                 column.name: ("literal", None, f"={column.name}", _column_type_tag(column.type))
                 for column in self.table.columns

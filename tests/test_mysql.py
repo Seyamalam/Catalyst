@@ -1,8 +1,9 @@
-"""Live MySQL checks for Catalyst's initial async driver slice (ADR 0004).
+"""Live MySQL checks for Catalyst's async driver slice (ADR 0004).
 
 Text execution, typed result hydration, transactions, ``has_table``, pool
-semantics, and error mapping are compared with SQLAlchemy + asyncmy. Compiled
-Core statements and executemany are explicitly unsupported for now.
+semantics, and error mapping are compared with SQLAlchemy + asyncmy.
+Compiled Core statements execute through the MySQL dialect (see
+``test_mysql_core.py``); executemany is still unsupported.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from catalyst import (
     Table,
     TimeoutError,
     create_async_engine,
-    select,
+    insert,
     text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine as sa_create_async_engine
@@ -290,18 +291,17 @@ async def test_mysql_rejects_unsupported_features(table_name: str) -> None:
     engine = create_async_engine(MYSQL_URL)
     try:
         async with engine.connect() as connection:
-            # Compiled Core statements need the MySQL dialect compiler, which
-            # is not implemented yet.
+            # Batch parameter sets are rejected cleanly, for text() and
+            # compiled Core statements alike.
+            with pytest.raises(ArgumentError, match="executemany"):
+                await connection.execute(text("SELECT :v"), [{"v": 1}, {"v": 2}])
             table = Table(
                 "mysql_probe",
                 MetaData(),
                 Column("id", Integer, primary_key=True),
             )
-            with pytest.raises(ArgumentError, match="text SQL only"):
-                await connection.execute(select(table))
-            # Batch parameter sets are rejected cleanly.
             with pytest.raises(ArgumentError, match="executemany"):
-                await connection.execute(text("SELECT :v"), [{"v": 1}, {"v": 2}])
+                await connection.execute(insert(table), [{"id": 1}, {"id": 2}])
     finally:
         await engine.dispose()
 

@@ -1,6 +1,6 @@
 # ADR 0004: MySQL driver selection
 
-- **Status:** Accepted; initial async driver slice implemented with `mysql_async` 0.37.1 (text execution, typed results, transactions, pool, `has_table`; compiled Core/executemany pending the MySQL dialect compiler)
+- **Status:** Accepted; async driver slice implemented with `mysql_async` 0.37.1 (text execution, typed results, transactions, pool, `has_table`, compiled Core via the MySQL dialect; executemany pending)
 - **Date:** 2026-11-08
 
 ## Context
