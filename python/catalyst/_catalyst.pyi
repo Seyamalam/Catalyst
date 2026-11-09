@@ -35,6 +35,7 @@ def sqlite_text(sql: str, parameters: list[object]) -> list[list[object]]:
 
 def compile_expression(
     value: object,
+    dialect: str = ...,
 ) -> tuple[
     str,
     dict[str, object],

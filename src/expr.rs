@@ -17,7 +17,7 @@ type CompiledExpression = (
 );
 type CompiledStatement = (
     String,
-    Vec<(String, Value, Option<String>)>,
+    Vec<(String, Value, Option<String>, bool)>,
     &'static str,
     Vec<Option<String>>,
 );
@@ -126,19 +126,63 @@ fn renders_empty(expr: &Expr) -> bool {
     }
 }
 
-/// Quote an identifier with double quotes when it is not a bare lowercase
-/// SQLite identifier.
-pub(crate) fn quote_identifier(value: &str) -> String {
-    if needs_quote(value) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
+/// SQLAlchemy concatenates string-typed operands with ``||`` instead of ``+``.
+fn is_string_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_, _, Some(tag)) | Expr::Literal(_, _, Some(tag)) => {
+            matches!(tag.as_str(), "string" | "text")
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    fn parse(name: &str) -> PyResult<Self> {
+        match name {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgresql" => Ok(Self::Postgres),
+            other => Err(ArgumentError::new_err(format!(
+                "Unsupported compilation dialect '{other}'"
+            ))),
+        }
+    }
+
+    fn is_postgres(self) -> bool {
+        matches!(self, Self::Postgres)
+    }
+}
+
+/// SQLAlchemy's PG dialect cast rules: integer/string/text/date/datetime
+/// binds carry explicit casts; boolean, float, and binary binds do not.
+fn bind_cast(type_tag: Option<&str>) -> Option<&'static str> {
+    match type_tag {
+        Some("integer") => Some("::INTEGER"),
+        Some("string") | Some("text") => Some("::VARCHAR"),
+        Some("datetime") => Some("::TIMESTAMP WITHOUT TIME ZONE"),
+        Some("date") => Some("::DATE"),
+        _ => None,
+    }
+}
+
+/// SA infers a cast for untyped PG binds from the value itself.
+fn inferred_cast(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Integer(_) => Some("::INTEGER"),
+        Value::Text(_) => Some("::VARCHAR"),
+        _ => None,
     }
 }
 
 struct Compiler {
+    dialect: Dialect,
     sql: String,
-    params: Vec<(String, Value, Option<String>)>,
+    params: Vec<(String, Value, Option<String>, bool)>,
     result_types: Vec<Option<String>>,
     bind_counts: HashMap<String, usize>,
     function_counts: HashMap<String, usize>,
@@ -147,8 +191,9 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn new() -> Self {
+    fn new(dialect: Dialect) -> Self {
         Self {
+            dialect,
             sql: String::new(),
             params: Vec::new(),
             result_types: Vec::new(),
@@ -156,6 +201,15 @@ impl Compiler {
             function_counts: HashMap::new(),
             column_labels: HashMap::new(),
             anon_count: 0,
+        }
+    }
+
+    fn push_placeholder(&mut self) {
+        if self.dialect.is_postgres() {
+            self.sql.push('$');
+            self.sql.push_str(&self.params.len().to_string());
+        } else {
+            self.sql.push('?');
         }
     }
 
@@ -176,8 +230,23 @@ impl Compiler {
         } else {
             self.next_bind_name(&base)
         };
-        self.params.push((key, value, type_tag));
-        self.sql.push('?');
+        let is_bool = type_tag.as_deref() == Some("boolean");
+        let cast_suffix = if self.dialect.is_postgres() {
+            bind_cast(type_tag.as_deref()).or_else(|| {
+                if type_tag.is_none() {
+                    inferred_cast(&value)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        self.params.push((key, value, type_tag, is_bool));
+        self.push_placeholder();
+        if let Some(cast) = cast_suffix {
+            self.sql.push_str(cast);
+        }
     }
 
     fn bind_in_values(&mut self, inner: &Expr, values: &[Expr]) {
@@ -193,23 +262,48 @@ impl Compiler {
                 self.sql.push_str(", ");
             }
             if let Expr::Literal(value, _, type_tag) = value {
+                let is_bool = type_tag.as_deref() == Some("boolean");
+                let cast_suffix = if self.dialect.is_postgres() {
+                    bind_cast(type_tag.as_deref()).or_else(|| {
+                        if type_tag.is_none() {
+                            inferred_cast(value)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
                 self.params.push((
                     format!("{group}_{}", index + 1),
                     value.clone(),
                     type_tag.clone(),
+                    is_bool,
                 ));
-                self.sql.push('?');
+                self.push_placeholder();
+                if let Some(cast) = cast_suffix {
+                    self.sql.push_str(cast);
+                }
             } else if let Expr::Boolean(value) = value {
                 let type_tag = match inner {
                     Expr::Column(_, _, type_tag) => type_tag.clone(),
                     _ => None,
                 };
+                let cast_suffix = if self.dialect.is_postgres() {
+                    bind_cast(type_tag.as_deref())
+                } else {
+                    None
+                };
                 self.params.push((
                     format!("{group}_{}", index + 1),
                     Value::Integer(i64::from(*value)),
                     type_tag,
+                    true,
                 ));
-                self.sql.push('?');
+                self.push_placeholder();
+                if let Some(cast) = cast_suffix {
+                    self.sql.push_str(cast);
+                }
             } else {
                 self.expr(value, None);
             }
@@ -234,13 +328,24 @@ impl Compiler {
                 self.ident(column);
             }
             Expr::Literal(_, _, _) => self.bind(expr),
-            Expr::Boolean(value) => self.sql.push_str(if *value { "1" } else { "0" }),
-            // SQLAlchemy renders a bare Python bool predicate as 1 = 1 / 0 = 1.
+            Expr::Boolean(value) => {
+                if self.dialect.is_postgres() {
+                    self.sql.push_str(if *value { "true" } else { "false" });
+                } else {
+                    self.sql.push_str(if *value { "1" } else { "0" });
+                }
+            }
+            // SQLAlchemy renders a bare Python bool predicate as 1 = 1 / 0 = 1
+            // on SQLite and as true/false words on PostgreSQL.
             Expr::BooleanWord(value) => {
-                self.sql.push_str(if *value { "1 = 1" } else { "0 = 1" });
+                if self.dialect.is_postgres() {
+                    self.sql.push_str(if *value { "true" } else { "false" });
+                } else {
+                    self.sql.push_str(if *value { "1 = 1" } else { "0 = 1" });
+                }
             }
             Expr::Binary(left, op, right) => {
-                if op == "/" {
+                if op == "/" && !self.dialect.is_postgres() {
                     // SQLAlchemy's SQLite dialect rewrites true division as
                     // ``left / (right + 0.0)``; the right operand renders
                     // inside its own grouping.
@@ -248,10 +353,29 @@ impl Compiler {
                     self.sql.push_str(" / (");
                     self.render_child(right, Some(op.as_str()));
                     self.sql.push_str(" + 0.0)");
+                } else if op == "/" {
+                    // SQLAlchemy's PG dialect casts the divisor: NUMERIC for
+                    // integer operands, FLOAT otherwise.
+                    self.render_child(left, Some(op.as_str()));
+                    self.sql.push_str(" / CAST(");
+                    self.render_child(right, Some(op.as_str()));
+                    let cast = match right.as_ref() {
+                        Expr::Column(_, _, Some(tag)) if tag == "integer" => "NUMERIC",
+                        _ => "FLOAT",
+                    };
+                    self.sql.push_str(" AS ");
+                    self.sql.push_str(cast);
+                    self.sql.push(')');
                 } else {
+                    let rendered_op =
+                        if op == "+" && is_string_operand(left) && is_string_operand(right) {
+                            "||"
+                        } else {
+                            op.as_str()
+                        };
                     self.render_child(left, Some(op.as_str()));
                     self.sql.push(' ');
-                    self.sql.push_str(op);
+                    self.sql.push_str(rendered_op);
                     self.sql.push(' ');
                     self.render_child(right, Some(op.as_str()));
                 }
@@ -302,11 +426,20 @@ impl Compiler {
                 }
                 self.render_child(inner, Some("IN"));
                 if values.is_empty() {
-                    self.sql.push_str(if negated {
-                        " NOT IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)"
+                    if self.dialect.is_postgres() {
+                        // SQLAlchemy's expanding-bind empty-set rendering for PG.
+                        if negated {
+                            self.sql.push_str(" NOT IN (NULL) OR (1 = 1)");
+                        } else {
+                            self.sql.push_str(" IN (NULL) AND (1 != 1)");
+                        }
                     } else {
-                        " IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)"
-                    });
+                        self.sql.push_str(if negated {
+                            " NOT IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)"
+                        } else {
+                            " IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)"
+                        });
+                    }
                 } else {
                     self.sql
                         .push_str(if negated { " NOT IN (" } else { " IN (" });
@@ -407,7 +540,7 @@ impl Compiler {
     }
 
     fn ident(&mut self, value: &str) {
-        if needs_quote(value) {
+        if needs_quote_in(value, self.dialect) {
             self.sql.push('"');
             self.sql.push_str(&value.replace('"', "\"\""));
             self.sql.push('"');
@@ -497,17 +630,32 @@ impl Compiler {
                     }
                 }
                 if limit.is_some() || offset.is_some() {
-                    self.sql.push_str("\n LIMIT ");
-                    if let Some(limit) = limit {
-                        self.expr(limit, None);
+                    if self.dialect.is_postgres() {
+                        // SA PG: " \nLIMIT x" with limit, "\n LIMIT ALL" when
+                        // only offset is present; OFFSET joins on the same line.
+                        if let Some(limit) = limit {
+                            self.sql.push_str(" \n LIMIT ");
+                            self.expr(limit, None);
+                        } else {
+                            self.sql.push_str("\n LIMIT ALL");
+                        }
+                        if let Some(offset) = offset {
+                            self.sql.push_str(" OFFSET ");
+                            self.expr(offset, None);
+                        }
                     } else {
-                        self.sql.push_str("-1");
-                    }
-                    self.sql.push_str(" OFFSET ");
-                    if let Some(offset) = offset {
-                        self.expr(offset, None);
-                    } else {
-                        self.sql.push('0');
+                        self.sql.push_str("\n LIMIT ");
+                        if let Some(limit) = limit {
+                            self.expr(limit, None);
+                        } else {
+                            self.sql.push_str("-1");
+                        }
+                        self.sql.push_str(" OFFSET ");
+                        if let Some(offset) = offset {
+                            self.expr(offset, None);
+                        } else {
+                            self.sql.push('0');
+                        }
                     }
                 }
                 "select"
@@ -572,6 +720,14 @@ impl Compiler {
                 columns,
                 primary_key,
             } => {
+                let dialect = self.dialect;
+                let quote = |value: &str| {
+                    if needs_quote_in(value, dialect) {
+                        format!("\"{}\"", value.replace('"', "\"\""))
+                    } else {
+                        value.to_owned()
+                    }
+                };
                 self.sql.push('\n');
                 self.sql.push_str("CREATE TABLE ");
                 self.ident(table);
@@ -583,9 +739,19 @@ impl Compiler {
                 let mut lines: Vec<String> = columns
                     .iter()
                     .map(|column| {
-                        let mut line = quote_identifier(&column.name);
+                        let mut line = quote(&column.name);
                         line.push(' ');
-                        line.push_str(&column.type_name);
+                        // SQLAlchemy's PG dialect renders a single integer
+                        // autoincrement primary key column as SERIAL.
+                        if dialect.is_postgres()
+                            && primary_key.len() == 1
+                            && primary_key[0] == column.name
+                            && column.type_name == "INTEGER"
+                        {
+                            line.push_str("SERIAL");
+                        } else {
+                            line.push_str(&column.type_name);
+                        }
                         if let Some(default) = &column.default {
                             line.push_str(" DEFAULT '");
                             line.push_str(&default.replace('\'', "''"));
@@ -600,13 +766,13 @@ impl Compiler {
                 if !primary_key.is_empty() {
                     let keys = primary_key
                         .iter()
-                        .map(|key| quote_identifier(key))
+                        .map(|key| quote(key))
                         .collect::<Vec<_>>()
                         .join(", ");
                     lines.push(format!("PRIMARY KEY ({keys})"));
                 }
                 for column in columns.iter().filter(|column| column.unique) {
-                    lines.push(format!("UNIQUE ({})", quote_identifier(&column.name)));
+                    lines.push(format!("UNIQUE ({})", quote(&column.name)));
                 }
                 self.sql.push_str(&lines.join(", \n\t"));
                 if lines.is_empty() {
@@ -627,7 +793,114 @@ impl Compiler {
     }
 }
 
+#[cfg(test)]
 fn needs_quote(value: &str) -> bool {
+    needs_quote_in(value, Dialect::Sqlite)
+}
+
+fn needs_quote_in(value: &str, dialect: Dialect) -> bool {
+    const PG_RESERVED: &[&str] = &[
+        "all",
+        "analyse",
+        "analyze",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "asymmetric",
+        "authorization",
+        "binary",
+        "both",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "collation",
+        "column",
+        "concurrently",
+        "constraint",
+        "create",
+        "cross",
+        "current_catalog",
+        "current_date",
+        "current_role",
+        "current_schema",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "default",
+        "deferrable",
+        "desc",
+        "distinct",
+        "do",
+        "else",
+        "end",
+        "except",
+        "false",
+        "fetch",
+        "for",
+        "foreign",
+        "freeze",
+        "from",
+        "full",
+        "grant",
+        "group",
+        "having",
+        "ilike",
+        "in",
+        "initially",
+        "inner",
+        "intersect",
+        "into",
+        "is",
+        "isnull",
+        "join",
+        "lateral",
+        "leading",
+        "left",
+        "like",
+        "limit",
+        "localtime",
+        "localtimestamp",
+        "natural",
+        "not",
+        "notnull",
+        "null",
+        "offset",
+        "on",
+        "only",
+        "or",
+        "order",
+        "outer",
+        "overlaps",
+        "placing",
+        "primary",
+        "references",
+        "returning",
+        "right",
+        "select",
+        "session_user",
+        "similar",
+        "some",
+        "symmetric",
+        "table",
+        "tablesample",
+        "then",
+        "to",
+        "trailing",
+        "true",
+        "union",
+        "unique",
+        "user",
+        "using",
+        "variadic",
+        "verbose",
+        "when",
+        "where",
+        "window",
+        "with",
+    ];
     const RESERVED: &[&str] = &[
         "abort",
         "action",
@@ -781,7 +1054,10 @@ fn needs_quote(value: &str) -> bool {
     };
     !(first == '_' || first.is_ascii_lowercase())
         || !chars.all(|ch| ch == '_' || ch.is_ascii_lowercase() || ch.is_ascii_digit())
-        || RESERVED.contains(&value)
+        || match dialect {
+            Dialect::Sqlite => RESERVED.contains(&value),
+            Dialect::Postgres => PG_RESERVED.contains(&value),
+        }
 }
 
 fn seq<'py>(value: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
@@ -950,9 +1226,26 @@ fn parse_values(value: &Bound<'_, PyAny>) -> PyResult<Vec<(String, Expr)>> {
     Ok(result)
 }
 
-/// Map a Python type-marker tag to its SQLite DDL type name (SQLAlchemy's
-/// SQLite type compiler rendering for the equivalent type).
-fn render_type_name(tag: &str, length: Option<u64>) -> PyResult<String> {
+/// Map a Python type-marker tag to its DDL type name (SQLAlchemy's type
+/// compiler rendering for the equivalent type in the target dialect).
+fn render_type_name(tag: &str, length: Option<u64>, dialect: Dialect) -> PyResult<String> {
+    if dialect.is_postgres() {
+        return match tag {
+            "integer" => Ok("INTEGER".to_owned()),
+            "string" => {
+                Ok(length.map_or_else(|| "VARCHAR".to_owned(), |size| format!("VARCHAR({size})")))
+            }
+            "text" => Ok("TEXT".to_owned()),
+            "boolean" => Ok("BOOLEAN".to_owned()),
+            "float" => Ok("FLOAT".to_owned()),
+            "datetime" => Ok("TIMESTAMP WITHOUT TIME ZONE".to_owned()),
+            "date" => Ok("DATE".to_owned()),
+            "binary" => Ok("BYTEA".to_owned()),
+            other => Err(ArgumentError::new_err(format!(
+                "Unsupported DDL column type '{other}'"
+            ))),
+        };
+    }
     match tag {
         "integer" => Ok("INTEGER".to_owned()),
         "string" => {
@@ -970,7 +1263,7 @@ fn render_type_name(tag: &str, length: Option<u64>) -> PyResult<String> {
     }
 }
 
-fn parse_column_def(value: &Bound<'_, PyAny>) -> PyResult<ColumnDdl> {
+fn parse_column_def(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<ColumnDdl> {
     let name = string_at(value, 0)?;
     let type_tag = string_at(value, 1)?;
     let length_value = item(value, 2)?;
@@ -989,14 +1282,14 @@ fn parse_column_def(value: &Bound<'_, PyAny>) -> PyResult<ColumnDdl> {
     };
     Ok(ColumnDdl {
         name,
-        type_name: render_type_name(&type_tag, length)?,
+        type_name: render_type_name(&type_tag, length, dialect)?,
         not_null,
         unique,
         default,
     })
 }
 
-fn parse_statement(value: &Bound<'_, PyAny>) -> PyResult<Statement> {
+fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<Statement> {
     let name = tag(value)?;
     match name.as_str() {
         "select" => {
@@ -1071,7 +1364,7 @@ fn parse_statement(value: &Bound<'_, PyAny>) -> PyResult<Statement> {
         "create_table" => {
             let columns = seq(&item(value, 2)?)?
                 .iter()
-                .map(parse_column_def)
+                .map(|column| parse_column_def(column, dialect))
                 .collect::<PyResult<Vec<_>>>()?;
             let primary_key = seq(&item(value, 3)?)?
                 .iter()
@@ -1093,19 +1386,28 @@ fn parse_statement(value: &Bound<'_, PyAny>) -> PyResult<Statement> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (value, dialect="sqlite"))]
 pub(crate) fn compile_expression(
     value: &Bound<'_, PyAny>,
+    dialect: &str,
     py: Python<'_>,
 ) -> PyResult<CompiledExpression> {
-    let statement = parse_statement(value)?;
+    let dialect = Dialect::parse(dialect)?;
+    let statement = parse_statement(value, dialect)?;
     let (sql, values, kind, result_types) =
-        py.detach(move || Compiler::new().statement(&statement));
+        py.detach(move || Compiler::new(dialect).statement(&statement));
     let params = PyDict::new(py);
     let mut ordered = Vec::with_capacity(values.len());
     let mut bind_types = Vec::with_capacity(values.len());
     let mut bind_names = Vec::with_capacity(values.len());
-    for (key, value, type_tag) in values {
-        let converted = crate::sqlite_to_python(py, value)?;
+    for (key, value, type_tag, is_bool) in values {
+        let converted = if dialect.is_postgres() && is_bool && matches!(value, Value::Integer(_)) {
+            // PG keeps boolean bind values as Python bools (SQLite stores 0/1).
+            let flag = matches!(value, Value::Integer(1));
+            flag.into_pyobject(py)?.to_owned().unbind().into_any()
+        } else {
+            crate::sqlite_to_python(py, value)?
+        };
         params.set_item(&key, converted.clone_ref(py))?;
         ordered.push(converted);
         bind_names.push(key);
