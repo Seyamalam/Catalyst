@@ -36,6 +36,7 @@ from ._catalyst import (
 from .engine import (
     AsyncConnection,
     AsyncEngine,
+    AsyncSavepointTransaction,
     Connection,
     CursorResult,
     Engine,
@@ -90,6 +91,7 @@ __all__ = [
     "Connection",
     "AsyncEngine",
     "AsyncConnection",
+    "AsyncSavepointTransaction",
     "RootTransaction",
     "SavepointTransaction",
     "CursorResult",

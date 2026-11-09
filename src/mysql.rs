@@ -38,6 +38,7 @@ pub(crate) struct NativeMysqlEngine {
 pub(crate) struct NativeMysqlConnection {
     connection: Mutex<Option<Conn>>,
     active: AtomicBool,
+    next_savepoint: std::sync::atomic::AtomicU64,
     pool: Mutex<Option<(Arc<MysqlPoolInner>, tokio::sync::OwnedSemaphorePermit)>>,
 }
 
@@ -158,6 +159,7 @@ impl NativeMysqlEngine {
                     NativeMysqlConnection {
                         connection: Mutex::new(Some(connection)),
                         active: AtomicBool::new(false),
+                        next_savepoint: std::sync::atomic::AtomicU64::new(0),
                         pool: Mutex::new(Some((inner, permit))),
                     },
                 )
@@ -331,6 +333,65 @@ impl NativeMysqlConnection {
         })
     }
 
+    /// Create a uniquely named savepoint, autobeginning a root if needed.
+    fn async_begin_savepoint<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (mut conn, active) = take_connection(&slf, py)?;
+        let owner = slf.clone_ref(py);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let serial = Python::attach(|py| {
+                owner
+                    .borrow(py)
+                    .next_savepoint
+                    .fetch_add(1, Ordering::Relaxed)
+            });
+            let result = async {
+                if !active {
+                    conn.query_drop("BEGIN").await.map_err(map_mysql_error)?;
+                }
+                let name = format!("catalyst_sp_{serial}");
+                conn.query_drop(format!("SAVEPOINT {name}"))
+                    .await
+                    .map_err(map_mysql_error)?;
+                Ok(name)
+            }
+            .await;
+            Python::attach(|py| {
+                let borrowed = owner.borrow(py);
+                if result.is_ok() {
+                    borrowed.active.store(true, Ordering::Release);
+                }
+                if let Ok(mut guard) = borrowed.connection.lock() {
+                    *guard = Some(conn);
+                }
+            });
+            result
+        })
+    }
+
+    /// Release a savepoint and any nested savepoints beneath it.
+    fn async_release_savepoint<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        savepoint_op(slf, py, name, false)
+    }
+
+    /// Roll back to and release a savepoint.
+    fn async_rollback_savepoint<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        savepoint_op(slf, py, name, true)
+    }
+
+    /// Whether this holder has an open transaction (explicit or autobegin).
+    fn async_is_active<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let active = slf.borrow(py).active.load(Ordering::Acquire);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(active) })
+    }
+
     /// Return the connection to the pool: roll back an open transaction first
     /// (reset-on-return), then release the slot permit. Dead connections and
     /// returns after engine dispose are dropped instead of idled.
@@ -374,6 +435,50 @@ impl NativeMysqlConnection {
             Ok(())
         })
     }
+}
+
+/// Take the checked-out `Conn` and current transaction flag for a call.
+fn take_connection(slf: &Py<NativeMysqlConnection>, py: Python<'_>) -> PyResult<(Conn, bool)> {
+    let borrowed = slf.borrow(py);
+    let conn = borrowed
+        .connection
+        .lock()
+        .map_err(|_| OperationalError::new_err("MySQL connection lock was poisoned"))?
+        .take()
+        .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+    Ok((conn, borrowed.active.load(Ordering::Acquire)))
+}
+
+/// Run `RELEASE SAVEPOINT` or `ROLLBACK TO` + `RELEASE`, restoring the
+/// connection into the wrapper regardless of outcome.
+fn savepoint_op<'py>(
+    slf: Py<NativeMysqlConnection>,
+    py: Python<'py>,
+    name: String,
+    rollback: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    crate::validate_savepoint_name(&name)?;
+    let (mut conn, _active) = take_connection(&slf, py)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = async {
+            if rollback {
+                conn.query_drop(format!("ROLLBACK TO SAVEPOINT {name}"))
+                    .await
+                    .map_err(map_mysql_error)?;
+            }
+            conn.query_drop(format!("RELEASE SAVEPOINT {name}"))
+                .await
+                .map_err(map_mysql_error)?;
+            Ok(())
+        }
+        .await;
+        Python::attach(|py| {
+            if let Ok(mut guard) = slf.borrow(py).connection.lock() {
+                *guard = Some(conn);
+            }
+        });
+        result
+    })
 }
 
 /// Map SQLAlchemy-style URL options onto `mysql_async` connection options.

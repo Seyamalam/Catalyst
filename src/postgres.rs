@@ -39,6 +39,7 @@ pub(crate) struct NativePgEngine {
 pub(crate) struct NativePgConnection {
     client: Mutex<Option<Arc<Client>>>,
     active: AtomicBool,
+    next_savepoint: std::sync::atomic::AtomicU64,
     pool: Mutex<Option<(Arc<PgPoolInner>, tokio::sync::OwnedSemaphorePermit)>>,
 }
 
@@ -193,6 +194,7 @@ impl NativePgEngine {
                     NativePgConnection {
                         client: Mutex::new(Some(client)),
                         active: AtomicBool::new(false),
+                        next_savepoint: std::sync::atomic::AtomicU64::new(0),
                         pool: Mutex::new(Some((inner, permit))),
                     },
                 )
@@ -413,6 +415,79 @@ impl NativePgConnection {
         })
     }
 
+    /// Create a uniquely named savepoint, autobeginning a root if needed.
+    fn async_begin_savepoint<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = {
+            let borrowed = slf.borrow(py);
+            borrowed
+                .client
+                .lock()
+                .map_err(|_| OperationalError::new_err("PostgreSQL connection lock was poisoned"))?
+                .clone()
+                .ok_or_else(|| OperationalError::new_err("Connection is closed"))?
+        };
+        let owner = slf.clone_ref(py);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (active, serial) = Python::attach(|py| {
+                let borrowed = owner.borrow(py);
+                (
+                    borrowed.active.load(Ordering::Acquire),
+                    borrowed.next_savepoint.fetch_add(1, Ordering::Relaxed),
+                )
+            });
+            if !active {
+                client.batch_execute("BEGIN").await.map_err(map_pg_error)?;
+            }
+            let name = format!("catalyst_sp_{serial}");
+            client
+                .batch_execute(&format!("SAVEPOINT {name}"))
+                .await
+                .map_err(map_pg_error)?;
+            Python::attach(|py| owner.borrow(py).active.store(true, Ordering::Release));
+            Ok(name)
+        })
+    }
+
+    /// Release a savepoint and any nested savepoints beneath it.
+    fn async_release_savepoint<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = take_savepoint_client(slf, py, &name)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .batch_execute(&format!("RELEASE SAVEPOINT {name}"))
+                .await
+                .map_err(map_pg_error)
+        })
+    }
+
+    /// Roll back to and release a savepoint.
+    fn async_rollback_savepoint<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = take_savepoint_client(slf, py, &name)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .batch_execute(&format!("ROLLBACK TO SAVEPOINT {name}"))
+                .await
+                .map_err(map_pg_error)?;
+            client
+                .batch_execute(&format!("RELEASE SAVEPOINT {name}"))
+                .await
+                .map_err(map_pg_error)
+        })
+    }
+
+    /// Whether this holder has an open transaction (explicit or autobegin).
+    fn async_is_active<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let active = slf.borrow(py).active.load(Ordering::Acquire);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(active) })
+    }
+
     /// Return the client to the pool: roll back an open transaction first
     /// (reset-on-return), then release the slot permit. Dead clients and
     /// returns after engine dispose are dropped instead of idled.
@@ -452,6 +527,22 @@ impl NativePgConnection {
             Ok(())
         })
     }
+}
+
+/// Validate a generated savepoint name and clone the live client for it.
+fn take_savepoint_client(
+    slf: Py<NativePgConnection>,
+    py: Python<'_>,
+    name: &str,
+) -> PyResult<Arc<Client>> {
+    crate::validate_savepoint_name(name)?;
+    let borrowed = slf.borrow(py);
+    borrowed
+        .client
+        .lock()
+        .map_err(|_| OperationalError::new_err("PostgreSQL connection lock was poisoned"))?
+        .clone()
+        .ok_or_else(|| OperationalError::new_err("Connection is closed"))
 }
 
 fn verified_tls_connector() -> PyResult<MakeRustlsConnect> {

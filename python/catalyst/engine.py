@@ -360,12 +360,81 @@ class SavepointTransaction:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        # An already-ended savepoint no-ops here; SQLAlchemy warns instead of
+        # raising in this path (documented parity difference).
+        if self._finished:
+            return
         if exc_type is None and self.native.is_active():
             self.commit()
         elif self.native.is_active():
             self.rollback()
+
+
+class AsyncSavepointTransaction:
+    """Async handle for a native savepoint.
+
+    Mirrors SQLAlchemy's ``AsyncConnection.begin_nested``: construction is
+    synchronous and the ``SAVEPOINT`` statement is deferred to ``start()``
+    or the async context manager.
+    """
+
+    def __init__(
+        self,
+        native: NativeConnection | NativePgConnection | NativeMysqlConnection,
+    ) -> None:
+        self._native = native
+        self._name: str | None = None
+        self._finished = False
+
+    async def start(self) -> AsyncSavepointTransaction:
+        """Emit the ``SAVEPOINT`` statement if it has not run yet."""
+        if self._finished:
+            raise InvalidRequestError("This savepoint is no longer active")
+        if self._name is None:
+            self._name = await self._native.async_begin_savepoint()
+        return self
+
+    async def commit(self) -> None:
+        """Release this savepoint."""
+        if self._finished or self._name is None:
+            raise InvalidRequestError("This savepoint is no longer active")
+        await self._native.async_release_savepoint(self._name)
+        self._finished = True
+
+    async def release(self) -> None:
+        """Release this savepoint."""
+        await self.commit()
+
+    async def rollback(self) -> None:
+        """Roll back to this savepoint and release it."""
+        if self._finished or self._name is None:
+            raise InvalidRequestError("This savepoint is no longer active")
+        await self._native.async_rollback_savepoint(self._name)
+        self._finished = True
+
+    async def close(self) -> None:
+        """Roll back this savepoint if it is still active."""
+        if not self._finished and self._name is not None:
+            await self.rollback()
+
+    def __await__(self) -> Any:
+        # ``await conn.begin_nested()`` starts the savepoint, matching
+        # SQLAlchemy's AsyncTransaction.
+        return self.start().__await__()
+
+    async def __aenter__(self) -> AsyncSavepointTransaction:
+        return await self.start()
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         # An already-ended savepoint no-ops here; SQLAlchemy warns instead of
         # raising in this path (documented parity difference).
+        if self._finished:
+            return
+        active = await self._native.async_is_active()
+        if exc_type is None and active:
+            await self.commit()
+        elif active:
+            await self.rollback()
 
 
 class AsyncConnection:
@@ -535,6 +604,12 @@ class AsyncConnection:
         if self._closed:
             raise RuntimeError("Connection is closed")
         await self._native.async_transaction("begin")
+
+    def begin_nested(self) -> AsyncSavepointTransaction:
+        """Begin a nested transaction implemented by a native savepoint."""
+        if self._closed:
+            raise RuntimeError("Connection is closed")
+        return AsyncSavepointTransaction(self._native)
 
     async def commit(self) -> None:
         if self._closed:
