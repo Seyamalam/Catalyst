@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
+from catalyst import ProgrammingError
 from catalyst.engine import create_engine as catalyst_create_engine
 from catalyst.expression import (
     Boolean,
@@ -386,7 +387,7 @@ def test_decimal_numeric_is_not_silently_coerced() -> None:
     sqlalchemy = sa_create_engine("sqlite:///:memory:")
     try:
         with catalyst.connect() as connection:
-            with pytest.raises(TypeError, match="SQLite parameters must be"):
+            with pytest.raises(ProgrammingError, match="type 'Decimal' is not supported"):
                 connection.execute("SELECT ?", [Decimal("1.25")])
         with sqlalchemy.connect() as connection:
             with pytest.raises(Exception) as sqlalchemy_error:

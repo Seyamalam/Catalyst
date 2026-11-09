@@ -120,6 +120,7 @@ class Compiled:
     _bind_names: list[str]
     _result_types: list[str | None]
     entity: type[object] | None
+    bind_error: BaseException | None
     def __init__(
         self,
         sql: str,
@@ -130,6 +131,7 @@ class Compiled:
         bind_names: list[str],
         result_types: list[str | None],
         entity: type[object] | None = ...,
+        bind_error: BaseException | None = ...,
     ) -> None: ...
     def __str__(self) -> str: ...
 

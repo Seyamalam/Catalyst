@@ -46,6 +46,7 @@ def compile_expression(
     list[str | None],
     list[str],
     list[str | None],
+    BaseException | None,
 ]: ...
 
 @final
@@ -185,6 +186,10 @@ class NoSuchModuleError(ArgumentError):
 
 class StatementError(CatalystError):
     """Base class for SQL statement errors."""
+
+    orig: BaseException | None
+    statement: str | None
+    params: object
 
 class DBAPIError(StatementError):
     """Base class for database driver errors."""

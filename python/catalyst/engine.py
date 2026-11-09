@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from ._catalyst import (
     ArgumentError,
+    DBAPIError,
     InvalidRequestError,
     NativeConnection,
     NativeEngine,
@@ -28,6 +29,32 @@ from ._catalyst import (
 from .expression import Compiled, Delete, Insert, Select, Table, Update
 
 _logger = logging.getLogger(__name__)
+
+# SQLAlchemy's ``StatementError`` instances always carry ``orig``,
+# ``statement``, and ``params``; declare the attribute shape on the native
+# exception type so stubs and attribute access reflect it.
+StatementError.orig = None
+StatementError.statement = None
+StatementError.params = None
+
+
+def _statement_error(orig: BaseException, statement: str, params: object) -> StatementError:
+    """Build a SQLAlchemy-shaped ``StatementError`` wrapping a bind failure.
+
+    Driver-level failures keep their concrete ``DBAPIError`` subclass (for
+    example ``ProgrammingError`` for unbindable types), matching SQLAlchemy's
+    wrapped exceptions; bind-processing failures use plain ``StatementError``.
+    """
+    origin = type(orig)
+    cls = origin if issubclass(origin, DBAPIError) else StatementError
+    message = f"({origin.__module__}.{origin.__qualname__}) {orig}\n[SQL: {statement}]"
+    if params:
+        message += f"\n[parameters: {params!r}]"
+    error = cls(message)
+    error.orig = orig
+    error.statement = statement
+    error.params = params
+    return error
 
 
 def _validate_compiled_parameters(parameters: object) -> None:
@@ -289,6 +316,7 @@ class Connection:
                 compiled_shape._bind_types,
                 compiled_shape._bind_names,
                 compiled_shape._result_types,
+                bind_error=compiled_shape.bind_error,
             )
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
@@ -328,15 +356,32 @@ class Connection:
             native_parameters = list(bindings)
         if self._echo:
             _logger.info("%s", sql)
-        return CursorResult(
-            self._native.execute(
+        if isinstance(statement, Compiled) and statement.bind_error is not None:
+            raise _statement_error(
+                statement.bind_error, sql, parameters if parameters is not None else ()
+            )
+        try:
+            native_result = self._native.execute(
                 sql,
                 native_parameters,
                 isinstance(statement, TextClause),
                 kind,
                 (bind_types, bind_names, result_types),
             )
-        )
+        except DBAPIError as error:
+            # Driver-level failures keep their concrete class and gain
+            # statement context like SQLAlchemy's wrapped exceptions.
+            raise _statement_error(
+                error, sql, parameters if parameters is not None else ()
+            ) from error
+        except StatementError as error:
+            # Already statement-shaped (a missing bind value, for example):
+            # attach the execution context SQLAlchemy sets on these.
+            if error.statement is None:
+                error.statement = sql
+                error.params = parameters if parameters is not None else ()
+            raise
+        return CursorResult(native_result)
 
     def begin(self) -> RootTransaction:
         """Begin an explicit root transaction on this connection."""
@@ -646,6 +691,7 @@ class AsyncConnection:
                 compiled_shape._bind_types,
                 compiled_shape._bind_names,
                 compiled_shape._result_types,
+                bind_error=compiled_shape.bind_error,
             )
         if isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile()
@@ -697,13 +743,27 @@ class AsyncConnection:
             native_parameters = list(bindings)
         if self._echo:
             _logger.info("%s", sql)
-        result = await self._native.async_execute(
-            sql,
-            native_parameters,
-            isinstance(statement, TextClause),
-            kind,
-            (bind_types, bind_names, result_types),
-        )
+        if isinstance(statement, Compiled) and statement.bind_error is not None:
+            raise _statement_error(
+                statement.bind_error, sql, parameters if parameters is not None else ()
+            )
+        try:
+            result = await self._native.async_execute(
+                sql,
+                native_parameters,
+                isinstance(statement, TextClause),
+                kind,
+                (bind_types, bind_names, result_types),
+            )
+        except DBAPIError as error:
+            raise _statement_error(
+                error, sql, parameters if parameters is not None else ()
+            ) from error
+        except StatementError as error:
+            if error.statement is None:
+                error.statement = sql
+                error.params = parameters if parameters is not None else ()
+            raise
         return CursorResult(result)
 
     async def begin(self) -> None:

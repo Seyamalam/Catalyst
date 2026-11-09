@@ -13,6 +13,7 @@ from catalyst import (
     Column,
     Integer,
     MetaData,
+    ProgrammingError,
     String,
     Table,
     create_async_engine,
@@ -157,8 +158,12 @@ def test_unhashable_bind_values_bypass_cache_and_execute(
         __hash__ = None  # type: ignore[assignment]
 
     with engine.connect() as connection:
-        with pytest.raises(TypeError):
+        # SQLAlchemy's sqlite driver reports unbindable types as a
+        # ProgrammingError carrying statement context.
+        with pytest.raises(ProgrammingError) as error:
             connection.execute(select(table.c.id).where(table.c.name == Unhashable()))
+        assert error.value.orig is not None
+        assert "SELECT" in (error.value.statement or "")
     engine.dispose()
 
 

@@ -48,7 +48,7 @@ def test_binding_mismatch_raises_matching_programming_error() -> None:
 
 def test_unsupported_parameter_type_is_rejected_before_execution() -> None:
     """Only SQLite's supported scalar types cross the native boundary."""
-    with pytest.raises(TypeError, match="parameters must be"):
+    with pytest.raises(ProgrammingError, match="type 'object' is not supported"):
         sqlite_text("SELECT ?", [object()])
 
 

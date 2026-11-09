@@ -28,10 +28,18 @@ def _compile_cached(
     tuple[str | None, ...],
     tuple[str, ...],
     tuple[str | None, ...],
+    BaseException | None,
 ]:
-    sql, params, kind, _ordered, bind_types, bind_names, result_types = compile_expression(
-        serialized, dialect
-    )
+    (
+        sql,
+        params,
+        kind,
+        _ordered,
+        bind_types,
+        bind_names,
+        result_types,
+        bind_error,
+    ) = compile_expression(serialized, dialect)
     return (
         sql,
         tuple(params.items()),
@@ -39,6 +47,7 @@ def _compile_cached(
         tuple(bind_types),
         tuple(bind_names),
         tuple(result_types),
+        bind_error,
     )
 
 
@@ -53,16 +62,24 @@ def _compiled_from_cache(
     list[str | None],
     list[str],
     list[str | None],
+    BaseException | None,
 ]:
     try:
-        sql, items, kind, bind_types, bind_names, result_types = _compile_cached(
+        sql, items, kind, bind_types, bind_names, result_types, bind_error = _compile_cached(
             serialized, dialect
         )
     except TypeError:
         # Bind values may be unhashable objects; compile directly without caching.
-        sql, params, kind, ordered, bind_types, bind_names, result_types = compile_expression(
-            serialized, dialect
-        )
+        (
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            bind_error,
+        ) = compile_expression(serialized, dialect)
         return (
             sql,
             params,
@@ -71,11 +88,21 @@ def _compiled_from_cache(
             list(bind_types),
             list(bind_names),
             list(result_types),
+            bind_error,
         )
     # Rebuild per call so the shared cache entry is never exposed mutably.
     params = dict(items)
     ordered = [value for _key, value in items]
-    return sql, params, kind, ordered, list(bind_types), list(bind_names), list(result_types)
+    return (
+        sql,
+        params,
+        kind,
+        ordered,
+        list(bind_types),
+        list(bind_names),
+        list(result_types),
+        bind_error,
+    )
 
 
 if TYPE_CHECKING:
@@ -383,16 +410,32 @@ class Table:
             for column in self.columns
         )
         primary_key = tuple(column.name for column in self.columns if column.primary_key)
-        sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
+        (
+            sql,
+            _params,
+            kind,
+            _ordered,
+            _bind_types,
+            _bind_names,
+            _result_types,
+            _bind_error,
+        ) = compile_expression(
             ("create_table", self.name, columns, primary_key), _dialect_name(dialect)
         )
         return Compiled(sql, {}, kind, [], [], [], [])
 
     def compile_drop(self, dialect: str | None = None) -> Compiled:
         """Compile this table's ``DROP TABLE`` statement natively."""
-        sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
-            ("drop_table", self.name), _dialect_name(dialect)
-        )
+        (
+            sql,
+            _params,
+            kind,
+            _ordered,
+            _bind_types,
+            _bind_names,
+            _result_types,
+            _bind_error,
+        ) = compile_expression(("drop_table", self.name), _dialect_name(dialect))
         return Compiled(sql, {}, kind, [], [], [], [])
 
     def create(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
@@ -661,6 +704,7 @@ class Compiled:
         bind_names: list[str],
         result_types: list[str | None],
         entity: type[object] | None = None,
+        bind_error: BaseException | None = None,
     ) -> None:
         self.string = sql
         self.params = params
@@ -670,6 +714,9 @@ class Compiled:
         self._bind_names = bind_names
         self._result_types = result_types
         self.entity = entity
+        # Literal bind processing is deferred to execution like SQLAlchemy:
+        # a conversion that failed during compile is raised here on execute.
+        self.bind_error = bind_error
 
     def __str__(self) -> str:
         return self.string
@@ -817,11 +864,26 @@ class Select:
         name = _dialect_name(dialect)
         serialized = self._serialize(name)
         _check_node_depth(serialized)
-        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            serialized, name
-        )
+        (
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            bind_error,
+        ) = _compiled_from_cache(serialized, name)
         return Compiled(
-            sql, params, kind, ordered, bind_types, bind_names, result_types, self.entity
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            self.entity,
+            bind_error,
         )
 
     def __str__(self) -> str:
@@ -861,10 +923,19 @@ class Insert:
                 for column in self.table.columns
                 if column.name in self.values_map
             }
-        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            ("insert", self.table.name, values), name
+        (
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            bind_error,
+        ) = _compiled_from_cache(("insert", self.table.name, values), name)
+        return Compiled(
+            sql, params, kind, ordered, bind_types, bind_names, result_types, bind_error=bind_error
         )
-        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -908,10 +979,21 @@ class Update:
             if column.name in self.values_map
         }
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
+        (
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            bind_error,
+        ) = _compiled_from_cache(
             ("update", self.table.name, values, predicate), _dialect_name(dialect)
         )
-        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
+        return Compiled(
+            sql, params, kind, ordered, bind_types, bind_names, result_types, bind_error=bind_error
+        )
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -936,10 +1018,19 @@ class Delete:
 
     def compile(self, dialect: str | None = None) -> Compiled:
         predicate = None if self.predicate is None else _node(self.predicate)
-        sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            ("delete", self.table.name, predicate), _dialect_name(dialect)
+        (
+            sql,
+            params,
+            kind,
+            ordered,
+            bind_types,
+            bind_names,
+            result_types,
+            bind_error,
+        ) = _compiled_from_cache(("delete", self.table.name, predicate), _dialect_name(dialect))
+        return Compiled(
+            sql, params, kind, ordered, bind_types, bind_names, result_types, bind_error=bind_error
         )
-        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
     def __str__(self) -> str:
         return str(self.compile())

@@ -5,6 +5,7 @@ mod mysql;
 mod pool;
 mod postgres;
 
+use pyo3::PyTypeInfo;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -272,68 +273,74 @@ impl NativeConnection {
         py: Python<'_>,
     ) -> PyResult<NativeResult> {
         let (bind_types, bind_names, result_types) = type_metadata.unwrap_or_default();
-        let mut batch = None;
-        let mut named_values = None;
-        let mut positional_values = None;
-        if let Ok(mapping) = parameters.cast::<PyDict>() {
-            named_values = Some(convert_named_values(
-                mapping,
-                Some((&bind_names, &bind_types)),
-            )?);
-        } else if let Ok(list) = parameters.cast::<PyList>() {
-            if list.is_empty() && text_mode {
-                named_values = Some(std::collections::HashMap::new());
-            } else if !list.is_empty()
-                && (list.get_item(0)?.is_instance_of::<PyDict>()
-                    || list.get_item(0)?.is_instance_of::<PyList>()
-                    || list.get_item(0)?.is_instance_of::<PyTuple>())
-            {
-                let mut rows = Vec::with_capacity(list.len());
-                for row in list.iter() {
-                    if let Ok(mapping) = row.cast::<PyDict>() {
-                        let converted =
-                            convert_named_values(mapping, Some((&bind_names, &bind_types)))?;
-                        if bind_names.is_empty() {
-                            rows.push(BatchValues::Named(converted));
-                        } else {
-                            let values = bind_names
-                                .iter()
-                                .map(|name| {
-                                    converted.get(name).cloned().ok_or_else(|| {
-                                        StatementError::new_err(format!(
-                                            "A value is required for bind parameter '{name}'"
-                                        ))
+        let (batch, named_values, positional_values) = (|| {
+            let mut batch = None;
+            let mut named_values = None;
+            let mut positional_values = None;
+            if let Ok(mapping) = parameters.cast::<PyDict>() {
+                named_values = Some(convert_named_values(
+                    mapping,
+                    Some((&bind_names, &bind_types)),
+                )?);
+            } else if let Ok(list) = parameters.cast::<PyList>() {
+                if list.is_empty() && text_mode {
+                    named_values = Some(std::collections::HashMap::new());
+                } else if !list.is_empty()
+                    && (list.get_item(0)?.is_instance_of::<PyDict>()
+                        || list.get_item(0)?.is_instance_of::<PyList>()
+                        || list.get_item(0)?.is_instance_of::<PyTuple>())
+                {
+                    let mut rows = Vec::with_capacity(list.len());
+                    for row in list.iter() {
+                        if let Ok(mapping) = row.cast::<PyDict>() {
+                            let converted =
+                                convert_named_values(mapping, Some((&bind_names, &bind_types)))?;
+                            if bind_names.is_empty() {
+                                rows.push(BatchValues::Named(converted));
+                            } else {
+                                let values = bind_names
+                                    .iter()
+                                    .map(|name| {
+                                        converted.get(name).cloned().ok_or_else(|| {
+                                            StatementError::new_err(format!(
+                                                "A value is required for bind parameter '{name}'"
+                                            ))
+                                        })
                                     })
+                                    .collect::<PyResult<Vec<_>>>()?;
+                                rows.push(BatchValues::Positional(values));
+                            }
+                        } else {
+                            let values = row
+                                .extract::<Vec<Py<PyAny>>>()?
+                                .iter()
+                                .enumerate()
+                                .map(|(index, value)| {
+                                    python_to_sqlite_typed(
+                                        value.bind(py),
+                                        bind_types.get(index).and_then(Option::as_deref),
+                                    )
                                 })
                                 .collect::<PyResult<Vec<_>>>()?;
                             rows.push(BatchValues::Positional(values));
                         }
-                    } else {
-                        let values = row
-                            .extract::<Vec<Py<PyAny>>>()?
-                            .iter()
-                            .enumerate()
-                            .map(|(index, value)| {
-                                python_to_sqlite_typed(
-                                    value.bind(py),
-                                    bind_types.get(index).and_then(Option::as_deref),
-                                )
-                            })
-                            .collect::<PyResult<Vec<_>>>()?;
-                        rows.push(BatchValues::Positional(values));
                     }
+                    batch = Some(rows);
+                } else {
+                    positional_values = Some(convert_positional_values(list, &bind_types, py)?);
                 }
-                batch = Some(rows);
+            } else if let Ok(tuple) = parameters.cast::<PyTuple>() {
+                positional_values = Some(convert_positional_values(tuple, &bind_types, py)?);
             } else {
-                positional_values = Some(convert_positional_values(list, &bind_types, py)?);
+                return Err(PyTypeError::new_err(
+                    "parameters must be a mapping or sequence",
+                ));
             }
-        } else if let Ok(tuple) = parameters.cast::<PyTuple>() {
-            positional_values = Some(convert_positional_values(tuple, &bind_types, py)?);
-        } else {
-            return Err(PyTypeError::new_err(
-                "parameters must be a mapping or sequence",
-            ));
-        }
+            Ok((batch, named_values, positional_values))
+        })()
+        // SQLAlchemy wraps parameter-processing failures in StatementError;
+        // result decoding errors propagate untouched after this point.
+        .map_err(|error: PyErr| wrap_statement_error(py, error, sql, parameters))?;
         // SQLAlchemy scopes the `\:` literal-colon escape to text() execution;
         // raw-string positional SQL must not be rewritten.
         let sql = if text_mode {
@@ -1170,6 +1177,54 @@ fn format_datetime(value: &Bound<'_, PyAny>) -> PyResult<String> {
     ))
 }
 
+/// Rebuild a bind-processing `TypeError`/`ValueError` as a `StatementError`,
+/// attaching SQLAlchemy's `orig`, `statement`, and `params` attributes and
+/// matching its `(<module>.<Class>) <cause>\n[SQL: ...]` message shape.
+/// `StatementError` subclasses (already wrapped, missing-bind errors, driver
+/// errors) and unrelated errors pass through unchanged.
+pub(crate) fn wrap_statement_error(
+    py: Python<'_>,
+    err: PyErr,
+    sql: &str,
+    parameters: &Bound<'_, PyAny>,
+) -> PyErr {
+    let bind_failure = {
+        let value = err.value(py);
+        !value
+            .is_instance(&StatementError::type_object(py))
+            .unwrap_or(false)
+            && (value.is_instance_of::<PyTypeError>() || value.is_instance_of::<PyValueError>())
+    };
+    if !bind_failure {
+        return err;
+    }
+    let value = err.value(py);
+    let origin = value.get_type();
+    let module = origin
+        .module()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "builtins".to_owned());
+    let qualname = origin
+        .qualname()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "Error".to_owned());
+    let detail = value.str().map(|text| text.to_string()).unwrap_or_default();
+    let mut message = format!("({module}.{qualname}) {detail}\n[SQL: {sql}]");
+    if parameters.is_truthy().unwrap_or(false) {
+        let rendered = parameters
+            .repr()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        message.push_str(&format!("\n[parameters: {rendered}]"));
+    }
+    let wrapped = StatementError::new_err(message);
+    let instance = wrapped.value(py);
+    let _ = instance.setattr("orig", value);
+    let _ = instance.setattr("statement", sql);
+    let _ = instance.setattr("params", parameters);
+    wrapped
+}
+
 fn convert_positional_values(
     values: &Bound<'_, PyAny>,
     types: &[Option<String>],
@@ -1390,9 +1445,16 @@ fn python_to_sqlite(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     } else if value.is_instance_of::<PyInt>() {
         Ok(Value::Integer(value.extract::<i64>()?))
     } else {
-        Err(PyErr::new::<PyTypeError, _>(
-            "SQLite parameters must be None, bool, int, float, str, or bytes",
-        ))
+        // SQLAlchemy's sqlite driver reports unsupported bind types as a
+        // ProgrammingError, not a TypeError.
+        let name = value
+            .get_type()
+            .qualname()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        Err(ProgrammingError::new_err(format!(
+            "Error binding parameter: type '{name}' is not supported"
+        )))
     }
 }
 

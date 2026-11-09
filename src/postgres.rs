@@ -255,14 +255,16 @@ impl NativePgConnection {
     ) -> PyResult<Bound<'py, PyAny>> {
         let _ = statement_kind;
         let (bind_types, _bind_names, _result_types) = type_metadata.unwrap_or_default();
-        let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode)?;
+        let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode)
+            .map_err(|error| crate::wrap_statement_error(py, error, &sql, parameters.bind(py)))?;
         let values = values
             .into_iter()
             .enumerate()
             .map(|(index, value)| {
                 coerce_pg_value(value, bind_types.get(index).and_then(|tag| tag.as_deref()))
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .collect::<PyResult<Vec<_>>>()
+            .map_err(|error| crate::wrap_statement_error(py, error, &sql, parameters.bind(py)))?;
         let (client, active) = {
             let borrowed = slf.borrow(py);
             let client = borrowed
@@ -667,9 +669,14 @@ fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
     } else if value.is_instance_of::<PyDate>() {
         Ok(PgValue::Date(value.extract()?))
     } else {
-        Err(PyTypeError::new_err(
-            "Unsupported PostgreSQL bind value type",
-        ))
+        let name = value
+            .get_type()
+            .qualname()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        Err(ProgrammingError::new_err(format!(
+            "Error binding parameter: type '{name}' is not supported"
+        )))
     }
 }
 

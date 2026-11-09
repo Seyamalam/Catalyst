@@ -1,10 +1,22 @@
-use pyo3::exceptions::PyTypeError;
+use pyo3::PyTypeInfo;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use rusqlite::types::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::{ArgumentError, OperationalError, python_to_sqlite};
+
+thread_local! {
+    /// Literal bind conversions that failed while deserializing a statement.
+    /// SQLAlchemy defers bind processing failures to statement execution, so
+    /// the first failure is kept here and the literal degrades to a NULL
+    /// placeholder: compilation still produces the exact SQL and bind shape
+    /// that execution (and `StatementError.statement`) needs. Each compile
+    /// runs on its own compiler thread, so the accumulator is thread-local.
+    static BIND_ERRORS: RefCell<Vec<PyErr>> = const { RefCell::new(Vec::new()) };
+}
 
 type CompiledExpression = (
     String,
@@ -14,6 +26,7 @@ type CompiledExpression = (
     Vec<Option<String>>,
     Vec<String>,
     Vec<Option<String>>,
+    Option<Py<PyAny>>,
 );
 type CompiledStatement = (
     String,
@@ -1454,8 +1467,28 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
                 Ok(Expr::Boolean(literal.extract()?))
             } else {
                 let converted = match type_tag.as_deref() {
-                    Some(tag) => crate::python_to_sqlite_typed(&literal, Some(tag))?,
-                    None => python_to_sqlite(&literal)?,
+                    Some(tag) => crate::python_to_sqlite_typed(&literal, Some(tag)),
+                    None => python_to_sqlite(&literal),
+                };
+                let converted = match converted {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        let py = literal.py();
+                        let exception = error.value(py);
+                        let bind_failure = exception.is_instance_of::<PyTypeError>()
+                            || exception.is_instance_of::<PyValueError>()
+                            || exception
+                                .is_instance(&crate::ProgrammingError::type_object(py))
+                                .unwrap_or(false);
+                        if bind_failure {
+                            // Defer the failure to execution like SQLAlchemy;
+                            // the NULL placeholder preserves the bind shape.
+                            BIND_ERRORS.with(|errors| errors.borrow_mut().push(error));
+                            Value::Null
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 };
                 Ok(Expr::Literal(converted, string_at(value, 2)?, type_tag))
             }
@@ -1765,21 +1798,29 @@ pub(crate) fn compile_expression(
     // stack is exhausted. Parse and render on a dedicated thread whose stack
     // is sized well beyond the guard's worst case.
     let owned = value.clone().unbind();
-    let (sql, values, kind, result_types) = py.detach(move || -> PyResult<CompiledStatement> {
-        // The GIL is released by detach, so the worker can re-attach for
-        // the Python-side parse and render outside it.
-        std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || -> PyResult<CompiledStatement> {
-                let statement = Python::attach(|py| parse_statement(owned.bind(py), dialect))?;
-                Ok(Compiler::new(dialect).statement(&statement))
-            })
-            .map_err(|error| {
-                OperationalError::new_err(format!("Expression compiler thread failed: {error}"))
-            })?
-            .join()
-            .map_err(|_| OperationalError::new_err("Expression compiler thread panicked"))?
-    })?;
+    let ((sql, values, kind, result_types), mut bind_errors) =
+        py.detach(move || -> PyResult<(CompiledStatement, Vec<PyErr>)> {
+            // The GIL is released by detach, so the worker can re-attach for
+            // the Python-side parse and render outside it.
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || -> PyResult<(CompiledStatement, Vec<PyErr>)> {
+                    let statement = Python::attach(|py| parse_statement(owned.bind(py), dialect))?;
+                    let compiled = Compiler::new(dialect).statement(&statement);
+                    let errors =
+                        BIND_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()));
+                    Ok((compiled, errors))
+                })
+                .map_err(|error| {
+                    OperationalError::new_err(format!("Expression compiler thread failed: {error}"))
+                })?
+                .join()
+                .map_err(|_| OperationalError::new_err("Expression compiler thread panicked"))?
+        })?;
+    let bind_error = bind_errors
+        .drain(..)
+        .next()
+        .map(|error| error.into_value(py).into_any());
     let params = PyDict::new(py);
     let mut ordered = Vec::with_capacity(values.len());
     let mut bind_types = Vec::with_capacity(values.len());
@@ -1805,6 +1846,7 @@ pub(crate) fn compile_expression(
         bind_types,
         bind_names,
         result_types,
+        bind_error,
     ))
 }
 

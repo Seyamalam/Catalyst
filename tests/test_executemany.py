@@ -271,7 +271,13 @@ def test_select_executemany_matches_sqlalchemy_programming_error() -> None:
             with pytest.raises(SAProgrammingError) as sa_error:
                 sa_connection.execute(sa_text("SELECT :value"), [{"value": 1}, {"value": 2}])
             assert type(catalyst_error.value).__name__ == type(sa_error.value).__name__
-            assert str(catalyst_error.value) == "executemany() can only execute DML statements."
+            catalyst_err = catalyst_error.value
+            # SQLAlchemy wraps the driver error with orig/statement/params.
+            assert "executemany() can only execute DML statements." in str(catalyst_err)
+            assert "[SQL:" in str(catalyst_err)
+            assert type(catalyst_err.orig).__name__ == "ProgrammingError"
+            assert catalyst_err.statement == "SELECT :value"
+            assert catalyst_err.params == [{"value": 1}, {"value": 2}]
     finally:
         catalyst.dispose()
         sqlalchemy.dispose()
