@@ -35,6 +35,8 @@ dev = [
     "mkdocs-mermaid2-plugin>=1.2",
     "sqlalchemy[asyncio]>=2.0",
     "psycopg[binary]>=3.2",
+    "asyncmy>=0.2.10",
+    "aiosqlite>=0.20",
 ]
 
 [tool.maturin]

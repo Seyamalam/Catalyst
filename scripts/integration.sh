@@ -25,4 +25,5 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 2
 fi
 export CATALYST_POSTGRES_URL="${CATALYST_POSTGRES_URL:-postgresql://catalyst:catalyst@127.0.0.1:5432/catalyst?sslmode=disable}"
+export CATALYST_MYSQL_URL="${CATALYST_MYSQL_URL:-mysql://catalyst:catalyst@127.0.0.1:3306/catalyst?sslmode=disable}"
 PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m pytest -m integration tests/ -q
