@@ -2,6 +2,7 @@
 
 mod expr;
 mod pool;
+mod postgres;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -112,11 +113,11 @@ struct NativeConnection {
 
 /// A buffered result set hydrated from one native query execution.
 #[pyclass(module = "catalyst._catalyst")]
-struct NativeResult {
-    columns: Vec<String>,
-    rows: Vec<Vec<Py<PyAny>>>,
-    next_row: usize,
-    rowcount: i64,
+pub(crate) struct NativeResult {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Py<PyAny>>>,
+    pub(crate) next_row: usize,
+    pub(crate) rowcount: i64,
 }
 
 enum BatchValues {
@@ -1183,6 +1184,8 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
+    module.add_class::<postgres::NativePgEngine>()?;
+    module.add_class::<postgres::NativePgConnection>()?;
     module.add_class::<NativeResult>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
     module.add_function(wrap_pyfunction!(expr::compile_expression, module)?)?;
@@ -1206,6 +1209,8 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "NativeEngine",
             "NativeConnection",
             "NativeResult",
+            "NativePgEngine",
+            "NativePgConnection",
         ],
     )?;
     Ok(())

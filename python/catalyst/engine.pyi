@@ -5,7 +5,7 @@ from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any, final
 
-from ._catalyst import NativeConnection, NativeResult
+from ._catalyst import NativeConnection, NativePgConnection, NativeResult
 from .expression import Compiled, Delete, Insert, Select, Update
 
 @final
@@ -65,7 +65,13 @@ class SavepointTransaction:
 
 @final
 class AsyncConnection:
-    def __init__(self, native: NativeConnection, *, echo: bool = False) -> None: ...
+    def __init__(
+        self,
+        native: NativeConnection | NativePgConnection,
+        *,
+        echo: bool = False,
+        postgres: bool = False,
+    ) -> None: ...
     async def begin(self) -> None: ...
     async def execute(
         self,
@@ -97,6 +103,7 @@ class AsyncEngine:
         pool_timeout: float = 30.0,
         timeout: float = 5.0,
         echo: bool = False,
+        postgres: bool = False,
     ) -> None: ...
     def connect(self) -> _AsyncConnectContext: ...
     async def connect_async(self) -> AsyncConnection: ...

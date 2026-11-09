@@ -18,6 +18,8 @@ from ._catalyst import (
     InvalidRequestError,
     NativeConnection,
     NativeEngine,
+    NativePgConnection,
+    NativePgEngine,
     NativeResult,
     StatementError,
 )
@@ -365,12 +367,19 @@ class SavepointTransaction:
 
 
 class AsyncConnection:
-    """A logical async connection using Tokio for native SQLite work."""
+    """A logical async connection using Tokio for native database work."""
 
-    def __init__(self, native: NativeConnection, *, echo: bool = False) -> None:
+    def __init__(
+        self,
+        native: NativeConnection | NativePgConnection,
+        *,
+        echo: bool = False,
+        postgres: bool = False,
+    ) -> None:
         self._native = native
         self._closed = False
         self._echo = echo
+        self._postgres = postgres
 
     async def execute(
         self,
@@ -379,6 +388,14 @@ class AsyncConnection:
     ) -> CursorResult:
         if self._closed:
             raise RuntimeError("Connection is closed")
+        if self._postgres and not isinstance(statement, (str, TextClause)):
+            raise ArgumentError("The initial PostgreSQL driver supports text SQL only")
+        if (
+            self._postgres
+            and isinstance(parameters, Mapping)
+            and not isinstance(statement, TextClause)
+        ):
+            raise ArgumentError("PostgreSQL named parameters require text() statements")
         if (
             isinstance(statement, TextClause)
             and parameters is not None
@@ -496,6 +513,8 @@ class AsyncConnection:
         """Return whether a table exists, checking main and temp schemas."""
         if self._closed:
             raise RuntimeError("Connection is closed")
+        if isinstance(self._native, NativePgConnection):
+            raise ArgumentError("has_table() is not supported by the initial PostgreSQL driver")
         return bool(await self._native.async_has_table(name))
 
     async def rollback(self) -> None:
@@ -505,7 +524,10 @@ class AsyncConnection:
 
     async def close(self) -> None:
         if not self._closed:
-            await self._native.async_transaction("close")
+            if isinstance(self._native, NativePgConnection):
+                await self._native.async_close()
+            else:
+                await self._native.async_transaction("close")
             self._closed = True
 
     async def __aenter__(self) -> AsyncConnection:
@@ -537,7 +559,7 @@ class _AsyncConnectContext:
 
 
 class AsyncEngine:
-    """Async SQLite engine with synchronous driver work isolated on Tokio."""
+    """Async engine using Tokio-native PostgreSQL or buffered SQLite."""
 
     def __init__(
         self,
@@ -548,9 +570,15 @@ class AsyncEngine:
         pool_timeout: float = 30.0,
         timeout: float = 5.0,
         echo: bool = False,
+        postgres: bool = False,
     ) -> None:
-        self._native = NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
+        self._native: NativeEngine | NativePgEngine = (
+            NativePgEngine(str(database))
+            if postgres
+            else NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
+        )
         self._echo = echo
+        self._postgres = postgres
         self._disposed = False
 
     def connect(self) -> _AsyncConnectContext:
@@ -560,7 +588,9 @@ class AsyncEngine:
     async def connect_async(self) -> AsyncConnection:
         if self._disposed:
             raise RuntimeError("Engine is disposed")
-        return AsyncConnection(await self._native.async_connect(), echo=self._echo)
+        return AsyncConnection(
+            await self._native.async_connect(), echo=self._echo, postgres=self._postgres
+        )
 
     @asynccontextmanager
     async def begin(self) -> AsyncGenerator[AsyncConnection, None]:
@@ -698,7 +728,22 @@ def create_engine(url: str | Path, **options: Any) -> Engine:
 
 
 def create_async_engine(url: str | Path, **options: Any) -> AsyncEngine:
-    """Create an asynchronous SQLite engine backed by Tokio and buffered results."""
+    """Create an async SQLite or initial PostgreSQL text-execution engine."""
+    value = str(url)
+    if _is_postgres_url(value):
+        merged = dict(options)
+        if not merged.pop("future", True):
+            raise ArgumentError(
+                "The 'future' parameter passed to create_async_engine() may only be set to True."
+            )
+        echo = _asbool(merged.pop("echo", False))
+        if merged:
+            names = ", ".join(repr(item) for item in sorted(merged))
+            raise TypeError(f"Invalid argument(s) {names} sent to create_async_engine()")
+        normalized = re.sub(
+            r"^postgres(?:ql)?\+[^:]+://", "postgresql://", value, flags=re.IGNORECASE
+        )
+        return AsyncEngine(normalized, echo=echo, postgres=True)
     database, config = _parse_engine_options(url, options, "create_async_engine")
     return AsyncEngine(database, **config)
 
@@ -781,6 +826,10 @@ _DIALECTS: dict[str, Callable[[], Callable[..., Engine]]] = {
 
 
 _DEFAULT_DRIVERS = {"postgresql": "psycopg", "mysql": "MySQLdb", "oracle": "oracledb"}
+
+
+def _is_postgres_url(value: str) -> bool:
+    return re.match(r"^(?:postgres|postgresql)(?:\+[^:]+)?://", value, re.IGNORECASE) is not None
 
 
 def _parse_database_url(value: str) -> tuple[str, dict[str, str]]:

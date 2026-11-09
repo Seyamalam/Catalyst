@@ -21,6 +21,8 @@ __all__ = [
     "NativeEngine",
     "NativeConnection",
     "NativeResult",
+    "NativePgEngine",
+    "NativePgConnection",
 ]
 
 class SQLAlchemyError(Exception):
@@ -91,6 +93,27 @@ class NativeConnection:
     def async_has_table(self, name: str) -> Awaitable[bool]: ...
     def is_active(self) -> bool: ...
     def close(self) -> None: ...
+
+@final
+class NativePgEngine:
+    """Native async PostgreSQL engine."""
+    def __new__(cls, url: str) -> NativePgEngine: ...
+    def async_connect(self) -> Awaitable[NativePgConnection]: ...
+    def async_close(self) -> Awaitable[None]: ...
+
+@final
+class NativePgConnection:
+    """Native asynchronous PostgreSQL connection."""
+    def async_execute(
+        self,
+        sql: str,
+        parameters: list[object] | dict[str, object],
+        text_mode: bool,
+        statement_kind: str | None = ...,
+        type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
+    ) -> Awaitable[NativeResult]: ...
+    def async_transaction(self, operation: str) -> Awaitable[None]: ...
+    def async_close(self) -> Awaitable[None]: ...
 
 @final
 class NativeResult:

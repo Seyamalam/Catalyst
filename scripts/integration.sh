@@ -24,4 +24,5 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "Project virtualenv missing at .venv; create it first." >&2
   exit 2
 fi
-PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m pytest -m integration tests/test_integration_infra.py -q
+export CATALYST_POSTGRES_URL="${CATALYST_POSTGRES_URL:-postgresql://catalyst:catalyst@127.0.0.1:5432/catalyst?sslmode=disable}"
+PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m pytest -m integration tests/ -q
