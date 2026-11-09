@@ -16,18 +16,30 @@ use crate::{IntegrityError, NativeResult, OperationalError, ProgrammingError, St
 
 type PgTypeMetadata = (Vec<Option<String>>, Vec<String>, Vec<Option<String>>);
 
-/// Native Tokio PostgreSQL engine. The first driver slice deliberately has no pool.
-#[pyclass(module = "catalyst._catalyst")]
-pub(crate) struct NativePgEngine {
+/// QueuePool-style shared state for a PostgreSQL engine: a bounded slot
+/// semaphore, an idle-client stack, and a closed flag set on dispose.
+struct PgPoolInner {
     url: String,
-    closed: bool,
+    idle: Mutex<Vec<Arc<Client>>>,
+    capacity: Arc<tokio::sync::Semaphore>,
+    checkout_timeout: std::time::Duration,
+    pool_size: usize,
+    max_overflow: i64,
+    closed: AtomicBool,
 }
 
-/// One async PostgreSQL client connection.
+/// Native Tokio PostgreSQL engine with a bounded async connection pool.
+#[pyclass(module = "catalyst._catalyst")]
+pub(crate) struct NativePgEngine {
+    inner: Arc<PgPoolInner>,
+}
+
+/// One async PostgreSQL client connection checked out from the pool.
 #[pyclass(module = "catalyst._catalyst")]
 pub(crate) struct NativePgConnection {
     client: Mutex<Option<Arc<Client>>>,
     active: AtomicBool,
+    pool: Mutex<Option<(Arc<PgPoolInner>, tokio::sync::OwnedSemaphorePermit)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,49 +123,77 @@ impl PgValue {
 #[pymethods]
 impl NativePgEngine {
     #[new]
-    fn new(url: &str) -> Self {
+    #[pyo3(signature = (url, pool_size=5, max_overflow=10, pool_timeout=30.0))]
+    fn new(url: &str, pool_size: usize, max_overflow: i64, pool_timeout: f64) -> Self {
+        // `max_overflow` of -1 means unlimited, matching SQLAlchemy QueuePool.
+        let permits = if max_overflow < 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            pool_size.saturating_add(max_overflow as usize)
+        };
         Self {
-            url: url.to_owned(),
-            closed: false,
+            inner: Arc::new(PgPoolInner {
+                url: url.to_owned(),
+                idle: Mutex::new(Vec::new()),
+                capacity: Arc::new(tokio::sync::Semaphore::new(permits)),
+                checkout_timeout: std::time::Duration::from_secs_f64(pool_timeout.max(0.0)),
+                pool_size,
+                max_overflow,
+                closed: AtomicBool::new(false),
+            }),
         }
     }
 
     fn async_connect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        if self.closed {
+        if self.inner.closed.load(Ordering::Acquire) {
             return Err(OperationalError::new_err("Engine is disposed"));
         }
-        let url = self.url.clone();
+        let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut config = Config::from_str(&url)
-                .map_err(|_| crate::ArgumentError::new_err("Invalid PostgreSQL connection URL"))?;
-            let disable_tls = config.get_ssl_mode() == SslMode::Disable;
-            // PostgreSQL's client default is `prefer`; Catalyst intentionally upgrades
-            // every other setting to mandatory TLS with certificate/hostname checks.
-            config.ssl_mode(if disable_tls {
-                SslMode::Disable
-            } else {
-                SslMode::Require
-            });
-            let tls = verified_tls_connector()?;
-            let (client, connection) = config.connect(tls).await.map_err(|_| {
-                if disable_tls {
-                    OperationalError::new_err("Could not connect to PostgreSQL")
-                } else {
-                    OperationalError::new_err(
-                        "Could not establish a verified PostgreSQL TLS connection",
-                    )
+            let permit = match tokio::time::timeout(
+                inner.checkout_timeout,
+                inner.capacity.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(OperationalError::new_err(
+                        "PostgreSQL connection pool is closed",
+                    ));
                 }
-            })?;
-            tokio::spawn(async move {
-                // The task owns protocol I/O. Driver details are intentionally not logged.
-                let _ = connection.await;
-            });
+                Err(_) => {
+                    return Err(crate::TimeoutError::new_err(format!(
+                        "QueuePool limit of size {} overflow {} reached, connection timed \
+                         out, timeout {:.2}",
+                        inner.pool_size,
+                        inner.max_overflow,
+                        inner.checkout_timeout.as_secs_f64(),
+                    )));
+                }
+            };
+            let client = loop {
+                let candidate = inner
+                    .idle
+                    .lock()
+                    .map_err(|_| OperationalError::new_err("PostgreSQL pool lock was poisoned"))?
+                    .pop();
+                match candidate {
+                    Some(client) if client.is_closed() => continue,
+                    other => break other,
+                }
+            };
+            let client = match client {
+                Some(client) => client,
+                None => connect_client(&inner.url).await?,
+            };
             Python::attach(|py| {
                 Py::new(
                     py,
                     NativePgConnection {
-                        client: Mutex::new(Some(Arc::new(client))),
+                        client: Mutex::new(Some(client)),
                         active: AtomicBool::new(false),
+                        pool: Mutex::new(Some((inner, permit))),
                     },
                 )
             })
@@ -161,9 +201,41 @@ impl NativePgEngine {
     }
 
     fn async_close<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        self.closed = true;
-        pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(()) })
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.closed.store(true, Ordering::Release);
+            if let Ok(mut idle) = inner.idle.lock() {
+                idle.clear();
+            }
+            Ok(())
+        })
     }
+}
+
+async fn connect_client(url: &str) -> PyResult<Arc<Client>> {
+    let mut config = Config::from_str(url)
+        .map_err(|_| crate::ArgumentError::new_err("Invalid PostgreSQL connection URL"))?;
+    let disable_tls = config.get_ssl_mode() == SslMode::Disable;
+    // PostgreSQL's client default is `prefer`; Catalyst intentionally upgrades
+    // every other setting to mandatory TLS with certificate/hostname checks.
+    config.ssl_mode(if disable_tls {
+        SslMode::Disable
+    } else {
+        SslMode::Require
+    });
+    let tls = verified_tls_connector()?;
+    let (client, connection) = config.connect(tls).await.map_err(|_| {
+        if disable_tls {
+            OperationalError::new_err("Could not connect to PostgreSQL")
+        } else {
+            OperationalError::new_err("Could not establish a verified PostgreSQL TLS connection")
+        }
+    })?;
+    tokio::spawn(async move {
+        // The task owns protocol I/O. Driver details are intentionally not logged.
+        let _ = connection.await;
+    });
+    Ok(Arc::new(client))
 }
 
 #[pymethods]
@@ -341,6 +413,9 @@ impl NativePgConnection {
         })
     }
 
+    /// Return the client to the pool: roll back an open transaction first
+    /// (reset-on-return), then release the slot permit. Dead clients and
+    /// returns after engine dispose are dropped instead of idled.
     fn async_close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let borrowed = slf.borrow(py);
         let client = borrowed
@@ -348,8 +423,34 @@ impl NativePgConnection {
             .lock()
             .map_err(|_| OperationalError::new_err("PostgreSQL connection lock was poisoned"))?
             .take();
-        drop(client);
-        pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(()) })
+        let pool_entry = borrowed
+            .pool
+            .lock()
+            .map_err(|_| OperationalError::new_err("PostgreSQL pool lock was poisoned"))?
+            .take();
+        let active = borrowed.active.load(Ordering::Acquire);
+        drop(borrowed);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let Some(client) = client else {
+                return Ok(());
+            };
+            let Some((inner, permit)) = pool_entry else {
+                drop(client);
+                return Ok(());
+            };
+            let mut healthy = !client.is_closed();
+            if healthy && active {
+                healthy = client.batch_execute("ROLLBACK").await.is_ok();
+            }
+            if healthy
+                && !inner.closed.load(Ordering::Acquire)
+                && let Ok(mut idle) = inner.idle.lock()
+            {
+                idle.push(client);
+            }
+            drop(permit);
+            Ok(())
+        })
     }
 }
 

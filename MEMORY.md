@@ -15,13 +15,15 @@
 - PostgreSQL async text driver slice landed at `12ce351` (pushed): tokio-postgres + rustls, single connection, named binds, buffered results, basic transactions, redacted errors.
 - PostgreSQL compiled-statement execution slice (in review on `feat/pg-compiled-execution`): `AsyncConnection.execute` runs compiled Core DML/SELECT and `Compiled` statements; typed `bind_types` metadata coerces compile-processed values (datetime/date strings → TIMESTAMP/DATE, boolean ints, binary), mapping overrides order by bind name, `has_table` uses the `pg_catalog` search-path probe, and DDL helpers pick the dialect from the bind. Live-verified vs SQLAlchemy+psycopg (`psycopg[binary]` added to dev extras; SA+psycopg reports `-1` INSERT rowcounts, Catalyst reports the true count). `aiosqlite` also installed in `.venv`, which un-skipped `test_async_executemany_merges_statement_values` (fixed to use `run_sync`).
 
+- PostgreSQL connection pool (in review on `feat/pg-pool`): semaphore-bounded async pool with `pool_size`/`max_overflow`/`pool_timeout`, idle reuse, `TimeoutError` checkout exhaustion in SQLAlchemy's QueuePool message shape, rollback reset-on-return, dead-client skipping, dispose draining. Live-verified in `tests/test_postgres_pool.py` including reuse via `pg_backend_pid()`. Queue item 1 is now fully implemented.
+
 ## In progress
 
-- PostgreSQL connection pool (last piece of queue item 1): multi-slot async pool for `NativePgEngine` with checkout/timeout semantics matching the SQLite pool where applicable.
+- Nothing in flight; next is queue item 2 (MySQL driver slice).
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 
-1. PostgreSQL connection pool with SQLAlchemy parity tests against real Postgres (compiled execution done this slice).
+1. ~~PostgreSQL pool + compiled-statement execution~~ (done: compiled execution merged at `8b1f815`, pool on `feat/pg-pool`).
 2. MySQL first driver slice per ADR 0004 (`mysql_async`), same pattern as the PG slice.
 3. Async savepoints; `aiosqlite` now installed — extend async parity comparisons to the real async SQLAlchemy driver.
 4. Milestone 3: declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration).
