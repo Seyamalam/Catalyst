@@ -781,6 +781,31 @@ impl NativeResult {
         self.next_row += 1;
         Ok(Some(row_to_python_tuple(row)?))
     }
+
+    /// Hydrate all remaining buffered rows into instances of `cls` in one call.
+    ///
+    /// Each instance is allocated through `cls.__new__` (bypassing `__init__`,
+    /// matching SQLAlchemy's instrumentation) and every attribute in `attrs`
+    /// receives the row value at the same column position. Consumes the
+    /// remaining rows like `fetchall`.
+    fn hydrate(
+        &mut self,
+        py: Python<'_>,
+        cls: &Bound<'_, PyAny>,
+        attrs: Vec<String>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let allocator = cls.getattr("__new__")?;
+        let mut instances = Vec::with_capacity(self.rows.len().saturating_sub(self.next_row));
+        for row in &self.rows[self.next_row..] {
+            let instance = allocator.call1((cls,))?;
+            for (attr, value) in attrs.iter().zip(row.iter()) {
+                instance.setattr(attr.as_str(), value.clone_ref(py))?;
+            }
+            instances.push(instance.unbind());
+        }
+        self.next_row = self.rows.len();
+        Ok(instances)
+    }
 }
 
 fn row_to_python_tuple(row: Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
@@ -820,7 +845,7 @@ fn sqlite_to_python_typed(
     match type_tag {
         "integer" => Ok(builtins.getattr("int")?.call1((value,))?.unbind()),
         "boolean" => Ok(builtins.getattr("bool")?.call1((value,))?.unbind()),
-        "float" => Ok(builtins.getattr("float")?.call1((value,))?.unbind()),
+        "float" | "double" => Ok(builtins.getattr("float")?.call1((value,))?.unbind()),
         "string" | "text" => {
             let rendered = value.str()?;
             Ok(rendered
@@ -897,7 +922,7 @@ pub(crate) fn python_to_sqlite_typed(
             Ok(Value::Integer(integer))
         }
         "integer" => python_to_sqlite(value),
-        "float" => {
+        "float" | "double" => {
             let number = if value.is_instance_of::<PyInt>() || value.is_instance_of::<PyFloat>() {
                 value.extract::<f64>()?
             } else {

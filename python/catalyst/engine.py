@@ -83,14 +83,33 @@ class TextClause:
 
 
 class CursorResult:
-    """Buffered result returned by a connection execution."""
+    """Buffered result returned by a connection execution.
 
-    def __init__(self, native_result: NativeResult) -> None:
+    With ``entity``, the buffered rows hydrate into mapped class instances in
+    one batched Rust call and each result row is the one-tuple ``(entity,)``,
+    matching SQLAlchemy's ORM-level ``Session.execute(select(Entity))``.
+    """
+
+    def __init__(self, native_result: NativeResult, entity: type[object] | None = None) -> None:
         self._native_result = native_result
+        self._entity = entity
+        self._entity_rows: list[tuple[object, ...]] | None = None
+        self._entity_index = 0
+        if entity is not None:
+            mapper = cast(Any, entity).__mapper__
+            instances = native_result.hydrate(entity, list(mapper.attrs))
+            self._entity_rows = [(instance,) for instance in instances]
+
+    @property
+    def native_result(self) -> NativeResult:
+        """Return the buffered native result backing this cursor."""
+        return self._native_result
 
     @property
     def keys(self) -> tuple[str, ...]:
         """Return result column names in database order."""
+        if self._entity_rows is not None and self._entity is not None:
+            return (self._entity.__name__,)
         return tuple(self._native_result.keys)
 
     @property
@@ -100,20 +119,103 @@ class CursorResult:
 
     def fetchone(self) -> tuple[object, ...] | None:
         """Fetch the next row, or ``None`` when the result is exhausted."""
-        return self._native_result.fetchone()
+        if self._entity_rows is None:
+            return self._native_result.fetchone()
+        if self._entity_index >= len(self._entity_rows):
+            return None
+        row = self._entity_rows[self._entity_index]
+        self._entity_index += 1
+        return row
 
     def fetchall(self) -> list[tuple[object, ...]]:
         """Fetch all remaining rows."""
-        return self._native_result.fetchall()
+        if self._entity_rows is None:
+            return self._native_result.fetchall()
+        rows = self._entity_rows[self._entity_index :]
+        self._entity_index = len(self._entity_rows)
+        return rows
 
     def all(self) -> list[tuple[object, ...]]:
         """Fetch all remaining rows."""
         return self.fetchall()
 
+    def scalars(self) -> ScalarResult:
+        """Return a result view yielding the first column of each row."""
+        return ScalarResult(self)
+
     def __iter__(self) -> Iterator[tuple[object, ...]]:
         """Iterate over remaining rows."""
         while (row := self.fetchone()) is not None:
             yield row
+
+
+class NoResultFound(InvalidRequestError):
+    """Raised when a result expected exactly one row and found none."""
+
+
+class MultipleResultsFound(InvalidRequestError):
+    """Raised when a result expected at most one row and found several."""
+
+
+class ScalarResult:
+    """Buffered result view yielding the first column of each row."""
+
+    def __init__(self, result: CursorResult) -> None:
+        self._result = result
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """Return result column names in database order."""
+        return self._result.keys
+
+    @property
+    def rowcount(self) -> int:
+        """Return the number of rows changed by the statement."""
+        return self._result.rowcount
+
+    def fetchone(self) -> object | None:
+        """Fetch the next row's first column, or ``None`` when exhausted."""
+        row = self._result.fetchone()
+        return None if row is None else row[0]
+
+    def fetchall(self) -> list[object]:
+        """Fetch the first column of all remaining rows."""
+        return [row[0] for row in self._result.fetchall()]
+
+    def all(self) -> list[object]:
+        """Fetch the first column of all remaining rows."""
+        return self.fetchall()
+
+    def first(self) -> object | None:
+        """Fetch the first row's first column, or ``None``."""
+        return self.fetchone()
+
+    def one(self) -> object:
+        """Fetch exactly one row's first column, like ``ScalarResult.one``."""
+        items = self.fetchall()
+        if not items:
+            raise NoResultFound("No row was found when one was required")
+        if len(items) != 1:
+            raise MultipleResultsFound(
+                f"Multiple rows were found when exactly one was required ({len(items)})"
+            )
+        return items[0]
+
+    def one_or_none(self) -> object | None:
+        """Fetch one row's first column, ``None`` for zero rows, error for many."""
+        items = self.fetchall()
+        if not items:
+            return None
+        if len(items) != 1:
+            raise MultipleResultsFound(
+                f"Multiple rows were found when one or none was required ({len(items)})"
+            )
+        return items[0]
+
+    def __iter__(self) -> Iterator[object]:
+        """Iterate over remaining first-column values."""
+        while (item := self.fetchone()) is not None:
+            yield item
 
 
 class Connection:
