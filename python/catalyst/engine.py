@@ -583,7 +583,7 @@ class AsyncEngine:
         postgres: bool = False,
     ) -> None:
         self._native: NativeEngine | NativePgEngine = (
-            NativePgEngine(str(database))
+            NativePgEngine(str(database), pool_size, max_overflow, pool_timeout)
             if postgres
             else NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
         )
@@ -739,7 +739,7 @@ def create_engine(url: str | Path, **options: Any) -> Engine:
 
 
 def create_async_engine(url: str | Path, **options: Any) -> AsyncEngine:
-    """Create an async SQLite or initial PostgreSQL text-execution engine."""
+    """Create an async SQLite or PostgreSQL engine."""
     value = str(url)
     if _is_postgres_url(value):
         merged = dict(options)
@@ -748,13 +748,30 @@ def create_async_engine(url: str | Path, **options: Any) -> AsyncEngine:
                 "The 'future' parameter passed to create_async_engine() may only be set to True."
             )
         echo = _asbool(merged.pop("echo", False))
+        try:
+            pool_size = int(merged.pop("pool_size", 5))
+            max_overflow = int(merged.pop("max_overflow", 10))
+            pool_timeout = float(merged.pop("pool_timeout", 30.0))
+        except (TypeError, ValueError) as error:
+            raise ArgumentError("Invalid numeric value in engine options") from error
+        if pool_size < 0 or max_overflow < -1 or pool_timeout < 0:
+            raise ArgumentError("Engine pool sizes and timeouts must be non-negative")
+        if not math.isfinite(pool_timeout):
+            raise ArgumentError("Engine timeouts must be finite numbers")
         if merged:
             names = ", ".join(repr(item) for item in sorted(merged))
             raise TypeError(f"Invalid argument(s) {names} sent to create_async_engine()")
         normalized = re.sub(
             r"^postgres(?:ql)?\+[^:]+://", "postgresql://", value, flags=re.IGNORECASE
         )
-        return AsyncEngine(normalized, echo=echo, postgres=True)
+        return AsyncEngine(
+            normalized,
+            echo=echo,
+            postgres=True,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+        )
     database, config = _parse_engine_options(url, options, "create_async_engine")
     return AsyncEngine(database, **config)
 

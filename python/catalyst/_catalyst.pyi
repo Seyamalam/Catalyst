@@ -98,7 +98,13 @@ class NativeConnection:
 @final
 class NativePgEngine:
     """Native async PostgreSQL engine."""
-    def __new__(cls, url: str) -> NativePgEngine: ...
+    def __new__(
+        cls,
+        url: str,
+        pool_size: int = ...,
+        max_overflow: int = ...,
+        pool_timeout: float = ...,
+    ) -> NativePgEngine: ...
     def async_connect(self) -> Awaitable[NativePgConnection]: ...
     def async_close(self) -> Awaitable[None]: ...
 
