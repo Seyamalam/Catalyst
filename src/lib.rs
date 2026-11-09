@@ -1,6 +1,7 @@
 #![deny(clippy::all, unsafe_code)]
 
 mod expr;
+mod mysql;
 mod pool;
 mod postgres;
 
@@ -1186,6 +1187,8 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeConnection>()?;
     module.add_class::<postgres::NativePgEngine>()?;
     module.add_class::<postgres::NativePgConnection>()?;
+    module.add_class::<mysql::NativeMysqlEngine>()?;
+    module.add_class::<mysql::NativeMysqlConnection>()?;
     module.add_class::<NativeResult>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
     module.add_function(wrap_pyfunction!(expr::compile_expression, module)?)?;
@@ -1211,6 +1214,8 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "NativeResult",
             "NativePgEngine",
             "NativePgConnection",
+            "NativeMysqlEngine",
+            "NativeMysqlConnection",
         ],
     )?;
     Ok(())

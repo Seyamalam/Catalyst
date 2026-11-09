@@ -18,6 +18,8 @@ from ._catalyst import (
     InvalidRequestError,
     NativeConnection,
     NativeEngine,
+    NativeMysqlConnection,
+    NativeMysqlEngine,
     NativePgConnection,
     NativePgEngine,
     NativeResult,
@@ -371,15 +373,17 @@ class AsyncConnection:
 
     def __init__(
         self,
-        native: NativeConnection | NativePgConnection,
+        native: NativeConnection | NativePgConnection | NativeMysqlConnection,
         *,
         echo: bool = False,
         postgres: bool = False,
+        mysql: bool = False,
     ) -> None:
         self._native = native
         self._closed = False
         self._echo = echo
         self._postgres = postgres
+        self._mysql = mysql
 
     async def execute(
         self,
@@ -390,6 +394,8 @@ class AsyncConnection:
             raise RuntimeError("Connection is closed")
         if self._postgres and isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile("postgresql")
+        if self._mysql and isinstance(statement, (Select, Insert, Update, Delete, Compiled)):
+            raise ArgumentError("The initial MySQL driver supports text SQL only")
         if (
             self._postgres
             and isinstance(statement, Compiled)
@@ -398,8 +404,22 @@ class AsyncConnection:
             and parameters
         ):
             raise ArgumentError("PostgreSQL executemany is not supported yet")
-        if self._postgres and isinstance(parameters, Mapping) and isinstance(statement, str):
-            raise ArgumentError("PostgreSQL named parameters require text() statements")
+        if (
+            self._mysql
+            and isinstance(parameters, Sequence)
+            and not isinstance(parameters, (str, bytes))
+            and parameters
+            and isinstance(parameters[0], (Mapping, Sequence))
+            and not isinstance(parameters[0], (str, bytes))
+        ):
+            raise ArgumentError("MySQL executemany is not supported yet")
+        if (
+            (self._postgres or self._mysql)
+            and isinstance(parameters, Mapping)
+            and isinstance(statement, str)
+        ):
+            dialect = "PostgreSQL" if self._postgres else "MySQL"
+            raise ArgumentError(f"{dialect} named parameters require text() statements")
         if (
             isinstance(statement, TextClause)
             and parameters is not None
@@ -534,7 +554,7 @@ class AsyncConnection:
 
     async def close(self) -> None:
         if not self._closed:
-            if isinstance(self._native, NativePgConnection):
+            if isinstance(self._native, NativePgConnection | NativeMysqlConnection):
                 await self._native.async_close()
             else:
                 await self._native.async_transaction("close")
@@ -581,14 +601,21 @@ class AsyncEngine:
         timeout: float = 5.0,
         echo: bool = False,
         postgres: bool = False,
+        mysql: bool = False,
     ) -> None:
-        self._native: NativeEngine | NativePgEngine = (
-            NativePgEngine(str(database), pool_size, max_overflow, pool_timeout)
-            if postgres
-            else NativeEngine(str(database), pool_size, max_overflow, pool_timeout, timeout)
-        )
+        if postgres:
+            self._native: NativeEngine | NativePgEngine | NativeMysqlEngine = NativePgEngine(
+                str(database), pool_size, max_overflow, pool_timeout
+            )
+        elif mysql:
+            self._native = NativeMysqlEngine(str(database), pool_size, max_overflow, pool_timeout)
+        else:
+            self._native = NativeEngine(
+                str(database), pool_size, max_overflow, pool_timeout, timeout
+            )
         self._echo = echo
         self._postgres = postgres
+        self._mysql = mysql
         self._disposed = False
 
     def connect(self) -> _AsyncConnectContext:
@@ -599,7 +626,10 @@ class AsyncEngine:
         if self._disposed:
             raise RuntimeError("Engine is disposed")
         return AsyncConnection(
-            await self._native.async_connect(), echo=self._echo, postgres=self._postgres
+            await self._native.async_connect(),
+            echo=self._echo,
+            postgres=self._postgres,
+            mysql=self._mysql,
         )
 
     @asynccontextmanager
@@ -738,40 +768,48 @@ def create_engine(url: str | Path, **options: Any) -> Engine:
     return Engine(database, **config)
 
 
+def _native_driver_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Validate pool/future/echo options shared by the native async drivers."""
+    merged = dict(options)
+    if not merged.pop("future", True):
+        raise ArgumentError(
+            "The 'future' parameter passed to create_async_engine() may only be set to True."
+        )
+    echo = _asbool(merged.pop("echo", False))
+    try:
+        pool_size = int(merged.pop("pool_size", 5))
+        max_overflow = int(merged.pop("max_overflow", 10))
+        pool_timeout = float(merged.pop("pool_timeout", 30.0))
+    except (TypeError, ValueError) as error:
+        raise ArgumentError("Invalid numeric value in engine options") from error
+    if pool_size < 0 or max_overflow < -1 or pool_timeout < 0:
+        raise ArgumentError("Engine pool sizes and timeouts must be non-negative")
+    if not math.isfinite(pool_timeout):
+        raise ArgumentError("Engine timeouts must be finite numbers")
+    if merged:
+        names = ", ".join(repr(item) for item in sorted(merged))
+        raise TypeError(f"Invalid argument(s) {names} sent to create_async_engine()")
+    return {
+        "pool_size": pool_size,
+        "max_overflow": max_overflow,
+        "pool_timeout": pool_timeout,
+        "echo": echo,
+    }
+
+
 def create_async_engine(url: str | Path, **options: Any) -> AsyncEngine:
-    """Create an async SQLite or PostgreSQL engine."""
+    """Create an async SQLite, PostgreSQL, or initial MySQL engine."""
     value = str(url)
     if _is_postgres_url(value):
-        merged = dict(options)
-        if not merged.pop("future", True):
-            raise ArgumentError(
-                "The 'future' parameter passed to create_async_engine() may only be set to True."
-            )
-        echo = _asbool(merged.pop("echo", False))
-        try:
-            pool_size = int(merged.pop("pool_size", 5))
-            max_overflow = int(merged.pop("max_overflow", 10))
-            pool_timeout = float(merged.pop("pool_timeout", 30.0))
-        except (TypeError, ValueError) as error:
-            raise ArgumentError("Invalid numeric value in engine options") from error
-        if pool_size < 0 or max_overflow < -1 or pool_timeout < 0:
-            raise ArgumentError("Engine pool sizes and timeouts must be non-negative")
-        if not math.isfinite(pool_timeout):
-            raise ArgumentError("Engine timeouts must be finite numbers")
-        if merged:
-            names = ", ".join(repr(item) for item in sorted(merged))
-            raise TypeError(f"Invalid argument(s) {names} sent to create_async_engine()")
+        config = _native_driver_options(dict(options))
         normalized = re.sub(
             r"^postgres(?:ql)?\+[^:]+://", "postgresql://", value, flags=re.IGNORECASE
         )
-        return AsyncEngine(
-            normalized,
-            echo=echo,
-            postgres=True,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-        )
+        return AsyncEngine(normalized, postgres=True, **config)
+    if _is_mysql_url(value):
+        config = _native_driver_options(dict(options))
+        normalized = re.sub(r"^mysql\+[^:]+://", "mysql://", value, flags=re.IGNORECASE)
+        return AsyncEngine(normalized, mysql=True, **config)
     database, config = _parse_engine_options(url, options, "create_async_engine")
     return AsyncEngine(database, **config)
 
@@ -858,6 +896,10 @@ _DEFAULT_DRIVERS = {"postgresql": "psycopg", "mysql": "MySQLdb", "oracle": "orac
 
 def _is_postgres_url(value: str) -> bool:
     return re.match(r"^(?:postgres|postgresql)(?:\+[^:]+)?://", value, re.IGNORECASE) is not None
+
+
+def _is_mysql_url(value: str) -> bool:
+    return re.match(r"^mysql(?:\+[^:]+)?://", value, re.IGNORECASE) is not None
 
 
 def _parse_database_url(value: str) -> tuple[str, dict[str, str]]:

@@ -293,7 +293,13 @@ class _ColumnCollection:
 
 def _bind_dialect(bind: Engine | AsyncEngine) -> str | None:
     """Select the DDL compilation dialect from the bind's native driver."""
-    return "postgresql" if getattr(bind, "_postgres", False) else None
+    if getattr(bind, "_postgres", False):
+        return "postgresql"
+    if getattr(bind, "_mysql", False):
+        # MySQL DDL is not implemented yet; the compiler raises a clean
+        # ArgumentError for the unknown dialect rather than emitting SQLite SQL.
+        return "mysql"
+    return None
 
 
 class MetaData:

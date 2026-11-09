@@ -21,6 +21,8 @@ __all__ = [
     "NativeEngine",
     "NativeConnection",
     "NativeResult",
+    "NativeMysqlEngine",
+    "NativeMysqlConnection",
     "NativePgEngine",
     "NativePgConnection",
 ]
@@ -106,6 +108,34 @@ class NativePgEngine:
         pool_timeout: float = ...,
     ) -> NativePgEngine: ...
     def async_connect(self) -> Awaitable[NativePgConnection]: ...
+    def async_close(self) -> Awaitable[None]: ...
+
+@final
+class NativeMysqlEngine:
+    """Native async MySQL engine."""
+    def __new__(
+        cls,
+        url: str,
+        pool_size: int = ...,
+        max_overflow: int = ...,
+        pool_timeout: float = ...,
+    ) -> NativeMysqlEngine: ...
+    def async_connect(self) -> Awaitable[NativeMysqlConnection]: ...
+    def async_close(self) -> Awaitable[None]: ...
+
+@final
+class NativeMysqlConnection:
+    """Native asynchronous MySQL connection."""
+    def async_execute(
+        self,
+        sql: str,
+        parameters: list[object] | dict[str, object],
+        text_mode: bool,
+        statement_kind: str | None = ...,
+        type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
+    ) -> Awaitable[NativeResult]: ...
+    def async_has_table(self, name: str) -> Awaitable[bool]: ...
+    def async_transaction(self, operation: str) -> Awaitable[None]: ...
     def async_close(self) -> Awaitable[None]: ...
 
 @final
