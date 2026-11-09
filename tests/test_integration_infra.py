@@ -45,7 +45,7 @@ def _postgres_startup_packet() -> bytes:
 
 
 def test_postgres_plaintext_startup_response() -> None:
-    """Validate PostgreSQL plaintext startup framing, not driver behavior or parity.
+    """Validate PostgreSQL protocol framing, not driver behavior or parity.
 
     PostgreSQL does not send a greeting on connect: the client asks whether TLS is
     available with an SSLRequest, expects `N` from the TLS-disabled service, then

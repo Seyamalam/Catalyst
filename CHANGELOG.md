@@ -4,6 +4,7 @@ All notable changes to Catalyst are recorded here.
 
 ## Unreleased
 
+- Add an initial Tokio-native asynchronous PostgreSQL text driver: PostgreSQL URL routing in `create_async_engine`, safe named-bind scanning, buffered primitive SELECT results, DML rowcounts, basic transactions, redacted error mapping, and rustls certificate/hostname verification by default (explicit `sslmode=disable` only for local plaintext). No PostgreSQL pool, dialect compiler, ORM, savepoints, streaming, or broad SQLAlchemy parity is claimed.
 - Add SQLAlchemy-compatible SQLite Core type processing for declared Integer/String/Text/Boolean/Float/Date/DateTime and binary columns, including typed binds/results, formatted datetime storage, checked ISO result hydration, and result timezone offsets. SQLite timezone offsets are dropped on storage like SQLAlchemy; Numeric/Decimal remains unsupported.
 - Add one-crossing SQLite executemany for compiled Core DML and text/positional batches, with aggregate rowcount and SQLAlchemy-like transaction behavior on batch failure; SELECT executemany raises ProgrammingError. Empty parameter sequences on compiled statements execute once with compiled values, including `DEFAULT VALUES` inserts. Async execution uses the same native batch path.
 - Add a two-layer deterministic plan cache: Python-side LRU memoization of compiled Core statements keyed by the serialized statement, and Rust-side bounded per-connection prepared-statement caching (capacity 128) via rusqlite; measured ~4.5x faster repeated execution.
