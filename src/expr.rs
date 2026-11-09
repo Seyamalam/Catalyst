@@ -4,7 +4,7 @@ use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use rusqlite::types::Value;
 use std::collections::HashMap;
 
-use crate::{ArgumentError, python_to_sqlite};
+use crate::{ArgumentError, OperationalError, python_to_sqlite};
 
 type CompiledExpression = (
     String,
@@ -1393,9 +1393,26 @@ pub(crate) fn compile_expression(
     py: Python<'_>,
 ) -> PyResult<CompiledExpression> {
     let dialect = Dialect::parse(dialect)?;
-    let statement = parse_statement(value, dialect)?;
-    let (sql, values, kind, result_types) =
-        py.detach(move || Compiler::new(dialect).statement(&statement));
+    // Parsing recurses once per serialized node and each debug frame is
+    // large; on the default stack the depth guard cannot fire before the
+    // stack is exhausted. Parse and render on a dedicated thread whose stack
+    // is sized well beyond the guard's worst case.
+    let owned = value.clone().unbind();
+    let (sql, values, kind, result_types) = py.detach(move || -> PyResult<CompiledStatement> {
+        // The GIL is released by detach, so the worker can re-attach for
+        // the Python-side parse and render outside it.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || -> PyResult<CompiledStatement> {
+                let statement = Python::attach(|py| parse_statement(owned.bind(py), dialect))?;
+                Ok(Compiler::new(dialect).statement(&statement))
+            })
+            .map_err(|error| {
+                OperationalError::new_err(format!("Expression compiler thread failed: {error}"))
+            })?
+            .join()
+            .map_err(|_| OperationalError::new_err("Expression compiler thread panicked"))?
+    })?;
     let params = PyDict::new(py);
     let mut ordered = Vec::with_capacity(values.len());
     let mut bind_types = Vec::with_capacity(values.len());
