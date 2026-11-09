@@ -20,15 +20,15 @@
 
 ## In progress
 
-- MySQL dialect compilation + compiled Core execution on `feat/mysql-dialect` (all local gates green incl. live integration; commit pending): `Dialect::Mysql` in `src/expr.rs` renders `?` binds, `concat()`, plain `/`, `IN (NULL)` empty sets, `LIMIT offset,count` (offset-only → `18446744073709551615`), `true`/`false` + `true = 1`/`false = 1` boolean forms, backtick quoting (MySQL 8.x reserved list), `AUTO_INCREMENT` int PKs, NULL-bind empty inserts, and `BOOL`/`BLOB`/`DATETIME` DDL types. `AsyncConnection.execute` compiles and executes Core/`Compiled` on MySQL with `bind_types` coercion (`coerce_mysql_value`) and mapping-override ordering; DDL picks the dialect via `_bind_dialect`. Latent fix: `compile_expression` now parses+renders on a 64 MiB-stack thread so the 2000-depth guard fires before native stack exhaustion (pre-existing segfault found during this slice). Also fixed `is_scalar` boolean literals → `IS true`/`IS 1` (was `IS ?`, rejected by MySQL/PG grammars). Live suite `tests/test_mysql_core.py` (9 tests) vs SQLAlchemy+asyncmy; DATETIME fsp 0 truncates microseconds like SA.
+- All dialect slices merged. Next queue item: Milestone 3 declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration). Optional side gaps: MySQL executemany, Numeric/Decimal, `StatementError` attributes.
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 
 1. ~~PostgreSQL pool + compiled-statement execution~~ (done: compiled execution merged at `8b1f815`, pool merged at `62c18ca`).
 2. ~~MySQL first driver slice per ADR 0004 (`mysql_async`)~~ (done: merged at `58958c3`, 14 live tests).
-3. ~~Async savepoints + `aiosqlite` real async parity~~ (done: merged `aa417ce`). ~~MySQL dialect compilation + compiled Core execution~~ (implemented on `feat/mysql-dialect`, pending commit/merge). Next: MySQL executemany (optional gap) or Milestone 3 declarative ORM.
+3. ~~Async savepoints + `aiosqlite` real async parity~~ (done: merged `aa417ce`). ~~MySQL dialect compilation + compiled Core execution~~ (done: merged `7bb1242` — fix `9e0658a` + feat `20cffb7`, 288 tests incl. 9 live `test_mysql_core.py`). Next: Milestone 3 declarative ORM.
 4. Milestone 3: declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration).
-5. Close documented parity gaps: Numeric/Decimal, StatementError wrapping, `.orig`/`.params` (string `+` → `||` closed in the dialect slice).
+5. Close documented parity gaps: Numeric/Decimal, StatementError wrapping, `.orig`/`.params` (string `+` → `||` closed in the dialect slice); MySQL executemany also open.
 6. Milestone 4: Session, identity map, unit of work, relationships/loading; then milestone 5 parity/benchmarks.
 
 ## Environment facts
