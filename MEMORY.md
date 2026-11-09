@@ -20,13 +20,13 @@
 
 ## In progress
 
-- Async savepoint slice on `feat/async-savepoints` (uncommitted): `AsyncSavepointTransaction` (`begin_nested` deferred start, `await`/`async with`/`start`/`commit`/`release`/`rollback`/`close`) on all three drivers — SQLite via `spawn_blocking`, PG/MySQL via `SAVEPOINT`/`RELEASE`/`ROLLBACK TO SAVEPOINT` with `catalyst_sp_N` counters + shared name validation. Fixed latent `_finished`-guard bug in sync `SavepointTransaction.__exit__` too. aiosqlite parity test added (`test_async_savepoint.py`, 7 tests) + general aiosqlite execution test in `test_async_engine.py`.
+- Async savepoints merged at `aa417ce` (pushed): `AsyncSavepointTransaction` on all three drivers + aiosqlite parity tests; fixed latent `_finished`-guard bug in sync `SavepointTransaction.__exit__`. Next: MySQL dialect compilation + compiled Core execution (mirrors the PG compiled slice).
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 
 1. ~~PostgreSQL pool + compiled-statement execution~~ (done: compiled execution merged at `8b1f815`, pool merged at `62c18ca`).
 2. ~~MySQL first driver slice per ADR 0004 (`mysql_async`)~~ (done: merged at `58958c3`, 14 live tests).
-3. Async savepoints; `aiosqlite` now installed — extend async parity comparisons to the real async SQLAlchemy driver. Next: MySQL dialect compilation + compiled Core execution (same slice shape as PG compiled execution).
+3. ~~Async savepoints + `aiosqlite` real async parity~~ (done: merged `aa417ce`). Next: MySQL dialect compilation + compiled Core execution (same slice shape as PG compiled execution), then MySQL DDL (`create_all`/`has_table` already half-wired via `_bind_dialect`).
 4. Milestone 3: declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration).
 5. Close documented parity gaps: Numeric/Decimal, StatementError wrapping, `.orig`/`.params` (string `+` → `||` closed in the dialect slice).
 6. Milestone 4: Session, identity map, unit of work, relationships/loading; then milestone 5 parity/benchmarks.
