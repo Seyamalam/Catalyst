@@ -3,8 +3,50 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from catalyst import TimeoutError, create_async_engine, text
 from sqlalchemy import create_engine as sqlalchemy_create_engine
+from sqlalchemy.ext.asyncio import create_async_engine as sa_create_async_engine
+
+
+@pytest.mark.asyncio
+async def test_async_text_execution_and_transactions_match_aiosqlite(
+    tmp_path: Path,
+) -> None:
+    """Compare text execution and transactions with SQLAlchemy's real async
+    SQLite driver (aiosqlite) on a shared file database."""
+    database = tmp_path / "aiosqlite_parity.sqlite"
+    catalyst_engine = create_async_engine(f"sqlite:///{database}")
+    sa_engine = sa_create_async_engine(f"sqlite+aiosqlite:///{database}")
+    try:
+        async with sa_engine.begin() as connection:
+            await connection.execute(sa.text("CREATE TABLE items (value INTEGER)"))
+        async with catalyst_engine.begin() as connection:
+            result = await connection.execute(
+                text("INSERT INTO items VALUES (:value)"), {"value": 12}
+            )
+            assert result.rowcount == 1
+        async with sa_engine.begin() as connection:
+            sa_result = await connection.execute(
+                sa.text("INSERT INTO items VALUES (:value)"), {"value": 34}
+            )
+            assert sa_result.rowcount == result.rowcount
+        # Rolled-back writes stay invisible on both drivers.
+        async with catalyst_engine.connect() as connection:
+            await connection.execute(text("INSERT INTO items VALUES (:value)"), {"value": 99})
+            await connection.rollback()
+            rows = (
+                await connection.execute(text("SELECT value FROM items ORDER BY value"))
+            ).fetchall()
+            await connection.commit()
+        async with sa_engine.connect() as connection:
+            sa_rows = (
+                await connection.execute(sa.text("SELECT value FROM items ORDER BY value"))
+            ).fetchall()
+        assert rows == [tuple(row) for row in sa_rows] == [(12,), (34,)]
+    finally:
+        await catalyst_engine.dispose()
+        await sa_engine.dispose()
 
 
 @pytest.mark.asyncio
