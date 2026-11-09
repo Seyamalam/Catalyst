@@ -4,7 +4,7 @@ use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use rusqlite::types::Value;
 use std::collections::HashMap;
 
-use crate::{ArgumentError, python_to_sqlite};
+use crate::{ArgumentError, OperationalError, python_to_sqlite};
 
 type CompiledExpression = (
     String,
@@ -140,6 +140,7 @@ fn is_string_operand(expr: &Expr) -> bool {
 pub(crate) enum Dialect {
     Sqlite,
     Postgres,
+    Mysql,
 }
 
 impl Dialect {
@@ -147,6 +148,7 @@ impl Dialect {
         match name {
             "sqlite" => Ok(Self::Sqlite),
             "postgresql" => Ok(Self::Postgres),
+            "mysql" => Ok(Self::Mysql),
             other => Err(ArgumentError::new_err(format!(
                 "Unsupported compilation dialect '{other}'"
             ))),
@@ -155,6 +157,10 @@ impl Dialect {
 
     fn is_postgres(self) -> bool {
         matches!(self, Self::Postgres)
+    }
+
+    fn is_mysql(self) -> bool {
+        matches!(self, Self::Mysql)
     }
 }
 
@@ -329,23 +335,27 @@ impl Compiler {
             }
             Expr::Literal(_, _, _) => self.bind(expr),
             Expr::Boolean(value) => {
-                if self.dialect.is_postgres() {
+                if self.dialect.is_postgres() || self.dialect.is_mysql() {
                     self.sql.push_str(if *value { "true" } else { "false" });
                 } else {
                     self.sql.push_str(if *value { "1" } else { "0" });
                 }
             }
             // SQLAlchemy renders a bare Python bool predicate as 1 = 1 / 0 = 1
-            // on SQLite and as true/false words on PostgreSQL.
+            // on SQLite, as true/false words on PostgreSQL, and as true = 1 /
+            // false = 1 on MySQL.
             Expr::BooleanWord(value) => {
                 if self.dialect.is_postgres() {
                     self.sql.push_str(if *value { "true" } else { "false" });
+                } else if self.dialect.is_mysql() {
+                    self.sql
+                        .push_str(if *value { "true = 1" } else { "false = 1" });
                 } else {
                     self.sql.push_str(if *value { "1 = 1" } else { "0 = 1" });
                 }
             }
             Expr::Binary(left, op, right) => {
-                if op == "/" && !self.dialect.is_postgres() {
+                if op == "/" && matches!(self.dialect, Dialect::Sqlite) {
                     // SQLAlchemy's SQLite dialect rewrites true division as
                     // ``left / (right + 0.0)``; the right operand renders
                     // inside its own grouping.
@@ -353,7 +363,7 @@ impl Compiler {
                     self.sql.push_str(" / (");
                     self.render_child(right, Some(op.as_str()));
                     self.sql.push_str(" + 0.0)");
-                } else if op == "/" {
+                } else if op == "/" && self.dialect.is_postgres() {
                     // SQLAlchemy's PG dialect casts the divisor: NUMERIC for
                     // integer operands, FLOAT otherwise.
                     self.render_child(left, Some(op.as_str()));
@@ -365,6 +375,18 @@ impl Compiler {
                     };
                     self.sql.push_str(" AS ");
                     self.sql.push_str(cast);
+                    self.sql.push(')');
+                } else if op == "+"
+                    && self.dialect.is_mysql()
+                    && is_string_operand(left)
+                    && is_string_operand(right)
+                {
+                    // MySQL concatenates with the CONCAT function, not an
+                    // operator.
+                    self.sql.push_str("concat(");
+                    self.expr(left, None);
+                    self.sql.push_str(", ");
+                    self.expr(right, None);
                     self.sql.push(')');
                 } else {
                     let rendered_op =
@@ -426,8 +448,9 @@ impl Compiler {
                 }
                 self.render_child(inner, Some("IN"));
                 if values.is_empty() {
-                    if self.dialect.is_postgres() {
-                        // SQLAlchemy's expanding-bind empty-set rendering for PG.
+                    if self.dialect.is_postgres() || self.dialect.is_mysql() {
+                        // SQLAlchemy's expanding-bind empty-set rendering for
+                        // PostgreSQL and MySQL.
                         if negated {
                             self.sql.push_str(" NOT IN (NULL) OR (1 = 1)");
                         } else {
@@ -540,13 +563,7 @@ impl Compiler {
     }
 
     fn ident(&mut self, value: &str) {
-        if needs_quote_in(value, self.dialect) {
-            self.sql.push('"');
-            self.sql.push_str(&value.replace('"', "\"\""));
-            self.sql.push('"');
-        } else {
-            self.sql.push_str(value);
-        }
+        self.sql.push_str(&quote_ident(value, self.dialect));
     }
 
     fn select_expr(&mut self, expr: &Expr) {
@@ -643,6 +660,21 @@ impl Compiler {
                             self.sql.push_str(" OFFSET ");
                             self.expr(offset, None);
                         }
+                    } else if self.dialect.is_mysql() {
+                        // SA MySQL: "LIMIT offset, count"; an offset without a
+                        // limit uses the maximum unsigned BIGINT count.
+                        self.sql.push_str(" \n LIMIT ");
+                        if let Some(offset) = offset {
+                            self.expr(offset, None);
+                            self.sql.push_str(", ");
+                            if let Some(limit) = limit {
+                                self.expr(limit, None);
+                            } else {
+                                self.sql.push_str("18446744073709551615");
+                            }
+                        } else if let Some(limit) = limit {
+                            self.expr(limit, None);
+                        }
                     } else {
                         self.sql.push_str("\n LIMIT ");
                         if let Some(limit) = limit {
@@ -664,7 +696,14 @@ impl Compiler {
                 self.sql.push_str("INSERT INTO ");
                 self.ident(table);
                 if values.is_empty() {
-                    self.sql.push_str(" DEFAULT VALUES");
+                    if self.dialect.is_mysql() {
+                        // MySQL has no DEFAULT VALUES syntax; Python expands
+                        // empty inserts to NULL binds, so this only guards a
+                        // directly-serialized empty values map.
+                        self.sql.push_str(" () VALUES ()");
+                    } else {
+                        self.sql.push_str(" DEFAULT VALUES");
+                    }
                 } else {
                     self.sql.push_str(" (");
                     for (i, (name, _)) in values.iter().enumerate() {
@@ -721,13 +760,7 @@ impl Compiler {
                 primary_key,
             } => {
                 let dialect = self.dialect;
-                let quote = |value: &str| {
-                    if needs_quote_in(value, dialect) {
-                        format!("\"{}\"", value.replace('"', "\"\""))
-                    } else {
-                        value.to_owned()
-                    }
-                };
+                let quote = |value: &str| quote_ident(value, dialect);
                 self.sql.push('\n');
                 self.sql.push_str("CREATE TABLE ");
                 self.ident(table);
@@ -757,7 +790,16 @@ impl Compiler {
                             line.push_str(&default.replace('\'', "''"));
                             line.push('\'');
                         }
-                        if column.not_null {
+                        // MySQL renders the single integer primary key with
+                        // NOT NULL AUTO_INCREMENT; the PRIMARY KEY clause is
+                        // still emitted below.
+                        if dialect.is_mysql()
+                            && primary_key.len() == 1
+                            && primary_key[0] == column.name
+                            && column.type_name == "INTEGER"
+                        {
+                            line.push_str(" NOT NULL AUTO_INCREMENT");
+                        } else if column.not_null {
                             line.push_str(" NOT NULL");
                         }
                         line
@@ -796,6 +838,19 @@ impl Compiler {
 #[cfg(test)]
 fn needs_quote(value: &str) -> bool {
     needs_quote_in(value, Dialect::Sqlite)
+}
+
+/// Quote a possibly-reserved identifier: double quotes for SQLite/PostgreSQL,
+/// backticks for MySQL, with doubled-quote escapes inside.
+fn quote_ident(value: &str, dialect: Dialect) -> String {
+    if !needs_quote_in(value, dialect) {
+        return value.to_owned();
+    }
+    if dialect.is_mysql() {
+        format!("`{}`", value.replace('`', "``"))
+    } else {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
 }
 
 fn needs_quote_in(value: &str, dialect: Dialect) -> bool {
@@ -1048,6 +1103,287 @@ fn needs_quote_in(value: &str, dialect: Dialect) -> bool {
         "with",
         "without",
     ];
+    // SQLAlchemy's ``RESERVED_WORDS_MYSQL`` (MySQL 8.x reserved words).
+    const MYSQL_RESERVED: &[&str] = &[
+        "accessible",
+        "add",
+        "admin",
+        "all",
+        "alter",
+        "analyze",
+        "and",
+        "array",
+        "as",
+        "asc",
+        "asensitive",
+        "before",
+        "between",
+        "bigint",
+        "binary",
+        "blob",
+        "both",
+        "by",
+        "call",
+        "cascade",
+        "case",
+        "change",
+        "char",
+        "character",
+        "check",
+        "collate",
+        "column",
+        "condition",
+        "constraint",
+        "continue",
+        "convert",
+        "create",
+        "cross",
+        "cube",
+        "cume_dist",
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "cursor",
+        "database",
+        "databases",
+        "day_hour",
+        "day_microsecond",
+        "day_minute",
+        "day_second",
+        "dec",
+        "decimal",
+        "declare",
+        "default",
+        "delayed",
+        "delete",
+        "dense_rank",
+        "desc",
+        "describe",
+        "deterministic",
+        "distinct",
+        "distinctrow",
+        "div",
+        "double",
+        "drop",
+        "dual",
+        "each",
+        "else",
+        "elseif",
+        "empty",
+        "enclosed",
+        "escaped",
+        "except",
+        "exists",
+        "exit",
+        "explain",
+        "false",
+        "fetch",
+        "first_value",
+        "float",
+        "float4",
+        "float8",
+        "for",
+        "force",
+        "foreign",
+        "from",
+        "fulltext",
+        "function",
+        "general",
+        "generated",
+        "get",
+        "get_master_public_key",
+        "grant",
+        "group",
+        "grouping",
+        "groups",
+        "having",
+        "high_priority",
+        "hour_microsecond",
+        "hour_minute",
+        "hour_second",
+        "if",
+        "ignore",
+        "ignore_server_ids",
+        "in",
+        "index",
+        "infile",
+        "inner",
+        "inout",
+        "insensitive",
+        "insert",
+        "int",
+        "int1",
+        "int2",
+        "int3",
+        "int4",
+        "int8",
+        "integer",
+        "intersect",
+        "interval",
+        "into",
+        "io_after_gtids",
+        "io_before_gtids",
+        "is",
+        "iterate",
+        "join",
+        "json_table",
+        "key",
+        "keys",
+        "kill",
+        "lag",
+        "last_value",
+        "lateral",
+        "lead",
+        "leading",
+        "leave",
+        "left",
+        "like",
+        "limit",
+        "linear",
+        "lines",
+        "load",
+        "localtime",
+        "localtimestamp",
+        "lock",
+        "long",
+        "longblob",
+        "longtext",
+        "loop",
+        "low_priority",
+        "master_bind",
+        "master_heartbeat_period",
+        "master_ssl_verify_server_cert",
+        "match",
+        "maxvalue",
+        "mediumblob",
+        "mediumint",
+        "mediumtext",
+        "member",
+        "middleint",
+        "minute_microsecond",
+        "minute_second",
+        "mod",
+        "modifies",
+        "natural",
+        "no_write_to_binlog",
+        "not",
+        "nth_value",
+        "ntile",
+        "null",
+        "numeric",
+        "of",
+        "on",
+        "optimize",
+        "optimizer_costs",
+        "option",
+        "optionally",
+        "or",
+        "order",
+        "out",
+        "outer",
+        "outfile",
+        "over",
+        "parallel",
+        "parse_gcol_expr",
+        "partition",
+        "percent_rank",
+        "persist",
+        "persist_only",
+        "precision",
+        "primary",
+        "procedure",
+        "purge",
+        "qualify",
+        "range",
+        "rank",
+        "read",
+        "read_write",
+        "reads",
+        "real",
+        "recursive",
+        "references",
+        "regexp",
+        "release",
+        "rename",
+        "repeat",
+        "replace",
+        "require",
+        "resignal",
+        "restrict",
+        "return",
+        "revoke",
+        "right",
+        "rlike",
+        "role",
+        "row",
+        "row_number",
+        "rows",
+        "schema",
+        "schemas",
+        "second_microsecond",
+        "select",
+        "sensitive",
+        "separator",
+        "set",
+        "show",
+        "signal",
+        "slow",
+        "smallint",
+        "spatial",
+        "specific",
+        "sql",
+        "sql_after_gtids",
+        "sql_before_gtids",
+        "sql_big_result",
+        "sql_calc_found_rows",
+        "sql_small_result",
+        "sqlexception",
+        "sqlstate",
+        "sqlwarning",
+        "ssl",
+        "starting",
+        "stored",
+        "straight_join",
+        "system",
+        "table",
+        "terminated",
+        "then",
+        "tinyblob",
+        "tinyint",
+        "tinytext",
+        "to",
+        "trailing",
+        "trigger",
+        "true",
+        "undo",
+        "union",
+        "unique",
+        "unlock",
+        "unsigned",
+        "update",
+        "usage",
+        "use",
+        "using",
+        "utc_date",
+        "utc_time",
+        "utc_timestamp",
+        "values",
+        "varbinary",
+        "varchar",
+        "varcharacter",
+        "varying",
+        "virtual",
+        "when",
+        "where",
+        "while",
+        "window",
+        "with",
+        "write",
+        "xor",
+        "year_month",
+        "zerofill",
+    ];
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return true;
@@ -1057,6 +1393,7 @@ fn needs_quote_in(value: &str, dialect: Dialect) -> bool {
         || match dialect {
             Dialect::Sqlite => RESERVED.contains(&value),
             Dialect::Postgres => PG_RESERVED.contains(&value),
+            Dialect::Mysql => MYSQL_RESERVED.contains(&value),
         }
 }
 
@@ -1170,6 +1507,16 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
         "is_scalar" | "is_not_scalar" => {
             let left = Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?);
             let right = Box::new(parse_expr_at_depth(&item(value, 2)?, child_depth)?);
+            // IS TRUE/FALSE is a grammar production, not a bind: typed boolean
+            // literals render inline like the binary-operator arm.
+            let right = Box::new(match *right {
+                Expr::Literal(Value::Integer(value), _, Some(tag))
+                    if tag == "boolean" && matches!(value, 0 | 1) =>
+                {
+                    Expr::Boolean(value != 0)
+                }
+                other => other,
+            });
             if name == "is_scalar" {
                 Ok(Expr::IsScalar(left, right))
             } else {
@@ -1241,6 +1588,23 @@ fn render_type_name(tag: &str, length: Option<u64>, dialect: Dialect) -> PyResul
             "datetime" => Ok("TIMESTAMP WITHOUT TIME ZONE".to_owned()),
             "date" => Ok("DATE".to_owned()),
             "binary" => Ok("BYTEA".to_owned()),
+            other => Err(ArgumentError::new_err(format!(
+                "Unsupported DDL column type '{other}'"
+            ))),
+        };
+    }
+    if dialect.is_mysql() {
+        return match tag {
+            "integer" => Ok("INTEGER".to_owned()),
+            "string" => {
+                Ok(length.map_or_else(|| "VARCHAR".to_owned(), |size| format!("VARCHAR({size})")))
+            }
+            "text" => Ok("TEXT".to_owned()),
+            "boolean" => Ok("BOOL".to_owned()),
+            "float" => Ok("FLOAT".to_owned()),
+            "datetime" => Ok("DATETIME".to_owned()),
+            "date" => Ok("DATE".to_owned()),
+            "binary" => Ok("BLOB".to_owned()),
             other => Err(ArgumentError::new_err(format!(
                 "Unsupported DDL column type '{other}'"
             ))),
@@ -1393,9 +1757,26 @@ pub(crate) fn compile_expression(
     py: Python<'_>,
 ) -> PyResult<CompiledExpression> {
     let dialect = Dialect::parse(dialect)?;
-    let statement = parse_statement(value, dialect)?;
-    let (sql, values, kind, result_types) =
-        py.detach(move || Compiler::new(dialect).statement(&statement));
+    // Parsing recurses once per serialized node and each debug frame is
+    // large; on the default stack the depth guard cannot fire before the
+    // stack is exhausted. Parse and render on a dedicated thread whose stack
+    // is sized well beyond the guard's worst case.
+    let owned = value.clone().unbind();
+    let (sql, values, kind, result_types) = py.detach(move || -> PyResult<CompiledStatement> {
+        // The GIL is released by detach, so the worker can re-attach for
+        // the Python-side parse and render outside it.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || -> PyResult<CompiledStatement> {
+                let statement = Python::attach(|py| parse_statement(owned.bind(py), dialect))?;
+                Ok(Compiler::new(dialect).statement(&statement))
+            })
+            .map_err(|error| {
+                OperationalError::new_err(format!("Expression compiler thread failed: {error}"))
+            })?
+            .join()
+            .map_err(|_| OperationalError::new_err("Expression compiler thread panicked"))?
+    })?;
     let params = PyDict::new(py);
     let mut ordered = Vec::with_capacity(values.len());
     let mut bind_types = Vec::with_capacity(values.len());

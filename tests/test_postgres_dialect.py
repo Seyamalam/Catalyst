@@ -381,7 +381,7 @@ def test_pg_cache_is_dialect_scoped() -> None:
 def test_unknown_dialect_rejected() -> None:
     table, _ = _table()
     with pytest.raises(catalyst.ArgumentError):
-        select(table.c.id).compile(dialect="mysql")
+        select(table.c.id).compile(dialect="oracle")
 
 
 def test_sqlite_string_concat_now_matches_sqlalchemy() -> None:

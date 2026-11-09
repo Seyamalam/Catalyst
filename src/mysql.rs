@@ -197,8 +197,16 @@ impl NativeMysqlConnection {
         statement_kind: Option<String>,
         type_metadata: Option<MysqlTypeMetadata>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (statement_kind, type_metadata);
+        let _ = statement_kind;
+        let (bind_types, _bind_names, _result_types) = type_metadata.unwrap_or_default();
         let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode)?;
+        let values = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                coerce_mysql_value(value, bind_types.get(index).and_then(|tag| tag.as_deref()))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let (mut connection, active) = {
             let borrowed = slf.borrow(py);
             let connection = borrowed
@@ -776,6 +784,51 @@ fn extract_parameters(
             "MySQL parameters must be a mapping or list",
         ))
     }
+}
+
+/// Reinterpret a bind value using the compiled statement's declared type tag,
+/// mirroring ``coerce_pg_value`` for the MySQL driver. Compile-time bind
+/// processing formats temporal values as strings for SQLite storage; the
+/// binary protocol needs them back as typed date/timestamp parameters.
+fn coerce_mysql_value(value: MysqlValue, tag: Option<&str>) -> PyResult<MysqlValue> {
+    let Some(tag) = tag else {
+        return Ok(value);
+    };
+    match (tag, value) {
+        (_, MysqlValue::Null) => Ok(MysqlValue::Null),
+        ("datetime", MysqlValue::Text(ref text)) => parse_mysql_datetime(text),
+        ("datetime", MysqlValue::Date(day)) => {
+            Ok(MysqlValue::Timestamp(day.and_time(chrono::NaiveTime::MIN)))
+        }
+        ("date", MysqlValue::Text(ref text)) => parse_mysql_date(text),
+        ("date", MysqlValue::Timestamp(timestamp)) => Ok(MysqlValue::Date(timestamp.date())),
+        ("binary", MysqlValue::Text(_)) => Err(PyTypeError::new_err(
+            "Binary columns require bytes bind values",
+        )),
+        ("boolean", MysqlValue::Int(flag)) => Ok(MysqlValue::Bool(flag != 0)),
+        ("integer", MysqlValue::Text(ref text)) => text
+            .trim()
+            .parse::<i64>()
+            .map(MysqlValue::Int)
+            .map_err(|_| PyTypeError::new_err("Invalid integer bind value")),
+        ("float", MysqlValue::Int(number)) => Ok(MysqlValue::Float(number as f64)),
+        (_, value) => Ok(value),
+    }
+}
+
+fn parse_mysql_datetime(text: &str) -> PyResult<MysqlValue> {
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            return Ok(MysqlValue::Timestamp(parsed));
+        }
+    }
+    Err(PyTypeError::new_err("Invalid datetime bind value"))
+}
+
+fn parse_mysql_date(text: &str) -> PyResult<MysqlValue> {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map(MysqlValue::Date)
+        .map_err(|_| PyTypeError::new_err("Invalid date bind value"))
 }
 
 fn python_to_mysql_value(value: &Bound<'_, PyAny>) -> PyResult<MysqlValue> {
