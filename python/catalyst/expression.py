@@ -120,6 +120,10 @@ class Float(TypeEngine):
     pass
 
 
+class Double(TypeEngine):
+    pass
+
+
 class DateTime(TypeEngine):
     pass
 
@@ -482,6 +486,7 @@ _TYPE_TAGS = {
     "Text": "text",
     "Boolean": "boolean",
     "Float": "float",
+    "Double": "double",
     "DateTime": "datetime",
     "Date": "date",
     "LargeBinary": "binary",
@@ -509,7 +514,7 @@ def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
         return None
     if type_tag == "integer":
         return type_tag if isinstance(value, int) and not isinstance(value, bool) else None
-    if type_tag == "float":
+    if type_tag in {"float", "double"}:
         from decimal import Decimal
         from numbers import Number
 
@@ -655,6 +660,7 @@ class Compiled:
         bind_types: list[str | None],
         bind_names: list[str],
         result_types: list[str | None],
+        entity: type[object] | None = None,
     ) -> None:
         self.string = sql
         self.params = params
@@ -663,6 +669,7 @@ class Compiled:
         self._bind_types = bind_types
         self._bind_names = bind_names
         self._result_types = result_types
+        self.entity = entity
 
     def __str__(self) -> str:
         return self.string
@@ -676,6 +683,7 @@ class Select:
     ordering: tuple[Column | Expression, ...] = ()
     row_limit: int | None = None
     row_offset: int | None = None
+    entity: type[object] | None = None
 
     def where(self, *clauses: Column | Expression | bool) -> Select:
         if not clauses:
@@ -688,7 +696,13 @@ class Select:
         if self.predicate is not None:
             predicate = and_(self.predicate, predicate)
         return Select(
-            self.columns, self.table, predicate, self.ordering, self.row_limit, self.row_offset
+            self.columns,
+            self.table,
+            predicate,
+            self.ordering,
+            self.row_limit,
+            self.row_offset,
+            self.entity,
         )
 
     def order_by(self, *clauses: Column | Expression) -> Select:
@@ -699,16 +713,29 @@ class Select:
             self.ordering + clauses,
             self.row_limit,
             self.row_offset,
+            self.entity,
         )
 
     def limit(self, value: int) -> Select:
         return Select(
-            self.columns, self.table, self.predicate, self.ordering, value, self.row_offset
+            self.columns,
+            self.table,
+            self.predicate,
+            self.ordering,
+            value,
+            self.row_offset,
+            self.entity,
         )
 
     def offset(self, value: int) -> Select:
         return Select(
-            self.columns, self.table, self.predicate, self.ordering, self.row_limit, value
+            self.columns,
+            self.table,
+            self.predicate,
+            self.ordering,
+            self.row_limit,
+            value,
+            self.entity,
         )
 
     def _serialize(self, dialect: str = "sqlite") -> tuple[object, ...]:
@@ -793,7 +820,9 @@ class Select:
         sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
             serialized, name
         )
-        return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
+        return Compiled(
+            sql, params, kind, ordered, bind_types, bind_names, result_types, self.entity
+        )
 
     def __str__(self) -> str:
         return str(self.compile())
@@ -916,18 +945,43 @@ class Delete:
         return str(self.compile())
 
 
-def select(*columns: Column | Expression | Table) -> Select:
-    table = columns[0] if len(columns) == 1 and isinstance(columns[0], Table) else None
-    return Select(tuple(column for column in columns if not isinstance(column, Table)), table)
+def _entity_table(value: object) -> Table | None:
+    """Resolve a mapped declarative class to its ``Table``; ``None`` otherwise."""
+    table = getattr(value, "__table__", None)
+    return table if isinstance(value, type) and isinstance(table, Table) else None
 
 
-def insert(table: Table) -> Insert:
-    return Insert(table)
+def select(*columns: Column | Expression | Table | type[object]) -> Select:
+    if len(columns) == 1:
+        first = columns[0]
+        if isinstance(first, type):
+            entity_table = _entity_table(first)
+            if entity_table is not None:
+                return Select((), entity_table, entity=first)
+        table = first if isinstance(first, Table) else None
+        return Select(
+            tuple(column for column in columns if isinstance(column, (Column, Expression))),
+            table,
+        )
+    return Select(tuple(column for column in columns if isinstance(column, (Column, Expression))))
 
 
-def update(table: Table) -> Update:
-    return Update(table)
+def _dml_table(table: Table | type[object], verb: str) -> Table:
+    if isinstance(table, Table):
+        return table
+    resolved = _entity_table(table)
+    if resolved is None:
+        raise ArgumentError(f"{verb}() expected a Table or mapped declarative class")
+    return resolved
 
 
-def delete(table: Table) -> Delete:
-    return Delete(table)
+def insert(table: Table | type[object]) -> Insert:
+    return Insert(_dml_table(table, "insert"))
+
+
+def update(table: Table | type[object]) -> Update:
+    return Update(_dml_table(table, "update"))
+
+
+def delete(table: Table | type[object]) -> Delete:
+    return Delete(_dml_table(table, "delete"))

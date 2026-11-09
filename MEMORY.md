@@ -20,7 +20,7 @@
 
 ## In progress
 
-- All dialect slices merged. Next queue item: Milestone 3 declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration). Optional side gaps: MySQL executemany, Numeric/Decimal, `StatementError` attributes.
+- Milestone 3 first slice on `feat/orm-declarative`: `DeclarativeBase`/`declarative_base()`, `Mapped[T]`/`mapped_column` → Core `Table` mapping with SA type inference (`float`→`Double` — new `Double` marker), `select(Entity)` entity marking, `Session` read facade with batched Rust hydration (`NativeResult.hydrate`, `__new__` + setattr per column), `ScalarResult`/`one`/`first`/`one_or_none`, `NoResultFound`/`MultipleResultsFound`, PEP 681 `@dataclass_transform` via typing_extensions (strict `__init__` typing proven by `tests/test_orm_typing.py`). 287 tests pass; remaining M3/M4 work: relationships, inheritance, `MappedAsDataclass`, identity map, unit of work. Optional side gaps: MySQL executemany, Numeric/Decimal, `StatementError` attributes.
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 

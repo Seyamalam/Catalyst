@@ -627,7 +627,7 @@ fn coerce_pg_value(value: PgValue, tag: Option<&str>) -> PyResult<PgValue> {
             .parse::<i64>()
             .map(PgValue::Int)
             .map_err(|_| PyTypeError::new_err("Invalid integer bind value")),
-        ("float", PgValue::Int(number)) => Ok(PgValue::Float(number as f64)),
+        ("float" | "double", PgValue::Int(number)) => Ok(PgValue::Float(number as f64)),
         (_, value) => Ok(value),
     }
 }

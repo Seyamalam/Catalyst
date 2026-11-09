@@ -811,7 +811,7 @@ fn coerce_mysql_value(value: MysqlValue, tag: Option<&str>) -> PyResult<MysqlVal
             .parse::<i64>()
             .map(MysqlValue::Int)
             .map_err(|_| PyTypeError::new_err("Invalid integer bind value")),
-        ("float", MysqlValue::Int(number)) => Ok(MysqlValue::Float(number as f64)),
+        ("float" | "double", MysqlValue::Int(number)) => Ok(MysqlValue::Float(number as f64)),
         (_, value) => Ok(value),
     }
 }
