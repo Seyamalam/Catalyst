@@ -34,6 +34,7 @@ dev = [
     "mkdocs-material>=9.5",
     "mkdocs-mermaid2-plugin>=1.2",
     "sqlalchemy[asyncio]>=2.0",
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.maturin]

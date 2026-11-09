@@ -15,10 +15,11 @@ name = "_catalyst"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.29", features = ["abi3-py310"] }
+pyo3 = { version = "0.29", features = ["abi3-py310", "chrono"] }
 pyo3-async-runtimes = { version = "=0.29.0", features = ["tokio-runtime"] }
 tokio = { version = "=1.45.1", features = ["rt-multi-thread"] }
-tokio-postgres = { version = "=0.7.18", features = ["runtime"] }
+tokio-postgres = { version = "=0.7.18", features = ["runtime", "with-chrono-0_4"] }
+chrono = "0.4"
 tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring", "webpki-roots"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "=1.0.11"

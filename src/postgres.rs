@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use bytes::BytesMut;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{IsNull, ToSql, Type};
 use tokio_postgres::{Client, Config, Row};
@@ -38,6 +38,9 @@ enum PgValue {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    Timestamp(chrono::NaiveDateTime),
+    TimestampTz(chrono::DateTime<chrono::Utc>),
+    Date(chrono::NaiveDate),
 }
 
 impl ToSql for PgValue {
@@ -70,6 +73,9 @@ impl ToSql for PgValue {
                 output.extend_from_slice(value.as_bytes());
             }
             (Self::Bytes(value), Type::BYTEA) => output.extend_from_slice(value),
+            (Self::Timestamp(value), Type::TIMESTAMP) => return value.to_sql(ty, output),
+            (Self::TimestampTz(value), Type::TIMESTAMPTZ) => return value.to_sql(ty, output),
+            (Self::Date(value), Type::DATE) => return value.to_sql(ty, output),
             _ => {
                 return Err(
                     "PostgreSQL bind value does not match the inferred parameter type".into(),
@@ -95,6 +101,9 @@ impl PgValue {
             Self::Float(_) => Type::FLOAT8,
             Self::Text(_) => Type::TEXT,
             Self::Bytes(_) => Type::BYTEA,
+            Self::Timestamp(_) => Type::TIMESTAMP,
+            Self::TimestampTz(_) => Type::TIMESTAMPTZ,
+            Self::Date(_) => Type::DATE,
         }
     }
 }
@@ -170,8 +179,16 @@ impl NativePgConnection {
         statement_kind: Option<String>,
         type_metadata: Option<PgTypeMetadata>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (statement_kind, type_metadata);
+        let _ = statement_kind;
+        let (bind_types, _bind_names, _result_types) = type_metadata.unwrap_or_default();
         let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode)?;
+        let values = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                coerce_pg_value(value, bind_types.get(index).and_then(|tag| tag.as_deref()))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let (client, active) = {
             let borrowed = slf.borrow(py);
             let client = borrowed
@@ -241,6 +258,31 @@ impl NativePgConnection {
                 buffer_rows(&rows, &statement)?
             };
             Python::attach(|py| make_native_result(py, result))
+        })
+    }
+
+    /// Existence probe matching SQLAlchemy 2.x's PostgreSQL ``has_table``:
+    /// search-path-visible table-like relations outside pg_catalog.
+    fn async_has_table<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self
+            .client
+            .lock()
+            .map_err(|_| OperationalError::new_err("PostgreSQL connection lock was poisoned"))?
+            .clone()
+            .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.relname = $1 AND c.relkind IN ('r', 'p', 'f', 'v', 'm') \
+                     AND pg_catalog.pg_table_is_visible(c.oid) \
+                     AND n.nspname != 'pg_catalog')",
+                    &[&name],
+                )
+                .await
+                .map_err(map_pg_error)?;
+            Ok(row.get::<_, bool>(0))
         })
     }
 
@@ -367,6 +409,52 @@ fn extract_parameters(
     }
 }
 
+/// Reinterpret a bind value using the compiled statement's declared type tag.
+/// Compile-time bind processing formats some values for SQLite storage (for
+/// example datetimes as `YYYY-MM-DD HH:MM:SS.ffffff` strings); PostgreSQL has
+/// native typed parameters, so the driver coerces processed and user-supplied
+/// raw values alike into the `PgValue` variant the tag requires.
+fn coerce_pg_value(value: PgValue, tag: Option<&str>) -> PyResult<PgValue> {
+    let Some(tag) = tag else {
+        return Ok(value);
+    };
+    match (tag, value) {
+        (_, PgValue::Null) => Ok(PgValue::Null),
+        ("datetime", PgValue::Text(ref text)) => parse_pg_datetime(text),
+        ("datetime", PgValue::Date(day)) => {
+            Ok(PgValue::Timestamp(day.and_time(chrono::NaiveTime::MIN)))
+        }
+        ("date", PgValue::Text(ref text)) => parse_pg_date(text),
+        ("date", PgValue::Timestamp(timestamp)) => Ok(PgValue::Date(timestamp.date())),
+        ("binary", PgValue::Text(_)) => Err(PyTypeError::new_err(
+            "Binary columns require bytes bind values",
+        )),
+        ("boolean", PgValue::Int(flag)) => Ok(PgValue::Bool(flag != 0)),
+        ("integer", PgValue::Text(ref text)) => text
+            .trim()
+            .parse::<i64>()
+            .map(PgValue::Int)
+            .map_err(|_| PyTypeError::new_err("Invalid integer bind value")),
+        ("float", PgValue::Int(number)) => Ok(PgValue::Float(number as f64)),
+        (_, value) => Ok(value),
+    }
+}
+
+fn parse_pg_datetime(text: &str) -> PyResult<PgValue> {
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            return Ok(PgValue::Timestamp(parsed));
+        }
+    }
+    Err(PyTypeError::new_err("Invalid datetime bind value"))
+}
+
+fn parse_pg_date(text: &str) -> PyResult<PgValue> {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map(PgValue::Date)
+        .map_err(|_| PyTypeError::new_err("Invalid date bind value"))
+}
+
 fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
     if value.is_none() {
         Ok(PgValue::Null)
@@ -380,6 +468,12 @@ fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
         Ok(PgValue::Text(value.extract()?))
     } else if value.is_instance_of::<PyBytes>() {
         Ok(PgValue::Bytes(value.extract()?))
+    } else if value.is_instance_of::<PyDateTime>() {
+        // Timezone-aware values bind their wall-clock fields; the offset is
+        // dropped like the SQLite slice (TIMESTAMP WITHOUT TIME ZONE target).
+        Ok(PgValue::Timestamp(value.extract()?))
+    } else if value.is_instance_of::<PyDate>() {
+        Ok(PgValue::Date(value.extract()?))
     } else {
         Err(PyTypeError::new_err(
             "Unsupported PostgreSQL bind value type",
@@ -584,6 +678,15 @@ fn row_to_value(row: &Row, index: usize, ty: &Type) -> PyResult<PgValue> {
     } else if *ty == Type::BYTEA {
         row.try_get::<_, Option<Vec<u8>>>(index)
             .map(|v| v.map(PgValue::Bytes))
+    } else if *ty == Type::TIMESTAMP {
+        row.try_get::<_, Option<chrono::NaiveDateTime>>(index)
+            .map(|v| v.map(PgValue::Timestamp))
+    } else if *ty == Type::TIMESTAMPTZ {
+        row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(index)
+            .map(|v| v.map(PgValue::TimestampTz))
+    } else if *ty == Type::DATE {
+        row.try_get::<_, Option<chrono::NaiveDate>>(index)
+            .map(|v| v.map(PgValue::Date))
     } else {
         return Err(OperationalError::new_err(
             "Unsupported PostgreSQL result type in this driver slice",
@@ -623,6 +726,9 @@ fn pg_value_to_python(py: Python<'_>, value: PgValue) -> PyResult<Py<PyAny>> {
             .to_owned()
             .unbind()
             .into_any()),
+        PgValue::Timestamp(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PgValue::TimestampTz(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PgValue::Date(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
     }
 }
 

@@ -388,13 +388,17 @@ class AsyncConnection:
     ) -> CursorResult:
         if self._closed:
             raise RuntimeError("Connection is closed")
-        if self._postgres and not isinstance(statement, (str, TextClause)):
-            raise ArgumentError("The initial PostgreSQL driver supports text SQL only")
+        if self._postgres and isinstance(statement, (Select, Insert, Update, Delete)):
+            statement = statement.compile("postgresql")
         if (
             self._postgres
-            and isinstance(parameters, Mapping)
-            and not isinstance(statement, TextClause)
+            and isinstance(statement, Compiled)
+            and isinstance(parameters, Sequence)
+            and not isinstance(parameters, (str, bytes))
+            and parameters
         ):
+            raise ArgumentError("PostgreSQL executemany is not supported yet")
+        if self._postgres and isinstance(parameters, Mapping) and isinstance(statement, str):
             raise ArgumentError("PostgreSQL named parameters require text() statements")
         if (
             isinstance(statement, TextClause)
@@ -468,7 +472,7 @@ class AsyncConnection:
                 else parameters
             )
             kind = statement.statement_kind
-            if parameters is not None:
+            if parameters is not None or self._postgres:
                 bind_types = statement._bind_types
                 bind_names = statement._bind_names
             result_types = statement._result_types
@@ -483,6 +487,14 @@ class AsyncConnection:
             if parameters is not None and isinstance(parameters, Mapping):
                 raise ArgumentError("Mapping is only supported with text() statements")
             bindings = () if parameters is None else parameters
+        if self._postgres and isinstance(statement, Compiled) and isinstance(bindings, Mapping):
+            mapping_bindings = cast(Mapping[str, object], bindings)
+            ordered_bindings: list[object] = []
+            for name in statement._bind_names:
+                if name not in mapping_bindings:
+                    raise StatementError(f"A value is required for bind parameter '{name}'")
+                ordered_bindings.append(mapping_bindings[name])
+            bindings = ordered_bindings
         native_parameters: dict[str, object] | list[object]
         if isinstance(bindings, Mapping):
             native_parameters = dict(bindings)
@@ -510,11 +522,9 @@ class AsyncConnection:
         await self._native.async_transaction("commit")
 
     async def has_table(self, name: str) -> bool:
-        """Return whether a table exists, checking main and temp schemas."""
+        """Return whether a table exists in the connection's visible schemas."""
         if self._closed:
             raise RuntimeError("Connection is closed")
-        if isinstance(self._native, NativePgConnection):
-            raise ArgumentError("has_table() is not supported by the initial PostgreSQL driver")
         return bool(await self._native.async_has_table(name))
 
     async def rollback(self) -> None:
@@ -688,9 +698,10 @@ def run_ddl(
     """Execute compiled DDL with SQLAlchemy ``checkfirst`` semantics.
 
     Create statements run when the table is missing; drop statements run when
-    it exists. Existence is checked with SQLAlchemy's sqlite ``has_table``
-    probes (``PRAGMA main/temp.table_info``). The synchronous path executes
-    immediately and commits; an ``AsyncEngine`` bind returns a coroutine.
+    it exists. Existence uses the bind dialect's ``has_table`` probe (SQLite
+    ``PRAGMA main/temp.table_info``; PostgreSQL's search-path catalog query).
+    The synchronous path executes immediately and commits; an ``AsyncEngine``
+    bind returns a coroutine.
     """
     if isinstance(bind, AsyncEngine):
         return run_ddl_async(bind, tables, statements, checkfirst, drop)

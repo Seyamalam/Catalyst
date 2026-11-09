@@ -291,6 +291,11 @@ class _ColumnCollection:
         return iter(self._table.columns)
 
 
+def _bind_dialect(bind: Engine | AsyncEngine) -> str | None:
+    """Select the DDL compilation dialect from the bind's native driver."""
+    return "postgresql" if getattr(bind, "_postgres", False) else None
+
+
 class MetaData:
     """Container for table metadata with SQLAlchemy-style DDL creation."""
 
@@ -306,8 +311,9 @@ class MetaData:
         from .engine import run_ddl
 
         tables = list(self.tables.values())
+        dialect = _bind_dialect(bind)
         return run_ddl(
-            bind, tables, [table.compile_ddl() for table in tables], checkfirst, drop=False
+            bind, tables, [table.compile_ddl(dialect) for table in tables], checkfirst, drop=False
         )
 
     def drop_all(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
@@ -318,8 +324,9 @@ class MetaData:
         from .engine import run_ddl
 
         tables = list(reversed(list(self.tables.values())))
+        dialect = _bind_dialect(bind)
         return run_ddl(
-            bind, tables, [table.compile_drop() for table in tables], checkfirst, drop=True
+            bind, tables, [table.compile_drop(dialect) for table in tables], checkfirst, drop=True
         )
 
 
@@ -384,13 +391,15 @@ class Table:
         """Create this table; returns a coroutine for an :class:`AsyncEngine`."""
         from .engine import run_ddl
 
-        return run_ddl(bind, [self], [self.compile_ddl()], checkfirst, drop=False)
+        dialect = _bind_dialect(bind)
+        return run_ddl(bind, [self], [self.compile_ddl(dialect)], checkfirst, drop=False)
 
     def drop(self, bind: Engine | AsyncEngine, checkfirst: bool = True) -> Any:
         """Drop this table; returns a coroutine for an :class:`AsyncEngine`."""
         from .engine import run_ddl
 
-        return run_ddl(bind, [self], [self.compile_drop()], checkfirst, drop=True)
+        dialect = _bind_dialect(bind)
+        return run_ddl(bind, [self], [self.compile_drop(dialect)], checkfirst, drop=True)
 
 
 @dataclass(frozen=True, slots=True, eq=False)

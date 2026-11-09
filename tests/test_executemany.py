@@ -362,7 +362,8 @@ async def _async_batch_defaults_roundtrip() -> None:
     sqlalchemy = sa_create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
         await catalyst_table.create(catalyst)
-        await sa_table.metadata.create_all(sqlalchemy)
+        async with sqlalchemy.begin() as connection:
+            await connection.run_sync(sa_table.metadata.create_all)
         async with catalyst.begin() as connection:
             result = await connection.execute(
                 insert(catalyst_table).values(value="fixed"),

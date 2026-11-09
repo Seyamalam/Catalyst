@@ -13,17 +13,17 @@
 - Milestone 1 (Foundation & Core Engine): PyO3 0.29/abi3-py310/maturin, SQLAlchemy-style exception hierarchy, rusqlite engine facade, bounded Rust pool (file connections + `:memory:` singleton, timed checkout), `text()` named binds, sync transactions/savepoints per physical pool slot, SQLite URL/options/dialect registry/echo, Tokio async engine skeleton (pyo3-async-runtimes 0.29 + tokio), cargo-llvm-cov + Criterion harness, PostgreSQL/MySQL ADRs 0003/0004 + Docker integration harness.
 - Milestone 2 (Expression AST & dialects): Rust Core expression AST/compiler with SQLAlchemy-exact SQL rendering (parenthesization, true division, anon labels, empty groups), SQLite DDL compilation + `create_all`/`drop_all`/`Table.create`/`drop` with checkfirst, two-layer deterministic plan/statement cache (~4.5x repeated execution), typed SQLite coercion (Integer/String/Text/Boolean/Float/Date/DateTime/binary) and one-crossing executemany with aggregate rowcounts. PostgreSQL dialect compilation (Core + DDL, `$N` binds, casts, SERIAL, reserved-word quoting) proven against SQLAlchemy in `tests/test_postgres_dialect.py`; string `+` → `||` aligned on SQLite too.
 - PostgreSQL async text driver slice landed at `12ce351` (pushed): tokio-postgres + rustls, single connection, named binds, buffered results, basic transactions, redacted errors.
-- Latest committed state before this slice: `12ce351`. Test suite with the dialect compiler: 239 passed, 5 skipped (live-DB gated).
+- PostgreSQL compiled-statement execution slice (in review on `feat/pg-compiled-execution`): `AsyncConnection.execute` runs compiled Core DML/SELECT and `Compiled` statements; typed `bind_types` metadata coerces compile-processed values (datetime/date strings → TIMESTAMP/DATE, boolean ints, binary), mapping overrides order by bind name, `has_table` uses the `pg_catalog` search-path probe, and DDL helpers pick the dialect from the bind. Live-verified vs SQLAlchemy+psycopg (`psycopg[binary]` added to dev extras; SA+psycopg reports `-1` INSERT rowcounts, Catalyst reports the true count). `aiosqlite` also installed in `.venv`, which un-skipped `test_async_executemany_merges_statement_values` (fixed to use `run_sync`).
 
 ## In progress
 
-- PostgreSQL pool + compiled-statement execution (next half of the dialect task): wire `AsyncConnection.execute` for PG `Compiled` statements, PG `has_table` (information_schema probe), `create_all` dialect selection from the bind, and a connection pool; live parity tests against compose Postgres. The dialect compiler itself is complete in this slice (compilation only — PG execution is still text-only).
+- PostgreSQL connection pool (last piece of queue item 1): multi-slot async pool for `NativePgEngine` with checkout/timeout semantics matching the SQLite pool where applicable.
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 
-1. PostgreSQL pool + compiled-statement execution with SQLAlchemy parity tests against real Postgres (dialect compiler done this slice).
+1. PostgreSQL connection pool with SQLAlchemy parity tests against real Postgres (compiled execution done this slice).
 2. MySQL first driver slice per ADR 0004 (`mysql_async`), same pattern as the PG slice.
-3. Async savepoints; install `aiosqlite` so async parity compares against a real async SQLAlchemy driver.
+3. Async savepoints; `aiosqlite` now installed — extend async parity comparisons to the real async SQLAlchemy driver.
 4. Milestone 3: declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration).
 5. Close documented parity gaps: Numeric/Decimal, StatementError wrapping, `.orig`/`.params` (string `+` → `||` closed in the dialect slice).
 6. Milestone 4: Session, identity map, unit of work, relationships/loading; then milestone 5 parity/benchmarks.
