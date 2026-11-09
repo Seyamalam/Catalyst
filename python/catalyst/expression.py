@@ -20,6 +20,7 @@ _COMPILE_CACHE_SIZE = 512
 @lru_cache(maxsize=_COMPILE_CACHE_SIZE)
 def _compile_cached(
     serialized: tuple[object, ...],
+    dialect: str,
 ) -> tuple[
     str,
     tuple[tuple[str, object], ...],
@@ -29,7 +30,7 @@ def _compile_cached(
     tuple[str | None, ...],
 ]:
     sql, params, kind, _ordered, bind_types, bind_names, result_types = compile_expression(
-        serialized
+        serialized, dialect
     )
     return (
         sql,
@@ -43,6 +44,7 @@ def _compile_cached(
 
 def _compiled_from_cache(
     serialized: tuple[object, ...],
+    dialect: str,
 ) -> tuple[
     str,
     dict[str, object],
@@ -53,11 +55,13 @@ def _compiled_from_cache(
     list[str | None],
 ]:
     try:
-        sql, items, kind, bind_types, bind_names, result_types = _compile_cached(serialized)
+        sql, items, kind, bind_types, bind_names, result_types = _compile_cached(
+            serialized, dialect
+        )
     except TypeError:
         # Bind values may be unhashable objects; compile directly without caching.
         sql, params, kind, ordered, bind_types, bind_names, result_types = compile_expression(
-            serialized
+            serialized, dialect
         )
         return (
             sql,
@@ -76,6 +80,19 @@ def _compiled_from_cache(
 
 if TYPE_CHECKING:
     from .engine import AsyncEngine, Engine
+
+
+def _dialect_name(dialect: str | None) -> str:
+    """Normalize the compile-time dialect selector.
+
+    Catalyst accepts dialect names (``"sqlite"``/``"postgresql"``) where
+    SQLAlchemy accepts dialect objects; ``None`` means SQLite.
+    """
+    if dialect is None:
+        return "sqlite"
+    if dialect not in {"sqlite", "postgresql"}:
+        raise ArgumentError(f"Unsupported compilation dialect '{dialect}'")
+    return dialect
 
 
 class TypeEngine:
@@ -338,7 +355,7 @@ class Table:
     def __iter__(self) -> Iterator[Column]:
         return iter(self.columns)
 
-    def compile_ddl(self) -> Compiled:
+    def compile_ddl(self, dialect: str | None = None) -> Compiled:
         """Compile this table's ``CREATE TABLE`` statement natively."""
         columns = tuple(
             (
@@ -352,14 +369,14 @@ class Table:
         )
         primary_key = tuple(column.name for column in self.columns if column.primary_key)
         sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
-            ("create_table", self.name, columns, primary_key)
+            ("create_table", self.name, columns, primary_key), _dialect_name(dialect)
         )
         return Compiled(sql, {}, kind, [], [], [], [])
 
-    def compile_drop(self) -> Compiled:
+    def compile_drop(self, dialect: str | None = None) -> Compiled:
         """Compile this table's ``DROP TABLE`` statement natively."""
         sql, _params, kind, _ordered, _bind_types, _bind_names, _result_types = compile_expression(
-            ("drop_table", self.name)
+            ("drop_table", self.name), _dialect_name(dialect)
         )
         return Compiled(sql, {}, kind, [], [], [], [])
 
@@ -614,7 +631,7 @@ func = _FunctionGenerator()
 
 
 class Compiled:
-    """SQLite compiled SQL, ordered parameters, and native type metadata."""
+    """Dialect-compiled SQL, ordered parameters, and native type metadata."""
 
     def __init__(
         self,
@@ -681,7 +698,7 @@ class Select:
             self.columns, self.table, self.predicate, self.ordering, self.row_limit, value
         )
 
-    def _serialize(self) -> tuple[object, ...]:
+    def _serialize(self, dialect: str = "sqlite") -> tuple[object, ...]:
         table = self.table
         if table is None and self.columns:
             for column in self.columns:
@@ -702,16 +719,31 @@ class Select:
         predicate = None if self.predicate is None else _node(self.predicate)
         ordering = tuple(_node(item) for item in self.ordering)
         has_pagination = self.row_limit is not None or self.row_offset is not None
-        limit = (
-            ("literal", self.row_limit if self.row_limit is not None else -1, "=param_1")
-            if has_pagination
-            else None
-        )
-        offset = (
-            ("literal", self.row_offset if self.row_offset is not None else 0, "=param_2")
-            if has_pagination
-            else None
-        )
+        if dialect == "postgresql":
+            # SA's PG dialect renders LIMIT ALL for offset-only queries and
+            # numbers binds by appearance, with INTEGER casts.
+            limit = (
+                ("literal", self.row_limit, "=param_1", "integer")
+                if self.row_limit is not None
+                else None
+            )
+            offset_name = "=param_2" if self.row_limit is not None else "=param_1"
+            offset = (
+                ("literal", self.row_offset, offset_name, "integer")
+                if self.row_offset is not None
+                else None
+            )
+        else:
+            limit = (
+                ("literal", self.row_limit if self.row_limit is not None else -1, "=param_1")
+                if has_pagination
+                else None
+            )
+            offset = (
+                ("literal", self.row_offset if self.row_offset is not None else 0, "=param_2")
+                if has_pagination
+                else None
+            )
         return (
             "select",
             nodes,
@@ -722,11 +754,12 @@ class Select:
             offset,
         )
 
-    def compile(self) -> Compiled:
-        serialized = self._serialize()
+    def compile(self, dialect: str | None = None) -> Compiled:
+        name = _dialect_name(dialect)
+        serialized = self._serialize(name)
         _check_node_depth(serialized)
         sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            serialized
+            serialized, name
         )
         return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
@@ -747,19 +780,28 @@ class Insert:
         merged.update(kwargs)
         return Insert(self.table, merged)
 
-    def compile(self) -> Compiled:
-        values: dict[str, tuple[object, ...]] = {
-            column.name: (
-                "literal",
-                self.values_map[column.name],
-                f"={column.name}",
-                _column_type_tag(column.type),
-            )
-            for column in self.table.columns
-            if column.name in self.values_map
-        }
+    def compile(self, dialect: str | None = None) -> Compiled:
+        name = _dialect_name(dialect)
+        if name == "postgresql" and not self.values_map:
+            # SA's PG dialect renders empty inserts as explicit NULL binds for
+            # every column rather than SQLite's DEFAULT VALUES.
+            values: dict[str, tuple[object, ...]] = {
+                column.name: ("literal", None, f"={column.name}", _column_type_tag(column.type))
+                for column in self.table.columns
+            }
+        else:
+            values = {
+                column.name: (
+                    "literal",
+                    self.values_map[column.name],
+                    f"={column.name}",
+                    _column_type_tag(column.type),
+                )
+                for column in self.table.columns
+                if column.name in self.values_map
+            }
         sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            ("insert", self.table.name, values)
+            ("insert", self.table.name, values), name
         )
         return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
@@ -793,7 +835,7 @@ class Update:
             predicate = and_(self.predicate, predicate)
         return Update(self.table, self.values_map, predicate)
 
-    def compile(self) -> Compiled:
+    def compile(self, dialect: str | None = None) -> Compiled:
         values: dict[str, tuple[object, ...]] = {
             column.name: (
                 "literal",
@@ -806,7 +848,7 @@ class Update:
         }
         predicate = None if self.predicate is None else _node(self.predicate)
         sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            ("update", self.table.name, values, predicate)
+            ("update", self.table.name, values, predicate), _dialect_name(dialect)
         )
         return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
@@ -831,10 +873,10 @@ class Delete:
             predicate = and_(self.predicate, predicate)
         return Delete(self.table, predicate)
 
-    def compile(self) -> Compiled:
+    def compile(self, dialect: str | None = None) -> Compiled:
         predicate = None if self.predicate is None else _node(self.predicate)
         sql, params, kind, ordered, bind_types, bind_names, result_types = _compiled_from_cache(
-            ("delete", self.table.name, predicate)
+            ("delete", self.table.name, predicate), _dialect_name(dialect)
         )
         return Compiled(sql, params, kind, ordered, bind_types, bind_names, result_types)
 
