@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from catalyst import (
-    ArgumentError,
     Boolean,
     Column,
     Date,
@@ -319,14 +318,6 @@ async def test_mysql_empty_insert_and_integrity_error_parity(
     with pytest.raises(sa.exc.IntegrityError):
         async with sa_engine.begin() as connection:
             await connection.execute(sa.insert(sa_table).values(id=1))
-
-
-async def test_mysql_executemany_not_supported_yet(mysql_pair: tuple[Any, Any, str]) -> None:
-    catalyst_engine, _, suffix = mysql_pair
-    _, table, _ = _tables(suffix)
-    async with catalyst_engine.connect() as connection:
-        with pytest.raises(ArgumentError, match="executemany"):
-            await connection.execute(insert(table), [{"id": 1}, {"id": 2}])
 
 
 async def test_mysql_ddl_catalog_matches_sqlalchemy(mysql_pair: tuple[Any, Any, str]) -> None:

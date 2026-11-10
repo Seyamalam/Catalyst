@@ -5,7 +5,7 @@
 - Work lands on `main` via reviewed feature branches; `origin/main` is the integration branch (origin HEAD still points at the historical `feat/m1-foundation`). Never accumulate unrelated changes; make logical, passing Conventional Commits frequently.
 - Project instructions are in `AGENTS.md`. User requires durable agent instructions and this current-state memory.
 - User direction (2026-11-09): work the priority queue continuously with frequent commits and pushes until the project roadmap is finished.
-- Delegation: AGENTS.md permits only GPT-6 Luna implementers with independent review and isolated worktrees. When that exact model/isolation is unavailable, work in the lead thread and state the limitation; never substitute a model.
+- Delegation: per user direction 2026-11-10, subagent workers use swe-2-flash for lighter tasks and swe-2-high ("swe 2 max") for heavier ones, each in an isolated worktree via `delegate_task` with independent review by the lead thread. This supersedes the earlier GPT-6 Luna-only note in AGENTS.md.
 - User explicitly deferred GitHub Actions; local CI is `scripts/ci.sh` (optionally `CATALYST_INTEGRATION=1`, `CATALYST_COVERAGE=1`, `CATALYST_BENCH=1`). No workflow files should be added.
 
 ## Completed milestones (committed on main, pushed)
@@ -20,7 +20,7 @@
 
 ## In progress
 
-- Milestone 3 declarative-ORM slice merged at `e80c02a` (pushed): `DeclarativeBase`/`declarative_base()`, `Mapped[T]`/`mapped_column` → Core `Table` mapping with SA type inference (`float`→`Double` — new `Double` marker), `select(Entity)` entity marking, `Session` read facade with batched Rust hydration (`NativeResult.hydrate`, `__new__` + setattr per column), `ScalarResult`/`one`/`first`/`one_or_none`, `NoResultFound`/`MultipleResultsFound`, PEP 681 `@dataclass_transform` via typing_extensions (strict `__init__` typing proven by `tests/test_orm_typing.py`). Remaining M4 work: relationships, inheritance, `MappedAsDataclass`, identity map, unit of work, `Session.add`/`commit`/`flush`. In progress on `fix/parity-gaps`: StatementError wrapping done (`.orig`/`.params`/`.statement`; deferred literal bind errors on `Compiled.bind_error`; unbindable types → `ProgrammingError`); remaining gaps — Numeric/Decimal support, MySQL executemany.
+- Milestone 3 declarative-ORM slice merged at `e80c02a` (pushed): `DeclarativeBase`/`declarative_base()`, `Mapped[T]`/`mapped_column` → Core `Table` mapping with SA type inference (`float`→`Double` — new `Double` marker), `select(Entity)` entity marking, `Session` read facade with batched Rust hydration (`NativeResult.hydrate`, `__new__` + setattr per column), `ScalarResult`/`one`/`first`/`one_or_none`, `NoResultFound`/`MultipleResultsFound`, PEP 681 `@dataclass_transform` via typing_extensions (strict `__init__` typing proven by `tests/test_orm_typing.py`). Remaining M4 work: relationships, inheritance, `MappedAsDataclass`, identity map, unit of work, `Session.add`/`commit`/`flush`. In progress on `fix/parity-gaps`: StatementError wrapping done (`.orig`/`.params`/`.statement`; deferred literal bind errors on `Compiled.bind_error`; unbindable types → `ProgrammingError`); MySQL executemany done (asyncmy-verified: collapsed atomic `INSERT|REPLACE ... VALUES` batches, per-group loop for other statements incl. SELECT, `text()` empty-batch missing-bind `StatementError`, 0-based `parameter group` suffix for rows ≥ 1, `ArgumentError` for positional rows on text()/compiled statements, residual `StatementError`/`TypeError`-vs-`DataError` bad-bind gap); remaining gap — Numeric/Decimal support.
 
 ## Remaining queue (priority order, user-approved 2026-11-09)
 
@@ -28,7 +28,7 @@
 2. ~~MySQL first driver slice per ADR 0004 (`mysql_async`)~~ (done: merged at `58958c3`, 14 live tests).
 3. ~~Async savepoints + `aiosqlite` real async parity~~ (done: merged `aa417ce`). ~~MySQL dialect compilation + compiled Core execution~~ (done: merged `7bb1242` — fix `9e0658a` + feat `20cffb7`, 288 tests incl. 9 live `test_mysql_core.py`). Next: Milestone 3 declarative ORM.
 4. Milestone 3: declarative ORM (`Mapped[T]`, mappings, PEP 681, stubs, batched hydration).
-5. Close documented parity gaps: Numeric/Decimal, StatementError wrapping, `.orig`/`.params` (string `+` → `||` closed in the dialect slice); MySQL executemany also open.
+5. Close documented parity gaps: Numeric/Decimal remains (StatementError wrapping/`.orig`/`.params` and MySQL executemany closed on `fix/parity-gaps`).
 6. Milestone 4: Session, identity map, unit of work, relationships/loading; then milestone 5 parity/benchmarks.
 
 ## Environment facts

@@ -198,8 +198,8 @@ impl NativeMysqlConnection {
         type_metadata: Option<MysqlTypeMetadata>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let _ = statement_kind;
-        let (bind_types, _bind_names, _result_types) = type_metadata.unwrap_or_default();
-        let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode)
+        let (bind_types, bind_names, _result_types) = type_metadata.unwrap_or_default();
+        let (sql, values) = extract_parameters(py, &sql, &parameters, text_mode, &bind_names)
             .map_err(|error| crate::wrap_statement_error(py, error, &sql, parameters.bind(py)))?;
         let values = values
             .into_iter()
@@ -238,6 +238,135 @@ impl NativeMysqlConnection {
             match outcome {
                 Ok(result) => Python::attach(|py| make_native_result(py, result)),
                 Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// Execute a complete executemany batch in one FFI crossing: every row is
+    /// converted and coerced before the async block, which collapses
+    /// `INSERT`/`REPLACE ... VALUES (...)` into a single multi-row statement
+    /// (asyncmy parity, atomic across the batch) and runs every other
+    /// statement once per parameter group inside one transaction, discarding
+    /// result sets and aggregating the rowcount.
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None, type_metadata=None))]
+    fn async_executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        sql: String,
+        parameters: Py<PyAny>,
+        text_mode: bool,
+        statement_kind: Option<String>,
+        type_metadata: Option<MysqlTypeMetadata>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = statement_kind;
+        let (bind_types, bind_names, _result_types) = type_metadata.unwrap_or_default();
+        let (exec_sql, names) = if text_mode {
+            let (rendered, scanned) = scan_named_binds(&sql).map_err(|error| {
+                crate::wrap_statement_error(py, error, &sql, parameters.bind(py))
+            })?;
+            (rendered, scanned)
+        } else {
+            (sql.clone(), bind_names)
+        };
+        let rows = {
+            let list = parameters.bind(py).cast::<PyList>().map_err(|_| {
+                PyTypeError::new_err("MySQL executemany parameters must be a list of rows")
+            })?;
+            let mut batch = Vec::with_capacity(list.len());
+            for (group, row) in list.iter().enumerate() {
+                let values = (|| {
+                    let raw = if let Ok(mapping) = row.cast::<PyDict>() {
+                        // SQLAlchemy reports the 0-based parameter group only
+                        // for rows after the first.
+                        extract_dict_values(mapping, &names, (group > 0).then_some(group))?
+                    } else {
+                        row.extract::<Vec<Py<PyAny>>>()?
+                            .iter()
+                            .map(|item| python_to_mysql_value(item.bind(py)))
+                            .collect::<PyResult<Vec<_>>>()?
+                    };
+                    raw.into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            coerce_mysql_value(
+                                value,
+                                bind_types.get(index).and_then(|tag| tag.as_deref()),
+                            )
+                        })
+                        .collect::<PyResult<Vec<_>>>()
+                })()
+                .map_err(|error| crate::wrap_statement_error(py, error, &sql, &row))?;
+                batch.push(values);
+            }
+            batch
+        };
+        let (mut connection, active) = take_connection(&slf, py)?;
+        let owner = slf.clone_ref(py);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut began = false;
+            let mut rowcount = 0_i64;
+            let mut failure = None;
+            // asyncmy rewrites `INSERT|REPLACE ... VALUES (...)` executemany
+            // into one multi-row statement; every other statement shape runs
+            // once per parameter group (its own fallback path).
+            let collapsed = if rows.len() > 1 {
+                split_insert_values(&exec_sql).map(|(prefix, group, suffix)| {
+                    let joined = vec![group; rows.len()].join(",");
+                    format!("{prefix}{joined}{suffix}")
+                })
+            } else {
+                None
+            };
+            if let Some(collapsed_sql) = collapsed {
+                let flattened: Vec<MysqlValue> = rows.into_iter().flatten().collect();
+                match execute_buffered(&mut connection, &collapsed_sql, flattened, active).await {
+                    Ok((result, flag)) => {
+                        began |= flag;
+                        rowcount += result.rowcount;
+                    }
+                    Err((error, flag)) => {
+                        began |= flag;
+                        failure = Some(error);
+                    }
+                }
+            } else {
+                for values in rows {
+                    match execute_buffered(&mut connection, &exec_sql, values, active || began)
+                        .await
+                    {
+                        Ok((result, flag)) => {
+                            began |= flag;
+                            rowcount += result.rowcount;
+                        }
+                        Err((error, flag)) => {
+                            began |= flag;
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            Python::attach(|py| {
+                let borrowed = owner.borrow(py);
+                if began {
+                    borrowed.active.store(true, Ordering::Release);
+                }
+                if let Ok(mut guard) = borrowed.connection.lock() {
+                    *guard = Some(connection);
+                }
+            });
+            match failure {
+                Some(error) => Err(error),
+                None => Python::attach(|py| {
+                    make_native_result(
+                        py,
+                        MysqlResult {
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rowcount,
+                        },
+                    )
+                }),
             }
         })
     }
@@ -744,38 +873,65 @@ fn mysql_value_to_python(py: Python<'_>, value: MysqlValue) -> PyResult<Py<PyAny
     }
 }
 
+/// Order a parameter mapping's values by bind names: the compiled
+/// statement's `bind_names` for prepared statements, or the scanned `:name`
+/// sequence for text mode. Missing keys raise SQLAlchemy's message, carrying
+/// the batch row's parameter group for executemany like SQLAlchemy (the first
+/// row reports no group: SQLAlchemy frames parameter sets from row zero).
+fn extract_dict_values(
+    mapping: &Bound<'_, PyDict>,
+    names: &[String],
+    parameter_group: Option<usize>,
+) -> PyResult<Vec<MysqlValue>> {
+    let mut entries = HashMap::new();
+    for (key, item) in mapping.iter() {
+        let name = key
+            .extract::<String>()
+            .map_err(|_| StatementError::new_err("MySQL named bind keys must be strings"))?;
+        entries.insert(name, python_to_mysql_value(&item)?);
+    }
+    let group = parameter_group
+        .map(|group| format!(", in parameter group {group}"))
+        .unwrap_or_default();
+    names
+        .iter()
+        .map(|name| {
+            entries.get(name).cloned().ok_or_else(|| {
+                StatementError::new_err(format!(
+                    "A value is required for bind parameter '{name}'{group}"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn extract_parameters(
     py: Python<'_>,
     sql: &str,
     parameters: &Py<PyAny>,
     text_mode: bool,
+    bind_names: &[String],
 ) -> PyResult<(String, Vec<MysqlValue>)> {
     let value = parameters.bind(py);
     if let Ok(mapping) = value.cast::<PyDict>() {
-        let mut entries = HashMap::new();
-        for (key, item) in mapping.iter() {
-            let name = key
-                .extract::<String>()
-                .map_err(|_| StatementError::new_err("MySQL named bind keys must be strings"))?;
-            entries.insert(name, python_to_mysql_value(&item)?);
-        }
-        let (rendered, names) = if text_mode {
-            scan_named_binds(sql)?
+        if text_mode {
+            let (rendered, names) = scan_named_binds(sql)?;
+            let ordered = extract_dict_values(mapping, &names, None)?;
+            Ok((rendered, ordered))
         } else {
-            (sql.to_owned(), Vec::new())
-        };
-        let ordered = names
-            .iter()
-            .map(|name| {
-                entries.get(name).cloned().ok_or_else(|| {
-                    StatementError::new_err(format!(
-                        "A value is required for bind parameter '{name}'"
-                    ))
-                })
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok((rendered, ordered))
+            let ordered = extract_dict_values(mapping, bind_names, None)?;
+            Ok((sql.to_owned(), ordered))
+        }
     } else if let Ok(sequence) = value.cast::<PyList>() {
+        if text_mode && sequence.is_empty() {
+            // An empty text() parameter sequence still binds once against an
+            // empty mapping, so a required named bind surfaces SQLAlchemy's
+            // missing-value StatementError instead of leaking `:name` to the
+            // server; bind-free statements execute once as before.
+            let (rendered, names) = scan_named_binds(sql)?;
+            let ordered = extract_dict_values(&PyDict::new(py), &names, None)?;
+            return Ok((rendered, ordered));
+        }
         let values = sequence
             .iter()
             .map(|item| python_to_mysql_value(&item))
@@ -864,6 +1020,160 @@ fn python_to_mysql_value(value: &Bound<'_, PyAny>) -> PyResult<MysqlValue> {
             "Error binding parameter: type '{name}' is not supported"
         )))
     }
+}
+
+/// Whether the text after a captured `VALUES (...)` group can follow the
+/// expanded multi-row list, mirroring the asyncmy rewrite's suffix pattern
+/// `\s*(?:AS\s.*?)?\s*(?:ON DUPLICATE.*)?;?\s*$`: `AS` + whitespace absorbs
+/// anything (row aliases), `ON DUPLICATE` absorbs anything, and an optional
+/// single `;` closes the statement.
+fn insert_values_suffix_ok(suffix: &str) -> bool {
+    let rest = suffix.trim_start();
+    if rest
+        .get(..2)
+        .is_some_and(|word| word.eq_ignore_ascii_case("as"))
+        && rest
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        return true;
+    }
+    if rest
+        .get(..12)
+        .is_some_and(|word| word.eq_ignore_ascii_case("on duplicate"))
+    {
+        return true;
+    }
+    rest.strip_prefix(';').unwrap_or(rest).trim().is_empty()
+}
+
+/// Split an `INSERT`/`REPLACE ... VALUES (...)` statement into the text before
+/// the placeholder group, the parenthesized `?`-only group itself, and the
+/// remaining suffix, so an executemany batch can collapse into one multi-row
+/// statement the way asyncmy's `RE_INSERT_VALUES` rewrite does. `VALUES`/`VALUE`
+/// word-tokens are tried right-to-left (the regex's greedy `.+` backtracks the
+/// same way, so `ON DUPLICATE KEY UPDATE c = VALUES(c)` still finds the real
+/// `?` group) and candidates inside string/identifier literals or comments are
+/// ignored. `None` sends the batch down the per-group path — asyncmy's own
+/// fallback for non-collapsible statements.
+fn split_insert_values(sql: &str) -> Option<(String, String, String)> {
+    let bytes = sql.as_bytes();
+    // `^\s*(?:INSERT|REPLACE)\b`
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let keyword = [b"insert".as_slice(), b"replace".as_slice()]
+        .into_iter()
+        .find(|keyword| {
+            bytes
+                .get(index..index + keyword.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(keyword))
+                && !bytes
+                    .get(index + keyword.len())
+                    .is_some_and(|byte| is_mysql_word_byte(*byte))
+        })?;
+    index += keyword.len();
+    // Collect `VALUES`/`VALUE` word-tokens outside literals and comments.
+    let mut candidates = Vec::<usize>::new();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        index += 1;
+                        if index < bytes.len() && bytes[index] == quote {
+                            index += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut depth = 1_u32;
+                while index < bytes.len() && depth > 0 {
+                    if bytes[index..].starts_with(b"/*") {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index..].starts_with(b"*/") {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            byte if is_mysql_word_byte(byte) => {
+                let start = index;
+                while index < bytes.len() && is_mysql_word_byte(bytes[index]) {
+                    index += 1;
+                }
+                let word = &bytes[start..index];
+                if word.eq_ignore_ascii_case(b"value") || word.eq_ignore_ascii_case(b"values") {
+                    candidates.push(index);
+                }
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    // Try each `VALUES` token right-to-left: at least one whitespace byte then
+    // a group of comma-separated `?` placeholders and a closable suffix. The
+    // whitespace is required because the regex's `\bVALUES?\s+` demands it —
+    // `VALUES(?)` falls back to per-group execution in asyncmy too.
+    for &word_end in candidates.iter().rev() {
+        let mut paren = word_end;
+        while paren < bytes.len() && bytes[paren].is_ascii_whitespace() {
+            paren += 1;
+        }
+        if paren == word_end || bytes.get(paren) != Some(&b'(') {
+            continue;
+        }
+        let Some(close) = bytes[paren + 1..].iter().position(|byte| *byte == b')') else {
+            continue;
+        };
+        let close = paren + 1 + close;
+        let placeholders_ok = sql[paren + 1..close]
+            .split(',')
+            .all(|piece| piece.trim() == "?");
+        if !placeholders_ok {
+            continue;
+        }
+        let suffix = &sql[close + 1..];
+        if !insert_values_suffix_ok(suffix) {
+            continue;
+        }
+        return Some((
+            sql[..paren].to_owned(),
+            sql[paren..=close].to_owned(),
+            suffix.to_owned(),
+        ));
+    }
+    None
+}
+
+/// Word bytes for token scanning: ASCII alphanumerics and `_` mark MySQL
+/// keywords; non-ASCII bytes stay inside runs so a multibyte identifier tail
+/// still counts as one word (Python's unicode `\b` treats them as word chars).
+fn is_mysql_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
 }
 
 /// Replace named binds outside SQL strings/comments and return first-seen names.
@@ -965,7 +1275,7 @@ fn map_mysql_error(error: mysql_async::Error) -> PyErr {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_named_binds;
+    use super::{scan_named_binds, split_insert_values};
 
     #[test]
     fn named_scanner_skips_literals_comments_backticks_and_hash() {
@@ -981,5 +1291,59 @@ mod tests {
         let (rendered, names) = scan_named_binds("SELECT :v + :v").expect("valid binds");
         assert_eq!(names, ["v"]);
         assert_eq!(rendered, "SELECT ? + ?");
+    }
+
+    #[test]
+    fn insert_values_split_captures_prefix_group_and_suffix() {
+        let (prefix, group, suffix) =
+            split_insert_values("INSERT INTO t (id, v) VALUES (?, ?)").expect("collapsible");
+        assert_eq!(prefix, "INSERT INTO t (id, v) VALUES ");
+        assert_eq!(group, "(?, ?)");
+        assert_eq!(suffix, "");
+        let (prefix, group, suffix) =
+            split_insert_values("  replace into t value (?) ;  ").expect("collapsible");
+        assert_eq!(prefix, "  replace into t value ");
+        assert_eq!(group, "(?)");
+        assert_eq!(suffix, " ;  ");
+    }
+
+    #[test]
+    fn insert_values_split_finds_group_before_on_duplicate_values_call() {
+        // The rightmost VALUES token is `VALUES(v)` inside the ON DUPLICATE
+        // clause; it fails the `?`-group check, so the scanner backtracks to
+        // the real placeholder group like the asyncmy regex.
+        let (prefix, group, suffix) = split_insert_values(
+            "INSERT INTO t (id, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)",
+        )
+        .expect("collapsible");
+        assert_eq!(prefix, "INSERT INTO t (id, v) VALUES ");
+        assert_eq!(group, "(?, ?)");
+        assert_eq!(suffix, " ON DUPLICATE KEY UPDATE v = VALUES(v)");
+    }
+
+    #[test]
+    fn insert_values_split_rejects_non_collapsible_shapes() {
+        // Non-INSERT/REPLACE statements never collapse.
+        assert!(split_insert_values("UPDATE t SET v = ? WHERE id = ?").is_none());
+        assert!(split_insert_values("SELECT ? FROM t").is_none());
+        // Literals, expressions, and comments inside the group disqualify it.
+        assert!(split_insert_values("INSERT INTO t VALUES (?, 'x')").is_none());
+        assert!(split_insert_values("INSERT INTO t VALUES (1 + ?)").is_none());
+        assert!(split_insert_values("INSERT INTO t VALUES (?) , (?)").is_none());
+        assert!(split_insert_values("INSERT INTO t SET v = ?").is_none());
+        // `VALUES` tokens inside literals/comments are ignored.
+        assert!(split_insert_values("INSERT INTO t VALUES ('VALUES(?)')").is_none());
+        assert!(split_insert_values("INSERT INTO t VALUES (?) # VALUES(?)").is_none());
+        // A non-empty suffix other than `;`/`AS`/`ON DUPLICATE` fails.
+        assert!(split_insert_values("INSERT INTO t VALUES (?) RETURNING id").is_none());
+        // Bare `AS` without whitespace fails, while `AS <anything>` absorbs.
+        assert!(split_insert_values("INSERT INTO t VALUES (?) AS").is_none());
+        let (_, _, suffix) =
+            split_insert_values("insert into t values (?) as x").expect("collapsible");
+        assert_eq!(suffix, " as x");
+        // The regex's `\bVALUES?\s+` requires whitespace before the group, so
+        // `VALUES(?)` falls back to per-group execution like asyncmy.
+        assert!(split_insert_values("INSERT INTO t VALUES(?)").is_none());
+        assert!(split_insert_values("INSERT INTO t VALUES\n(?)").is_some());
     }
 }

@@ -3,7 +3,8 @@
 Text execution, typed result hydration, transactions, ``has_table``, pool
 semantics, and error mapping are compared with SQLAlchemy + asyncmy.
 Compiled Core statements execute through the MySQL dialect (see
-``test_mysql_core.py``); executemany is still unsupported.
+``test_mysql_core.py``) and executemany batches run natively (see
+``test_mysql_executemany.py``).
 """
 
 from __future__ import annotations
@@ -19,15 +20,9 @@ from collections.abc import AsyncIterator
 import pytest
 import sqlalchemy as sa
 from catalyst import (
-    ArgumentError,
-    Column,
-    Integer,
     IntegrityError,
-    MetaData,
-    Table,
     TimeoutError,
     create_async_engine,
-    insert,
     text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine as sa_create_async_engine
@@ -286,24 +281,48 @@ async def test_mysql_unpreparable_statements_use_text_protocol(table_name: str) 
         await engine.dispose()
 
 
-async def test_mysql_rejects_unsupported_features(table_name: str) -> None:
-    del table_name
-    engine = create_async_engine(MYSQL_URL)
+async def test_mysql_select_executemany_runs_per_group_like_sqlalchemy(
+    table_name: str,
+) -> None:
+    # asyncmy executemany does NOT reject SELECT batches (PyMySQL's
+    # "executemany() can only execute DML statements." does not apply here):
+    # it executes once per parameter group, discards each result set, and
+    # reports the summed rowcount — verified live: `SELECT :x` x2 groups
+    # yields rowcount 2, and `SELECT *` over a 2-row table x2 groups yields 4.
+    sa_table_name = f"{table_name}_sa"
+    catalyst_engine = create_async_engine(MYSQL_URL)
+    sa_engine = sa_create_async_engine(_sa_url())
     try:
-        async with engine.connect() as connection:
-            # Batch parameter sets are rejected cleanly, for text() and
-            # compiled Core statements alike.
-            with pytest.raises(ArgumentError, match="executemany"):
-                await connection.execute(text("SELECT :v"), [{"v": 1}, {"v": 2}])
-            table = Table(
-                "mysql_probe",
-                MetaData(),
-                Column("id", Integer, primary_key=True),
+        async with catalyst_engine.begin() as connection:
+            await connection.execute(text(f"CREATE TABLE `{table_name}` (id INT PRIMARY KEY)"))
+            await connection.execute(
+                text(f"INSERT INTO `{table_name}` VALUES (:id)"),
+                [{"id": 1}, {"id": 2}],
             )
-            with pytest.raises(ArgumentError, match="executemany"):
-                await connection.execute(insert(table), [{"id": 1}, {"id": 2}])
+        async with sa_engine.begin() as connection:
+            await connection.execute(
+                sa.text(f"CREATE TABLE `{sa_table_name}` (id INT PRIMARY KEY)")
+            )
+            await connection.execute(
+                sa.text(f"INSERT INTO `{sa_table_name}` VALUES (:id)"),
+                [{"id": 1}, {"id": 2}],
+            )
+        async with catalyst_engine.connect() as connection:
+            bound = await connection.execute(text("SELECT :x"), [{"x": 1}, {"x": 2}])
+            scanned = await connection.execute(text(f"SELECT * FROM `{table_name}`"), [{}, {}])
+            await connection.rollback()
+        async with sa_engine.connect() as connection:
+            sa_bound = await connection.execute(sa.text("SELECT :x"), [{"x": 1}, {"x": 2}])
+            sa_scanned = await connection.execute(
+                sa.text(f"SELECT * FROM `{sa_table_name}`"), [{}, {}]
+            )
+        assert bound.all() == sa_bound.all() == []
+        assert bound.rowcount == sa_bound.rowcount == 2
+        assert scanned.all() == sa_scanned.all() == []
+        assert scanned.rowcount == sa_scanned.rowcount == 4
     finally:
-        await engine.dispose()
+        await catalyst_engine.dispose()
+        await sa_engine.dispose()
 
 
 async def test_mysql_driver_does_not_leak_connection_url_on_failure() -> None:

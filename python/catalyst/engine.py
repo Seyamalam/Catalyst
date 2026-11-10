@@ -83,7 +83,7 @@ def _merge_compiled_batch(
     defaults = dict(statement.params)
     default_names = set(defaults)
     merged: list[dict[str, object]] = []
-    for group, row in enumerate(parameters, start=1):
+    for group, row in enumerate(parameters):
         if not isinstance(row, Mapping):
             raise ArgumentError("List argument must consist only of dictionaries")
         row_values = cast(Mapping[str, object], row)
@@ -610,8 +610,6 @@ class AsyncConnection:
             raise RuntimeError("Connection is closed")
         if self._postgres and isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile("postgresql")
-        if self._mysql and isinstance(statement, (Select, Insert, Update, Delete)):
-            statement = statement.compile("mysql")
         if (
             self._postgres
             and isinstance(statement, Compiled)
@@ -621,21 +619,16 @@ class AsyncConnection:
         ):
             raise ArgumentError("PostgreSQL executemany is not supported yet")
         if (
-            self._mysql
-            and isinstance(parameters, Sequence)
-            and not isinstance(parameters, (str, bytes))
-            and parameters
-            and isinstance(parameters[0], (Mapping, Sequence))
-            and not isinstance(parameters[0], (str, bytes))
-        ):
-            raise ArgumentError("MySQL executemany is not supported yet")
-        if (
             (self._postgres or self._mysql)
             and isinstance(parameters, Mapping)
             and isinstance(statement, str)
         ):
             dialect = "PostgreSQL" if self._postgres else "MySQL"
             raise ArgumentError(f"{dialect} named parameters require text() statements")
+        # MySQL compiles lazily at the shared compile site so Insert batches
+        # keep their first-row shape and missing-key checks (PostgreSQL is
+        # already compiled above; SQLite uses the default dialect).
+        compile_dialect = "mysql" if self._mysql else None
         if (
             isinstance(statement, TextClause)
             and parameters is not None
@@ -680,7 +673,7 @@ class AsyncConnection:
             ]
             insert_shape = {name: defaults.get(name) for name in ordered_names}
             statement = Insert(statement.table).values(insert_shape)
-            compiled_shape = statement.compile()
+            compiled_shape = statement.compile(compile_dialect)
             statement_values = dict(compiled_shape.params)
             statement_values.update(defaults)
             statement = Compiled(
@@ -694,7 +687,7 @@ class AsyncConnection:
                 bind_error=compiled_shape.bind_error,
             )
         if isinstance(statement, (Select, Insert, Update, Delete)):
-            statement = statement.compile()
+            statement = statement.compile(compile_dialect)
         if isinstance(statement, Compiled) and isinstance(parameters, Sequence) and parameters:
             parameters = _merge_compiled_batch(statement, parameters)
         kind: str | None = None
@@ -747,14 +740,33 @@ class AsyncConnection:
             raise _statement_error(
                 statement.bind_error, sql, parameters if parameters is not None else ()
             )
-        try:
-            result = await self._native.async_execute(
+        native = self._native
+        if (
+            isinstance(native, NativeMysqlConnection)
+            and isinstance(native_parameters, list)
+            and native_parameters
+            and isinstance(native_parameters[0], (Mapping, Sequence))
+            and not isinstance(native_parameters[0], (str, bytes))
+        ):
+            # A dict/sequence batch executes as one native executemany call;
+            # the whole batch crosses the FFI boundary once in Rust.
+            awaitable = native.async_executemany(
                 sql,
                 native_parameters,
                 isinstance(statement, TextClause),
                 kind,
                 (bind_types, bind_names, result_types),
             )
+        else:
+            awaitable = native.async_execute(
+                sql,
+                native_parameters,
+                isinstance(statement, TextClause),
+                kind,
+                (bind_types, bind_names, result_types),
+            )
+        try:
+            result = await awaitable
         except DBAPIError as error:
             raise _statement_error(
                 error, sql, parameters if parameters is not None else ()
