@@ -166,6 +166,45 @@ class CursorResult:
         """Fetch all remaining rows."""
         return self.fetchall()
 
+    def first(self) -> tuple[object, ...] | None:
+        """Fetch the first row, or ``None`` when the result is empty."""
+        return self.fetchone()
+
+    def one(self) -> tuple[object, ...]:
+        """Fetch exactly one row, raising when zero or several rows remain."""
+        rows = self.fetchall()
+        if not rows:
+            raise NoResultFound("No row was found when one was required")
+        if len(rows) != 1:
+            raise MultipleResultsFound(
+                f"Multiple rows were found when exactly one was required ({len(rows)})"
+            )
+        return rows[0]
+
+    def one_or_none(self) -> tuple[object, ...] | None:
+        """Fetch one row, ``None`` for zero rows, raising for several."""
+        rows = self.fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise MultipleResultsFound(
+                f"Multiple rows were found when one or none was required ({len(rows)})"
+            )
+        return rows[0]
+
+    def scalar(self) -> object | None:
+        """Fetch the first row's first column, or ``None``."""
+        row = self.fetchone()
+        return None if row is None else row[0]
+
+    def scalar_one(self) -> object:
+        """Fetch exactly one row's first column, like ``ScalarResult.one``."""
+        return self.scalars().one()
+
+    def scalar_one_or_none(self) -> object | None:
+        """Fetch one row's first column, ``None`` for zero, error for many."""
+        return self.scalars().one_or_none()
+
     def scalars(self) -> ScalarResult:
         """Return a result view yielding the first column of each row."""
         return ScalarResult(self)
@@ -611,14 +650,6 @@ class AsyncConnection:
         if self._postgres and isinstance(statement, (Select, Insert, Update, Delete)):
             statement = statement.compile("postgresql")
         if (
-            self._postgres
-            and isinstance(statement, Compiled)
-            and isinstance(parameters, Sequence)
-            and not isinstance(parameters, (str, bytes))
-            and parameters
-        ):
-            raise ArgumentError("PostgreSQL executemany is not supported yet")
-        if (
             (self._postgres or self._mysql)
             and isinstance(parameters, Mapping)
             and isinstance(statement, str)
@@ -742,7 +773,7 @@ class AsyncConnection:
             )
         native = self._native
         if (
-            isinstance(native, NativeMysqlConnection)
+            isinstance(native, NativeMysqlConnection | NativePgConnection)
             and isinstance(native_parameters, list)
             and native_parameters
             and isinstance(native_parameters[0], (Mapping, Sequence))

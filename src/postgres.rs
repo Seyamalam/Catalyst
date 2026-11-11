@@ -8,11 +8,13 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString};
 use tokio_postgres::config::SslMode;
-use tokio_postgres::types::{IsNull, ToSql, Type};
+use tokio_postgres::types::{FromSql, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Config, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::{IntegrityError, NativeResult, OperationalError, ProgrammingError, StatementError};
+use crate::{
+    DataError, IntegrityError, NativeResult, OperationalError, ProgrammingError, StatementError,
+};
 
 type PgTypeMetadata = (Vec<Option<String>>, Vec<String>, Vec<Option<String>>);
 
@@ -51,6 +53,8 @@ enum PgValue {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    /// A decimal value carried as text until the NUMERIC binary codec runs.
+    Decimal(String),
     Timestamp(chrono::NaiveDateTime),
     TimestampTz(chrono::DateTime<chrono::Utc>),
     Date(chrono::NaiveDate),
@@ -85,6 +89,16 @@ impl ToSql for PgValue {
             (Self::Text(value), Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME) => {
                 output.extend_from_slice(value.as_bytes());
             }
+            (Self::Decimal(value), Type::NUMERIC) => {
+                output.extend_from_slice(&encode_numeric(value)?)
+            }
+            (Self::Text(value), Type::NUMERIC) => output.extend_from_slice(&encode_numeric(value)?),
+            (Self::Int(value), Type::NUMERIC) => {
+                output.extend_from_slice(&encode_numeric(&value.to_string())?)
+            }
+            (Self::Float(value), Type::NUMERIC) => {
+                output.extend_from_slice(&encode_numeric(&value.to_string())?)
+            }
             (Self::Bytes(value), Type::BYTEA) => output.extend_from_slice(value),
             (Self::Timestamp(value), Type::TIMESTAMP) => return value.to_sql(ty, output),
             (Self::TimestampTz(value), Type::TIMESTAMPTZ) => return value.to_sql(ty, output),
@@ -114,6 +128,7 @@ impl PgValue {
             Self::Float(_) => Type::FLOAT8,
             Self::Text(_) => Type::TEXT,
             Self::Bytes(_) => Type::BYTEA,
+            Self::Decimal(_) => Type::NUMERIC,
             Self::Timestamp(_) => Type::TIMESTAMP,
             Self::TimestampTz(_) => Type::TIMESTAMPTZ,
             Self::Date(_) => Type::DATE,
@@ -334,6 +349,118 @@ impl NativePgConnection {
                 buffer_rows(&rows, &statement)?
             };
             Python::attach(|py| make_native_result(py, result))
+        })
+    }
+
+    /// Execute a complete executemany batch in one FFI crossing: parameter
+    /// rows are converted and coerced before the async block, which prepares
+    /// the statement once and executes it once per parameter group (psycopg
+    /// semantics), discarding result rows and aggregating the rowcount.
+    #[pyo3(signature = (sql, parameters, text_mode, statement_kind=None, type_metadata=None))]
+    fn async_executemany<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        sql: String,
+        parameters: Py<PyAny>,
+        text_mode: bool,
+        statement_kind: Option<String>,
+        type_metadata: Option<PgTypeMetadata>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = statement_kind;
+        let (bind_types, bind_names, _result_types) = type_metadata.unwrap_or_default();
+        let (exec_sql, names) = if text_mode {
+            scan_named_binds(&sql).map_err(|error| {
+                crate::wrap_statement_error(py, error, &sql, parameters.bind(py))
+            })?
+        } else {
+            (sql.clone(), bind_names)
+        };
+        let rows = {
+            let list = parameters.bind(py).cast::<PyList>().map_err(|_| {
+                PyTypeError::new_err("PostgreSQL executemany parameters must be a list of rows")
+            })?;
+            let mut batch = Vec::with_capacity(list.len());
+            for (group, row) in list.iter().enumerate() {
+                let values = (|| {
+                    let raw = if let Ok(mapping) = row.cast::<PyDict>() {
+                        // SQLAlchemy reports the 0-based parameter group only
+                        // for rows after the first.
+                        extract_pg_dict_values(mapping, &names, (group > 0).then_some(group))?
+                    } else {
+                        row.extract::<Vec<Py<PyAny>>>()?
+                            .iter()
+                            .map(|item| python_to_pg_value(item.bind(py)))
+                            .collect::<PyResult<Vec<_>>>()?
+                    };
+                    raw.into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            coerce_pg_value(
+                                value,
+                                bind_types.get(index).and_then(|tag| tag.as_deref()),
+                            )
+                        })
+                        .collect::<PyResult<Vec<_>>>()
+                })()
+                .map_err(|error| crate::wrap_statement_error(py, error, &sql, &row))?;
+                batch.push(values);
+            }
+            batch
+        };
+        let (client, active) = {
+            let borrowed = slf.borrow(py);
+            let client = borrowed
+                .client
+                .lock()
+                .map_err(|_| OperationalError::new_err("PostgreSQL connection lock was poisoned"))?
+                .clone()
+                .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+            (client, borrowed.active.load(Ordering::Acquire))
+        };
+        let connection = slf.clone_ref(py);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if !active {
+                client.batch_execute("BEGIN").await.map_err(map_pg_error)?;
+                Python::attach(|py| connection.borrow(py).active.store(true, Ordering::Release));
+            }
+            let statement = client.prepare(&exec_sql).await.map_err(map_pg_error)?;
+            let param_types = statement.params();
+            let mut rowcount = 0_i64;
+            for values in rows {
+                if values.len() != param_types.len() {
+                    return Err(StatementError::new_err(
+                        "Incorrect number of PostgreSQL bind parameters",
+                    ));
+                }
+                let typed_values = values
+                    .iter()
+                    .zip(param_types)
+                    .map(|(value, server_type)| {
+                        let parameter_type = if matches!(value, PgValue::Null) {
+                            server_type.clone()
+                        } else if matches!(server_type, &Type::TEXT | &Type::UNKNOWN) {
+                            value.pg_type()
+                        } else {
+                            server_type.clone()
+                        };
+                        (value as &(dyn ToSql + Sync), parameter_type)
+                    })
+                    .collect::<Vec<_>>();
+                rowcount += client
+                    .execute_typed(&exec_sql, &typed_values)
+                    .await
+                    .map_err(map_pg_error)? as i64;
+            }
+            Python::attach(|py| {
+                make_native_result(
+                    py,
+                    PgResult {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        rowcount,
+                    },
+                )
+            })
         })
     }
 
@@ -649,6 +776,36 @@ fn parse_pg_date(text: &str) -> PyResult<PgValue> {
         .map_err(|_| PyTypeError::new_err("Invalid date bind value"))
 }
 
+/// Order a parameter mapping's values by bind name for executemany rows,
+/// mirroring `extract_dict_values` for MySQL: missing keys raise SQLAlchemy's
+/// message carrying the batch's parameter group for rows after the first.
+fn extract_pg_dict_values(
+    mapping: &Bound<'_, PyDict>,
+    names: &[String],
+    parameter_group: Option<usize>,
+) -> PyResult<Vec<PgValue>> {
+    let mut entries = HashMap::new();
+    for (key, item) in mapping.iter() {
+        let name = key
+            .extract::<String>()
+            .map_err(|_| StatementError::new_err("PostgreSQL named bind keys must be strings"))?;
+        entries.insert(name, python_to_pg_value(&item)?);
+    }
+    let group = parameter_group
+        .map(|group| format!(", in parameter group {group}"))
+        .unwrap_or_default();
+    names
+        .iter()
+        .map(|name| {
+            entries.get(name).cloned().ok_or_else(|| {
+                StatementError::new_err(format!(
+                    "A value is required for bind parameter '{name}'{group}"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
     if value.is_none() {
         Ok(PgValue::Null)
@@ -668,6 +825,10 @@ fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
         Ok(PgValue::Timestamp(value.extract()?))
     } else if value.is_instance_of::<PyDate>() {
         Ok(PgValue::Date(value.extract()?))
+    } else if value.get_type().name()? == "Decimal" {
+        // Decimal binds cross as text like psycopg's adaptation; the NUMERIC
+        // binary codec parses the canonical string when the parameter sends.
+        Ok(PgValue::Decimal(value.str()?.extract()?))
     } else {
         let name = value
             .get_type()
@@ -799,6 +960,202 @@ struct PgResult {
     rowcount: i64,
 }
 
+// PostgreSQL binary NUMERIC wire format: `i16 ndigits, i16 weight, u16 sign,
+// u16 dscale` then `ndigits` base-10000 digits. `weight` is the base-10000
+// exponent of the first digit relative to the decimal point (group 0 covers
+// 10^0..10^3); `dscale` is the declared display scale. Sign codes: 0x0000
+// positive, 0x4000 negative, 0xC000 NaN, 0xD000 +Infinity, 0xF000 -Infinity.
+const NUMERIC_SIGN_POSITIVE: u16 = 0x0000;
+const NUMERIC_SIGN_NEGATIVE: u16 = 0x4000;
+const NUMERIC_SIGN_NAN: u16 = 0xC000;
+const NUMERIC_SIGN_POSITIVE_INFINITY: u16 = 0xD000;
+const NUMERIC_SIGN_NEGATIVE_INFINITY: u16 = 0xF000;
+
+type CodecResult<T> = Result<T, Box<dyn std::error::Error + Sync + Send>>;
+
+fn numeric_header(sign: u16) -> Vec<u8> {
+    let mut output = Vec::with_capacity(8);
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output.extend_from_slice(&0i16.to_be_bytes());
+    output.extend_from_slice(&sign.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    output
+}
+
+/// Encode decimal text (any `str(Decimal)` output, including `NaN`,
+/// `Infinity`, and `E`-notation) into PostgreSQL's binary NUMERIC format.
+fn encode_numeric(text: &str) -> CodecResult<Vec<u8>> {
+    let invalid = || -> Box<dyn std::error::Error + Sync + Send> {
+        format!("invalid numeric bind value: {text:?}").into()
+    };
+    let text = text.trim();
+    let (negative, body) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let upper = body.to_ascii_uppercase();
+    if upper == "NAN" || upper.starts_with("SNAN") {
+        return Ok(numeric_header(NUMERIC_SIGN_NAN));
+    }
+    if matches!(upper.as_str(), "INFINITY" | "INF") {
+        return Ok(numeric_header(if negative {
+            NUMERIC_SIGN_NEGATIVE_INFINITY
+        } else {
+            NUMERIC_SIGN_POSITIVE_INFINITY
+        }));
+    }
+    let (mantissa, exponent) = match upper.split_once('E') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().map_err(|_| invalid())?),
+        None => (upper.as_str(), 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.bytes().any(|byte| !byte.is_ascii_digit())
+        || frac_part.bytes().any(|byte| !byte.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return Err(invalid());
+    }
+    // `point` counts digits left of the decimal point after the exponent is
+    // applied; stripping leading zeros shifts it with the digit string.
+    let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    let mut point = int_part.len() as i32 + exponent;
+    let leading = digits.len() - digits.trim_start_matches('0').len();
+    digits.drain(..leading);
+    point -= leading as i32;
+    let trimmed = digits.trim_end_matches('0').len();
+    digits.truncate(trimmed);
+    let dscale = (frac_part.len() as i32 - exponent).clamp(0, i32::from(u16::MAX)) as u16;
+    if digits.is_empty() {
+        let mut output = numeric_header(NUMERIC_SIGN_POSITIVE);
+        output[6..8].copy_from_slice(&dscale.to_be_bytes());
+        return Ok(output);
+    }
+    // The most significant group holds `point mod 4` positions (4 when the
+    // point is group-aligned); later groups hold four each, zero-padding the
+    // digit string's tail when it ends mid-group.
+    let weight = (point - 1).div_euclid(4) as i16;
+    let first_len = match point.rem_euclid(4) {
+        0 => 4,
+        value => value as usize,
+    };
+    let mut groups = Vec::<u16>::new();
+    let mut index = 0_usize;
+    let mut take = first_len;
+    while index < digits.len() {
+        let end = (index + take).min(digits.len());
+        let chunk = digits[index..end].parse::<u16>().map_err(|_| invalid())?;
+        let chunk = chunk * 10_u16.pow((take - (end - index)) as u32);
+        groups.push(chunk);
+        index = end;
+        take = 4;
+    }
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    let mut output = Vec::with_capacity(8 + groups.len() * 2);
+    output.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+    output.extend_from_slice(&weight.to_be_bytes());
+    output.extend_from_slice(
+        &(if negative {
+            NUMERIC_SIGN_NEGATIVE
+        } else {
+            NUMERIC_SIGN_POSITIVE
+        })
+        .to_be_bytes(),
+    );
+    output.extend_from_slice(&dscale.to_be_bytes());
+    for digit in groups {
+        output.extend_from_slice(&digit.to_be_bytes());
+    }
+    Ok(output)
+}
+
+/// Decode PostgreSQL's binary NUMERIC format into canonical decimal text
+/// that Python `decimal.Decimal` reproduces exactly (`dscale` pads the
+/// fractional part like `numeric_out`).
+fn decode_numeric(raw: &[u8]) -> CodecResult<String> {
+    let invalid =
+        || -> Box<dyn std::error::Error + Sync + Send> { "invalid NUMERIC result encoding".into() };
+    if raw.len() < 8 {
+        return Err(invalid());
+    }
+    let ndigits = u16::from_be_bytes([raw[0], raw[1]]);
+    let weight = i16::from_be_bytes([raw[2], raw[3]]) as i32;
+    let sign = u16::from_be_bytes([raw[4], raw[5]]);
+    let dscale = u16::from_be_bytes([raw[6], raw[7]]) as usize;
+    if raw.len() != 8 + usize::from(ndigits) * 2 {
+        return Err(invalid());
+    }
+    let digits: Vec<u16> = raw[8..]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect();
+    match sign {
+        NUMERIC_SIGN_NAN => return Ok("NaN".to_owned()),
+        NUMERIC_SIGN_POSITIVE_INFINITY => return Ok("Infinity".to_owned()),
+        NUMERIC_SIGN_NEGATIVE_INFINITY => return Ok("-Infinity".to_owned()),
+        NUMERIC_SIGN_POSITIVE | NUMERIC_SIGN_NEGATIVE => {}
+        _ => return Err(invalid()),
+    }
+    // Integer part: groups with weight >= 0; the first renders unpadded and
+    // later groups render as four digits. Missing groups between the last
+    // digit and the point are zeros.
+    let mut integer = String::new();
+    for group in 0..=weight {
+        if (group as usize) < digits.len() {
+            if integer.is_empty() {
+                integer.push_str(&digits[group as usize].to_string());
+            } else {
+                integer.push_str(&format!("{:04}", digits[group as usize]));
+            }
+        } else {
+            integer.push_str("0000");
+        }
+    }
+    let integer = integer.trim_start_matches('0');
+    let mut output = if integer.is_empty() {
+        "0".to_owned()
+    } else {
+        integer.to_owned()
+    };
+    if dscale > 0 {
+        let mut fraction = String::new();
+        for group in (weight + 1)..(digits.len() as i32) {
+            if group < 0 {
+                fraction.push_str("0000");
+            } else {
+                fraction.push_str(&format!("{:04}", digits[group as usize]));
+            }
+        }
+        while fraction.len() < dscale {
+            fraction.push('0');
+        }
+        fraction.truncate(dscale);
+        output.push('.');
+        output.push_str(&fraction);
+    }
+    if sign == NUMERIC_SIGN_NEGATIVE {
+        output.insert(0, '-');
+    }
+    Ok(output)
+}
+
+/// `FromSql` adapter decoding NUMERIC columns into decimal text.
+struct PgNumeric(String);
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> CodecResult<Self> {
+        decode_numeric(raw).map(Self)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
+    }
+}
+
 fn buffer_rows(rows: &[Row], statement: &tokio_postgres::Statement) -> PyResult<PgResult> {
     let columns = statement
         .columns()
@@ -886,6 +1243,9 @@ fn row_to_value(row: &Row, index: usize, ty: &Type) -> PyResult<PgValue> {
     } else if *ty == Type::DATE {
         row.try_get::<_, Option<chrono::NaiveDate>>(index)
             .map(|v| v.map(PgValue::Date))
+    } else if *ty == Type::NUMERIC {
+        row.try_get::<_, Option<PgNumeric>>(index)
+            .map(|v| v.map(|numeric| PgValue::Decimal(numeric.0)))
     } else {
         return Err(OperationalError::new_err(
             "Unsupported PostgreSQL result type in this driver slice",
@@ -928,6 +1288,11 @@ fn pg_value_to_python(py: Python<'_>, value: PgValue) -> PyResult<Py<PyAny>> {
         PgValue::Timestamp(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
         PgValue::TimestampTz(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
         PgValue::Date(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
+        PgValue::Decimal(value) => Ok(py
+            .import("decimal")?
+            .getattr("Decimal")?
+            .call1((value,))?
+            .unbind()),
     }
 }
 
@@ -939,6 +1304,11 @@ fn map_pg_error(error: tokio_postgres::Error) -> PyErr {
         }
         if code.starts_with("42") {
             return ProgrammingError::new_err("PostgreSQL statement is invalid");
+        }
+        // SQLSTATE class 22 covers data exceptions such as numeric field
+        // overflow; the server detail identifies the failing coercion.
+        if code.starts_with("22") {
+            return DataError::new_err(database_error.message().to_owned());
         }
     }
     OperationalError::new_err("PostgreSQL operation failed")

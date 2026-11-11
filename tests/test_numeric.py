@@ -535,12 +535,16 @@ def test_mapped_decimal_infers_numeric_and_hydrates() -> None:
 
 
 def _live_tables(suffix: str) -> tuple[MetaData, Table, sa.Table]:
-    """One wide table: unbounded + (20,6) + (10,2) + overflow-check (5,2)."""
+    """One wide table per engine: unbounded + (20,6) + (10,2) + overflow (5,2).
+
+    The Catalyst and SQLAlchemy tables get distinct names so each engine
+    inserts into its own physical table — identical explicit primary keys
+    would otherwise collide on the second engine's insert.
+    """
     assert Numeric is not None
-    name = f"gt_num_{suffix}"
     metadata = MetaData()
     table = Table(
-        name,
+        f"gt_num_cat_{suffix}",
         metadata,
         Column("id", Integer, primary_key=True),
         Column("n", Numeric),
@@ -549,7 +553,7 @@ def _live_tables(suffix: str) -> tuple[MetaData, Table, sa.Table]:
         Column("o", Numeric(5, 2)),
     )
     sa_table = sa.Table(
-        name,
+        f"gt_num_sa_{suffix}",
         sa.MetaData(),
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("n", sa.Numeric),
@@ -610,7 +614,7 @@ async def test_mysql_numeric_ddl_and_catalog(mysql_pair: tuple[Any, Any, str]) -
     _, table, sa_table = await _mysql_create(catalyst_engine, sa_engine, suffix)
     assert table.compile_ddl(dialect="mysql").string == str(
         sa.schema.CreateTable(sa_table).compile(dialect=sa_mysql_dialect.pymysql.dialect())
-    )
+    ).replace(sa_table.name, table.name)
     query = sa.text(
         "SELECT column_name, data_type, numeric_precision, numeric_scale "
         "FROM information_schema.columns "
@@ -621,7 +625,7 @@ async def test_mysql_numeric_ddl_and_catalog(mysql_pair: tuple[Any, Any, str]) -
         rows = [
             tuple(item) for item in (await connection.execute(query, {"name": table.name})).all()
         ]
-    # Both engines' tables share the name; the catalog reflects MySQL's view.
+    # The catalog reflects MySQL's view of the Catalyst-created table.
     assert rows == [
         ("id", "int", 10, 0),
         ("n", "decimal", 10, 0),
@@ -774,7 +778,10 @@ async def test_mysql_numeric_executemany(mysql_pair: tuple[Any, Any, str]) -> No
     assert Numeric is not None
     catalyst_engine, sa_engine, suffix = mysql_pair
     _, table, sa_table = await _mysql_create(catalyst_engine, sa_engine, suffix)
-    rows = [{"id": i, "p": D(f"{i}.5"), "s": D(f"{i}.25")} for i in range(3)]
+    # ``id`` starts at 1: inserting 0 into the AUTO_INCREMENT primary key
+    # auto-assigns 1 and collides with the explicit id=1 — verified to fail
+    # under pure SQLAlchemy+asyncmy as well.
+    rows = [{"id": i, "p": D(f"{i}.5"), "s": D(f"{i}.25")} for i in range(1, 4)]
     async with catalyst_engine.begin() as connection:
         catalyst_result = await connection.execute(insert(table), rows)
         catalyst_rows = (
@@ -793,9 +800,9 @@ async def test_mysql_numeric_executemany(mysql_pair: tuple[Any, Any, str]) -> No
     assert catalyst_result.rowcount == sa_result.rowcount == 3
     assert catalyst_rows == sa_rows
     assert catalyst_rows == [
-        (D("0.500000"), D("0.25")),
         (D("1.500000"), D("1.25")),
         (D("2.500000"), D("2.25")),
+        (D("3.500000"), D("3.25")),
     ]
 
 
@@ -815,7 +822,8 @@ async def pg_pair() -> AsyncIterator[tuple[Any, Any, str]]:
         yield catalyst_engine, sa_engine, suffix
     finally:
         async with sa_engine.begin() as connection:
-            await connection.execute(sa.text(f'DROP TABLE IF EXISTS "gt_num_{suffix}"'))
+            await connection.execute(sa.text(f'DROP TABLE IF EXISTS "gt_num_cat_{suffix}"'))
+            await connection.execute(sa.text(f'DROP TABLE IF EXISTS "gt_num_sa_{suffix}"'))
         await sa_engine.dispose()
         await catalyst_engine.dispose()
 
@@ -841,7 +849,7 @@ async def test_pg_numeric_ddl_and_catalog(pg_pair: tuple[Any, Any, str]) -> None
     _, table, sa_table = await _pg_create(catalyst_engine, sa_engine, suffix)
     assert table.compile_ddl(dialect="postgresql").string == str(
         sa.schema.CreateTable(sa_table).compile(dialect=sa_pg_dialect.dialect())
-    )
+    ).replace(sa_table.name, table.name)
     query = sa.text(
         "SELECT column_name, data_type, numeric_precision, numeric_scale "
         "FROM information_schema.columns WHERE table_name = :name "
@@ -1067,7 +1075,10 @@ async def test_pg_numeric_executemany(pg_pair: tuple[Any, Any, str]) -> None:
                 )
             ).all()
         ]
-    assert catalyst_result.rowcount == sa_result.rowcount == 3
+    # psycopg reports rowcount -1 for executemany (driver limitation,
+    # verified); Catalyst reports the true aggregate.
+    assert catalyst_result.rowcount == 3
+    assert sa_result.rowcount == -1
     assert catalyst_rows == sa_rows
     assert catalyst_rows == [
         (D("0.5"), D("0.25")),

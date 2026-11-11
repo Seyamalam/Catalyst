@@ -11,7 +11,9 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDate, PyDateTime, PyDict, PyFloat, PyInt, PyList, PyString};
 
-use crate::{IntegrityError, NativeResult, OperationalError, ProgrammingError, StatementError};
+use crate::{
+    DataError, IntegrityError, NativeResult, OperationalError, ProgrammingError, StatementError,
+};
 
 type MysqlTypeMetadata = (Vec<Option<String>>, Vec<String>, Vec<Option<String>>);
 
@@ -915,7 +917,22 @@ fn extract_parameters(
     let value = parameters.bind(py);
     if let Ok(mapping) = value.cast::<PyDict>() {
         if text_mode {
-            let (rendered, names) = scan_named_binds(sql)?;
+            // asyncmy has no typed parameters: it escapes Decimal values into
+            // the statement text, so `SELECT :n` with `Decimal('3.14')` runs
+            // as `SELECT 3.14` and comes back as a server-side DECIMAL. A
+            // non-finite Decimal inlines as a bare identifier and surfaces
+            // the same error 1054 the server gives asyncmy.
+            let (rendered, names) = scan_named_binds_inner(sql, &mut |name| {
+                mapping.get_item(name).ok().flatten().and_then(|value| {
+                    value
+                        .get_type()
+                        .name()
+                        .map(|name| name == "Decimal")
+                        .unwrap_or(false)
+                        .then(|| value.str().ok().map(|text| text.to_string()))
+                        .flatten()
+                })
+            })?;
             let ordered = extract_dict_values(mapping, &names, None)?;
             Ok((rendered, ordered))
         } else {
@@ -1180,6 +1197,17 @@ fn is_mysql_word_byte(byte: u8) -> bool {
 /// MySQL renders positional `?` parameters and additionally skips backtick
 /// quoted identifiers and `#` comments (dollar-quoting does not exist).
 fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
+    scan_named_binds_inner(sql, &mut |_| None)
+}
+
+/// Scanner shared by `scan_named_binds` that lets a caller inline a SQL
+/// literal for selected binds (for example Decimal values, which MySQL's
+/// protocol layer has no dedicated parameter type for — asyncmy escapes
+/// them into the statement the same way).
+fn scan_named_binds_inner(
+    sql: &str,
+    literal: &mut dyn FnMut(&str) -> Option<String>,
+) -> PyResult<(String, Vec<String>)> {
     let bytes = sql.as_bytes();
     let mut output = String::with_capacity(sql.len());
     let mut names = Vec::<String>::new();
@@ -1241,11 +1269,15 @@ fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
                 index += 1;
             }
             let name = &sql[start..index];
-            if !indexes.contains_key(name) {
-                names.push(name.to_owned());
-                indexes.insert(name.to_owned(), names.len());
+            if let Some(text) = literal(name) {
+                output.push_str(&text);
+            } else {
+                if !indexes.contains_key(name) {
+                    names.push(name.to_owned());
+                    indexes.insert(name.to_owned(), names.len());
+                }
+                output.push('?');
             }
-            output.push('?');
         } else {
             let character = sql[index..]
                 .chars()
@@ -1266,8 +1298,18 @@ fn map_mysql_error(error: mysql_async::Error) -> PyErr {
         ) {
             return IntegrityError::new_err("MySQL integrity constraint failed");
         }
-        if matches!(server.code, 1046 | 1054 | 1064 | 1142 | 1146 | 1241) {
+        // asyncmy maps out-of-range values (1264) to DataError; the server
+        // message names the column and the overflow detail.
+        if server.code == 1264 {
+            return DataError::new_err(format!("({}) {}", server.code, server.message));
+        }
+        if matches!(server.code, 1046 | 1064 | 1142 | 1146 | 1241) {
             return ProgrammingError::new_err("MySQL statement is invalid");
+        }
+        // asyncmy classifies unknown columns (1054) and statement-level
+        // failures as OperationalError rather than ProgrammingError.
+        if server.code == 1054 {
+            return OperationalError::new_err(format!("({}) {}", server.code, server.message));
         }
     }
     OperationalError::new_err("MySQL operation failed")

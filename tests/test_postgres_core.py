@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from catalyst import (
-    ArgumentError,
     Boolean,
     Column,
     Date,
@@ -291,12 +290,24 @@ async def test_pg_empty_insert_and_integrity_error_parity(pg_pair: tuple[Any, An
             await connection.execute(sa.insert(sa_table).values(id=1))
 
 
-async def test_pg_executemany_not_supported_yet(pg_pair: tuple[Any, Any, str]) -> None:
-    catalyst_engine, _, suffix = pg_pair
-    _, table, _ = _tables(suffix)
+async def test_pg_executemany_insert_batch_rowcount_and_rows(
+    pg_pair: tuple[Any, Any, str],
+) -> None:
+    # psycopg reports -1 INSERT rowcounts; Catalyst reports the true count.
+    catalyst_engine, sa_engine, suffix = pg_pair
+    metadata, table, sa_table = _tables(suffix)
+    await metadata.create_all(catalyst_engine)
+    async with sa_engine.begin() as connection:
+        await connection.run_sync(sa_table.metadata.create_all)
+    rows = [{"id": i, "name": f"v{i}", "score": float(i)} for i in range(1, 4)]
+    async with catalyst_engine.begin() as connection:
+        result = await connection.execute(insert(table), rows)
+    assert result.rowcount == 3
     async with catalyst_engine.connect() as connection:
-        with pytest.raises(ArgumentError, match="executemany"):
-            await connection.execute(insert(table), [{"id": 1}, {"id": 2}])
+        actual = (
+            await connection.execute(select(table.c.id, table.c.name).order_by(table.c.id))
+        ).all()
+    assert actual == [(1, "v1"), (2, "v2"), (3, "v3")]
 
 
 async def test_pg_ddl_catalog_matches_sqlalchemy(pg_pair: tuple[Any, Any, str]) -> None:

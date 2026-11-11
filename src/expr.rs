@@ -1440,11 +1440,11 @@ fn optional_string_at(value: &Bound<'_, PyAny>, index: usize) -> PyResult<Option
     }
 }
 
-fn parse_expr(value: &Bound<'_, PyAny>) -> PyResult<Expr> {
-    parse_expr_at_depth(value, 0)
+fn parse_expr(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<Expr> {
+    parse_expr_at_depth(value, dialect, 0)
 }
 
-fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr> {
+fn parse_expr_at_depth(value: &Bound<'_, PyAny>, dialect: Dialect, depth: usize) -> PyResult<Expr> {
     if depth >= 2000 {
         return Err(ArgumentError::new_err("expression nesting too deep"));
     }
@@ -1467,6 +1467,12 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
                 Ok(Expr::Boolean(literal.extract()?))
             } else {
                 let converted = match type_tag.as_deref() {
+                    // Decimal literals cross to the drivers as text so
+                    // PostgreSQL/MySQL keep full numeric precision; SQLite
+                    // binds Numeric through float() like SQLAlchemy does.
+                    Some(tag) if tag.starts_with("numeric") && dialect != Dialect::Sqlite => {
+                        crate::python_to_numeric_text(&literal)
+                    }
                     Some(tag) => crate::python_to_sqlite_typed(&literal, Some(tag)),
                     None => python_to_sqlite(&literal),
                 };
@@ -1495,9 +1501,9 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
         }
         "boolean_word" => Ok(Expr::BooleanWord(item(value, 1)?.extract()?)),
         "binary" => {
-            let left = parse_expr_at_depth(&item(value, 1)?, child_depth)?;
+            let left = parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?;
             let operator = string_at(value, 2)?;
-            let right = parse_expr_at_depth(&item(value, 3)?, child_depth)?;
+            let right = parse_expr_at_depth(&item(value, 3)?, dialect, child_depth)?;
             // SQLAlchemy's SQLite Boolean comparator renders typed boolean
             // constants inline as 1/0 rather than allocating a bind.
             let right = match right {
@@ -1514,18 +1520,19 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             if name == "and" { "AND" } else { "OR" }.to_owned(),
             seq(&item(value, 1)?)?
                 .iter()
-                .map(|child| parse_expr_at_depth(child, child_depth))
+                .map(|child| parse_expr_at_depth(child, dialect, child_depth))
                 .collect::<PyResult<Vec<_>>>()?,
         )),
         "not" => Ok(Expr::Not(Box::new(parse_expr_at_depth(
             &item(value, 1)?,
+            dialect,
             child_depth,
         )?))),
         "in" | "not_in" => {
-            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?);
+            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?);
             let members = seq(&item(value, 2)?)?
                 .iter()
-                .map(|child| parse_expr_at_depth(child, child_depth))
+                .map(|child| parse_expr_at_depth(child, dialect, child_depth))
                 .collect::<PyResult<Vec<_>>>()?;
             if name == "in" {
                 Ok(Expr::In(left, members))
@@ -1534,12 +1541,12 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             }
         }
         "is" | "is_not" => Ok(Expr::IsNull(
-            Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?),
+            Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?),
             name == "is_not",
         )),
         "is_scalar" | "is_not_scalar" => {
-            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?);
-            let right = Box::new(parse_expr_at_depth(&item(value, 2)?, child_depth)?);
+            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?);
+            let right = Box::new(parse_expr_at_depth(&item(value, 2)?, dialect, child_depth)?);
             // IS TRUE/FALSE is a grammar production, not a bind: typed boolean
             // literals render inline like the binary-operator arm.
             let right = Box::new(match *right {
@@ -1557,8 +1564,8 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             }
         }
         "like_escape" | "not_like_escape" => {
-            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?);
-            let right = Box::new(parse_expr_at_depth(&item(value, 2)?, child_depth)?);
+            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?);
+            let right = Box::new(parse_expr_at_depth(&item(value, 2)?, dialect, child_depth)?);
             let escape = string_at(value, 3)?;
             if name == "like_escape" {
                 Ok(Expr::LikeEscape(left, right, escape))
@@ -1567,9 +1574,9 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             }
         }
         "between" | "not_between" => {
-            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?);
-            let low = Box::new(parse_expr_at_depth(&item(value, 2)?, child_depth)?);
-            let high = Box::new(parse_expr_at_depth(&item(value, 3)?, child_depth)?);
+            let left = Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?);
+            let low = Box::new(parse_expr_at_depth(&item(value, 2)?, dialect, child_depth)?);
+            let high = Box::new(parse_expr_at_depth(&item(value, 3)?, dialect, child_depth)?);
             if name == "between" {
                 Ok(Expr::Between(left, low, high))
             } else {
@@ -1580,15 +1587,16 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
             string_at(value, 1)?,
             seq(&item(value, 2)?)?
                 .iter()
-                .map(|child| parse_expr_at_depth(child, child_depth))
+                .map(|child| parse_expr_at_depth(child, dialect, child_depth))
                 .collect::<PyResult<Vec<_>>>()?,
         )),
         "order" => Ok(Expr::Order(
-            Box::new(parse_expr_at_depth(&item(value, 1)?, child_depth)?),
+            Box::new(parse_expr_at_depth(&item(value, 1)?, dialect, child_depth)?),
             item(value, 2)?.extract()?,
         )),
         "neg" => Ok(Expr::Neg(Box::new(parse_expr_at_depth(
             &item(value, 1)?,
+            dialect,
             child_depth,
         )?))),
         _ => Err(ArgumentError::new_err(format!(
@@ -1597,18 +1605,46 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr>
     }
 }
 
-fn parse_values(value: &Bound<'_, PyAny>) -> PyResult<Vec<(String, Expr)>> {
+fn parse_values(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<Vec<(String, Expr)>> {
     let dict = value.cast::<PyDict>()?;
     let mut result = Vec::new();
     for (key, value) in dict.iter() {
-        result.push((key.extract()?, parse_expr(&value)?));
+        result.push((key.extract()?, parse_expr(&value, dialect)?));
     }
     Ok(result)
 }
 
+/// Column type arguments as serialized by ``_type_node``: a length for
+/// `String(n)` or a `(precision, scale)` pair for `Numeric(p, s)`.
+enum TypeArgs {
+    None,
+    Length(u64),
+    Numeric(Option<u64>, Option<u64>),
+}
+
+impl TypeArgs {
+    fn length(&self) -> Option<u64> {
+        match self {
+            Self::Length(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
 /// Map a Python type-marker tag to its DDL type name (SQLAlchemy's type
 /// compiler rendering for the equivalent type in the target dialect).
-fn render_type_name(tag: &str, length: Option<u64>, dialect: Dialect) -> PyResult<String> {
+fn render_type_name(tag: &str, args: &TypeArgs, dialect: Dialect) -> PyResult<String> {
+    // NUMERIC renders identically across all three dialects.
+    if tag == "numeric" {
+        return Ok(match args {
+            TypeArgs::Numeric(Some(precision), Some(scale)) => {
+                format!("NUMERIC({precision}, {scale})")
+            }
+            TypeArgs::Numeric(Some(precision), None) => format!("NUMERIC({precision})"),
+            _ => "NUMERIC".to_owned(),
+        });
+    }
+    let length = args.length();
     if dialect.is_postgres() {
         return match tag {
             "integer" => Ok("INTEGER".to_owned()),
@@ -1666,11 +1702,13 @@ fn render_type_name(tag: &str, length: Option<u64>, dialect: Dialect) -> PyResul
 fn parse_column_def(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<ColumnDdl> {
     let name = string_at(value, 0)?;
     let type_tag = string_at(value, 1)?;
-    let length_value = item(value, 2)?;
-    let length = if length_value.is_none() {
-        None
+    let args_value = item(value, 2)?;
+    let args = if args_value.is_none() {
+        TypeArgs::None
+    } else if let Ok((precision, scale)) = args_value.extract::<(Option<u64>, Option<u64>)>() {
+        TypeArgs::Numeric(precision, scale)
     } else {
-        Some(length_value.extract::<u64>()?)
+        TypeArgs::Length(args_value.extract::<u64>()?)
     };
     let not_null = item(value, 3)?.extract()?;
     let unique = item(value, 4)?.extract()?;
@@ -1682,7 +1720,7 @@ fn parse_column_def(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<Colu
     };
     Ok(ColumnDdl {
         name,
-        type_name: render_type_name(&type_tag, length, dialect)?,
+        type_name: render_type_name(&type_tag, &args, dialect)?,
         not_null,
         unique,
         default,
@@ -1695,7 +1733,7 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
         "select" => {
             let columns = seq(&item(value, 1)?)?
                 .iter()
-                .map(parse_expr)
+                .map(|node| parse_expr(node, dialect))
                 .collect::<PyResult<Vec<_>>>()?;
             let table_value = item(value, 2)?;
             let table = if table_value.is_none() {
@@ -1707,23 +1745,23 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
             let predicate = if predicate_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&predicate_value)?)
+                Some(parse_expr(&predicate_value, dialect)?)
             };
             let order = seq(&item(value, 4)?)?
                 .iter()
-                .map(parse_expr)
+                .map(|node| parse_expr(node, dialect))
                 .collect::<PyResult<Vec<_>>>()?;
             let limit_value = item(value, 5)?;
             let limit = if limit_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&limit_value)?)
+                Some(parse_expr(&limit_value, dialect)?)
             };
             let offset_value = item(value, 6)?;
             let offset = if offset_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&offset_value)?)
+                Some(parse_expr(&offset_value, dialect)?)
             };
             Ok(Statement::Select {
                 columns,
@@ -1736,17 +1774,17 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
         }
         "insert" => Ok(Statement::Insert {
             table: string_at(value, 1)?,
-            values: parse_values(&item(value, 2)?)?,
+            values: parse_values(&item(value, 2)?, dialect)?,
         }),
         "update" => {
             let predicate = item(value, 3)?;
             Ok(Statement::Update {
                 table: string_at(value, 1)?,
-                values: parse_values(&item(value, 2)?)?,
+                values: parse_values(&item(value, 2)?, dialect)?,
                 predicate: if predicate.is_none() {
                     None
                 } else {
-                    Some(parse_expr(&predicate)?)
+                    Some(parse_expr(&predicate, dialect)?)
                 },
             })
         }
@@ -1757,7 +1795,7 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
                 predicate: if predicate.is_none() {
                     None
                 } else {
-                    Some(parse_expr(&predicate)?)
+                    Some(parse_expr(&predicate, dialect)?)
                 },
             })
         }

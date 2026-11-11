@@ -84,6 +84,13 @@ create_exception!(
 
 create_exception!(
     _catalyst,
+    DataError,
+    DatabaseError,
+    "Raised when a database operation fails because of invalid data values."
+);
+
+create_exception!(
+    _catalyst,
     TimeoutError,
     SQLAlchemyError,
     "Raised when a connection pool checkout times out or is exhausted."
@@ -447,6 +454,7 @@ impl NativeConnection {
         let rows = Python::attach(|py| {
             let builtins = py.import("builtins")?;
             let datetime = py.import("datetime")?;
+            let decimal = py.import("decimal")?;
             buffered_rows
                 .into_iter()
                 .map(|row| {
@@ -459,6 +467,7 @@ impl NativeConnection {
                                 result_types.get(index).and_then(Option::as_deref),
                                 &builtins,
                                 &datetime,
+                                &decimal,
                             )
                         })
                         .collect::<PyResult<Vec<_>>>()
@@ -834,18 +843,121 @@ fn sqlite_to_python(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     })
 }
 
+/// Options packed into a `numeric` type tag by the Python markers:
+/// `numeric[:precision[:scale[:decimal_return_scale[:asdecimal]]]]` where `-`
+/// marks an unset field and the bare `numeric` tag means class defaults.
+pub(crate) struct NumericTag {
+    scale: Option<usize>,
+    decimal_return_scale: Option<usize>,
+    asdecimal: bool,
+}
+
+impl NumericTag {
+    /// SQLAlchemy's effective SQLite return scale: `decimal_return_scale`,
+    /// then column `scale`, then the default 10.
+    fn return_scale(&self) -> usize {
+        self.decimal_return_scale.or(self.scale).unwrap_or(10)
+    }
+}
+
+pub(crate) fn parse_numeric_tag(tag: &str) -> Option<NumericTag> {
+    let rest = tag.strip_prefix("numeric")?;
+    if rest.is_empty() {
+        return Some(NumericTag {
+            scale: None,
+            decimal_return_scale: None,
+            asdecimal: true,
+        });
+    }
+    let mut parts = rest.strip_prefix(':')?.split(':');
+    let mut field = || {
+        parts
+            .next()
+            .and_then(|raw| (raw != "-").then(|| raw.parse::<usize>().ok()).flatten())
+    };
+    let _precision = field();
+    let scale = field();
+    let decimal_return_scale = field();
+    let asdecimal = !matches!(parts.next(), Some("0"));
+    Some(NumericTag {
+        scale,
+        decimal_return_scale,
+        asdecimal,
+    })
+}
+
+/// SQLAlchemy's SQLite Numeric result processing: REAL values render as
+/// `Decimal("%.<eff>f" % value)` where `<eff>` is the effective return scale,
+/// and non-REAL storage passes through `Decimal(value)` (matching
+/// SQLAlchemy's float check for INTEGER/TEXT storage).
+fn sqlite_numeric_to_python(
+    py: Python<'_>,
+    value: Value,
+    numeric: &NumericTag,
+    decimal: &Bound<'_, PyModule>,
+) -> PyResult<Py<PyAny>> {
+    if !numeric.asdecimal {
+        return sqlite_to_python(py, value);
+    }
+    match value {
+        Value::Real(number) => {
+            // Rust's `{:.N}` matches CPython's `%.Nf` formatting exactly.
+            let rendered = format!("{:.*}", numeric.return_scale(), number);
+            Ok(decimal.getattr("Decimal")?.call1((rendered,))?.unbind())
+        }
+        other => {
+            let scalar = sqlite_to_python(py, other)?;
+            Ok(decimal.getattr("Decimal")?.call1((scalar,))?.unbind())
+        }
+    }
+}
+
+/// Convert a Numeric bind literal for PostgreSQL/MySQL compilation. The value
+/// is carried as text so full decimal precision survives the FFI boundary;
+/// each driver coerces it into the wire DECIMAL/NUMERIC parameter.
+pub(crate) fn python_to_numeric_text(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if value.is_none() {
+        return Ok(Value::Null);
+    }
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "Numeric type does not accept boolean bind values",
+        ));
+    }
+    if value.is_instance_of::<PyFloat>()
+        || value.is_instance_of::<PyInt>()
+        || value.is_instance_of::<PyString>()
+        || value.get_type().name()? == "Decimal"
+    {
+        return Ok(Value::Text(value.str()?.to_string()));
+    }
+    if value.is_instance_of::<PyBytes>() {
+        let text = String::from_utf8(value.extract::<Vec<u8>>()?)
+            .map_err(|_| PyTypeError::new_err("Numeric bind bytes must be UTF-8 text"))?;
+        return Ok(Value::Text(text));
+    }
+    Err(PyTypeError::new_err(format!(
+        "Numeric bind value must be a number or numeric string, not {:?}",
+        value
+    )))
+}
+
 fn sqlite_to_python_typed(
     py: Python<'_>,
     value: Value,
     type_tag: Option<&str>,
     builtins: &Bound<'_, PyModule>,
     datetime: &Bound<'_, PyModule>,
+    decimal: &Bound<'_, PyModule>,
 ) -> PyResult<Py<PyAny>> {
     let Some(type_tag) = type_tag else {
         return sqlite_to_python(py, value);
     };
     if value == Value::Null {
         return Ok(py.None());
+    }
+    if let Some(numeric) = parse_numeric_tag(type_tag) {
+        return sqlite_numeric_to_python(py, value, &numeric, decimal);
     }
     let scalar = sqlite_to_python(py, value)?;
     let value = scalar.bind(py);
@@ -927,6 +1039,22 @@ pub(crate) fn python_to_sqlite_typed(
                 )));
             }
             Ok(Value::Integer(integer))
+        }
+        tag if tag.starts_with("numeric") => {
+            // SQLAlchemy binds Numeric through `float(value)` on SQLite for
+            // every input type regardless of `asdecimal`; NaN stores as NULL
+            // and +/-Infinity as REAL extremes like sqlite3.
+            let number = if value.is_instance_of::<PyFloat>() {
+                value.extract::<f64>()?
+            } else {
+                value
+                    .py()
+                    .import("builtins")?
+                    .getattr("float")?
+                    .call1((value,))?
+                    .extract::<f64>()?
+            };
+            Ok(Value::Real(number))
         }
         "integer" => python_to_sqlite(value),
         "float" | "double" => {
@@ -1314,6 +1442,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "OperationalError",
         module.py().get_type::<OperationalError>(),
     )?;
+    module.add("DataError", module.py().get_type::<DataError>())?;
     module.add("TimeoutError", module.py().get_type::<TimeoutError>())?;
     module.add(
         "InvalidRequestError",
@@ -1341,6 +1470,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "IntegrityError",
             "ProgrammingError",
             "OperationalError",
+            "DataError",
             "TimeoutError",
             "InvalidRequestError",
             "sqlite_text",

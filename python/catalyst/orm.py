@@ -9,6 +9,7 @@ through :meth:`NativeResult.hydrate`, keeping one FFI crossing per batch.
 from __future__ import annotations
 
 import datetime
+import decimal
 import types
 import typing
 from collections.abc import Callable
@@ -41,6 +42,7 @@ from .expression import (
     Integer,
     LargeBinary,
     MetaData,
+    Numeric,
     Select,
     String,
     Table,
@@ -138,6 +140,7 @@ _TYPE_MARKERS: dict[type[object], type[object]] = {
     float: Double,
     str: String,
     bytes: LargeBinary,
+    decimal.Decimal: Numeric,
     datetime.datetime: DateTime,
     datetime.date: Date,
 }

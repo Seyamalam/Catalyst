@@ -14,6 +14,7 @@ __all__ = [
     "IntegrityError",
     "ProgrammingError",
     "OperationalError",
+    "DataError",
     "TimeoutError",
     "InvalidRequestError",
     "sqlite_text",
@@ -166,6 +167,14 @@ class NativePgConnection:
         statement_kind: str | None = ...,
         type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
     ) -> Awaitable[NativeResult]: ...
+    def async_executemany(
+        self,
+        sql: str,
+        parameters: list[object],
+        text_mode: bool,
+        statement_kind: str | None = ...,
+        type_metadata: tuple[list[str | None], list[str], list[str | None]] | None = ...,
+    ) -> Awaitable[NativeResult]: ...
     def async_has_table(self, name: str) -> Awaitable[bool]: ...
     def async_transaction(self, operation: str) -> Awaitable[None]: ...
     def async_begin_savepoint(self) -> Awaitable[str]: ...
@@ -213,6 +222,9 @@ class ProgrammingError(DatabaseError):
 
 class OperationalError(DatabaseError):
     """Database operation failure, such as a connection error."""
+
+class DataError(DatabaseError):
+    """Invalid data values detected by the database."""
 
 class TimeoutError(CatalystError):
     """Connection pool checkout timed out or was exhausted."""

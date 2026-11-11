@@ -163,6 +163,22 @@ class LargeBinary(TypeEngine):
     pass
 
 
+class Numeric(TypeEngine):
+    """Fixed-point decimal type marker, mirroring ``sqlalchemy.Numeric``."""
+
+    def __init__(
+        self,
+        precision: int | None = None,
+        scale: int | None = None,
+        decimal_return_scale: int | None = None,
+        asdecimal: bool = True,
+    ) -> None:
+        self.precision = precision
+        self.scale = scale
+        self.decimal_return_scale = decimal_return_scale
+        self.asdecimal = asdecimal
+
+
 @dataclass(frozen=True, slots=True)
 class Column:
     name: str
@@ -533,12 +549,30 @@ _TYPE_TAGS = {
     "DateTime": "datetime",
     "Date": "date",
     "LargeBinary": "binary",
+    "Numeric": "numeric",
 }
+
+
+def _numeric_field(value: int | None) -> str:
+    return "-" if value is None else str(value)
 
 
 def _column_type_tag(type_obj: object) -> str | None:
     marker = type_obj if isinstance(type_obj, type) else type(type_obj)
-    return _TYPE_TAGS.get(marker.__name__)
+    tag = _TYPE_TAGS.get(marker.__name__)
+    if tag == "numeric" and isinstance(type_obj, Numeric):
+        # The type's processing options ride along in the tag so compiled
+        # bind/result metadata carries them into the native drivers.
+        return ":".join(
+            (
+                "numeric",
+                _numeric_field(type_obj.precision),
+                _numeric_field(type_obj.scale),
+                _numeric_field(type_obj.decimal_return_scale),
+                "1" if type_obj.asdecimal else "0",
+            )
+        )
+    return tag
 
 
 def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
@@ -567,6 +601,16 @@ def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
             and not isinstance(value, (bool, complex))
             else None
         )
+    if type_tag.startswith("numeric"):
+        from decimal import Decimal
+        from numbers import Number
+
+        return (
+            type_tag
+            if (isinstance(value, (Number, Decimal, str, bytes)))
+            and not isinstance(value, (bool, complex))
+            else None
+        )
     if type_tag in {"string", "text"}:
         return type_tag if isinstance(value, str) else None
     if type_tag == "binary":
@@ -574,14 +618,17 @@ def _comparison_type_tag(value: object, type_tag: str | None) -> str | None:
     return None
 
 
-def _type_node(type_obj: object) -> tuple[str, int | None]:
-    """Map a Catalyst type marker to the native DDL type tag and length."""
+def _type_node(type_obj: object) -> tuple[str, object]:
+    """Map a Catalyst type marker to the native DDL type tag and its args."""
     marker = type_obj if isinstance(type_obj, type) else type(type_obj)
     tag = _TYPE_TAGS.get(marker.__name__)
     if tag is None:
         raise ArgumentError(f"Unsupported DDL column type '{marker.__name__}'")
-    length = None if isinstance(type_obj, type) else getattr(type_obj, "length", None)
-    return tag, length
+    if isinstance(type_obj, type):
+        return tag, None
+    if isinstance(type_obj, Numeric):
+        return tag, (type_obj.precision, type_obj.scale)
+    return tag, getattr(type_obj, "length", None)
 
 
 def _is_nullable(column: Column) -> bool:

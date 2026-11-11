@@ -21,6 +21,19 @@ class DateTime(TypeEngine): ...
 class Date(TypeEngine): ...
 class LargeBinary(TypeEngine): ...
 
+class Numeric(TypeEngine):
+    precision: int | None
+    scale: int | None
+    decimal_return_scale: int | None
+    asdecimal: bool
+    def __init__(
+        self,
+        precision: int | None = ...,
+        scale: int | None = ...,
+        decimal_return_scale: int | None = ...,
+        asdecimal: bool = ...,
+    ) -> None: ...
+
 @final
 class Column:
     __match_args__: tuple[str, ...]
