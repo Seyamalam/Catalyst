@@ -36,6 +36,7 @@ from typing import (
     Any,
     ClassVar,
     Generic,
+    NamedTuple,
     SupportsIndex,
     TypeVar,
     cast,
@@ -266,6 +267,32 @@ class Mapper(Generic[_T]):
         # This mapper plus every descendant, in registration order — the
         # identity subtree used by subclass SELECT/bulk-DML filters.
         self.self_and_descendants: list[Mapper[Any]] = [self]
+        # Joined-table inheritance shape. ``table_levels`` lists the distinct
+        # tables in the hierarchy chain root->leaf (one entry for ordinary
+        # and STI mappers); ``select_*`` describes a whole-entity SELECT —
+        # for JTI the root table leads the FROM with inner joins down the
+        # chain and the columns/attrs pairs follow SQLAlchemy's ordering
+        # (PK columns leaf->root, then non-PK columns root->leaf).
+        self.table_levels: tuple[_TableLevel, ...] = ()
+        self.select_columns: tuple[Column, ...] = tuple(self.attr_columns.values())
+        self.select_attrs: tuple[str, ...] = attrs
+        self.select_from: Table = table
+        self.select_joins: tuple[tuple[object, ...], ...] = ()
+
+
+class _TableLevel(NamedTuple):
+    """One distinct table in an inheritance chain's DML/SELECT layout."""
+
+    table: Table
+    # The table's own primary-key column (its join key for JTI).
+    pk_column: Column | None
+    # Attribute name bound to ``pk_column`` at this level.
+    pk_attr: str | None
+    # Non-PK mapped attributes whose columns live on this table.
+    attrs: tuple[str, ...]
+    # For non-root levels: this table's column that joins to the previous
+    # level (the PK/FK column under SQLAlchemy's JTI convention).
+    join_column: Column | None
 
 
 # -- relationships ---------------------------------------------------------
@@ -698,8 +725,11 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
     target_mapper = cast("Mapper[Any] | None", getattr(target, "__mapper__", None))
     if not isinstance(target_mapper, Mapper):
         return False
-    table = mapper.local_table
-    target_table = target_mapper.local_table
+    # FK inference searches every inheritance-table level: relationships
+    # conventionally reference the hierarchy root, but a joined-table child
+    # can also carry the foreign key.
+    local_names = {level.table.name for level in mapper.table_levels}
+    target_names = {level.table.name for level in target_mapper.table_levels}
     secondary: object = decl.secondary
     if secondary is not None:
         # A string ``secondary`` resolves against the declaring mapper's
@@ -718,13 +748,15 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
         return _configure_secondary(decl, mapper, target, target_mapper, secondary)
     a_fks = [
         column
-        for column in table.columns
-        if column.foreign_key is not None and column.foreign_key.target_table == target_table.name
+        for level in mapper.table_levels
+        for column in level.table.columns
+        if column.foreign_key is not None and column.foreign_key.target_table in target_names
     ]
     b_fks = [
         column
-        for column in target_table.columns
-        if column.foreign_key is not None and column.foreign_key.target_table == table.name
+        for level in target_mapper.table_levels
+        for column in level.table.columns
+        if column.foreign_key is not None and column.foreign_key.target_table in local_names
     ]
     if a_fks and b_fks:
         raise ArgumentError(
@@ -877,9 +909,13 @@ def _configure_secondary(
         raise ArgumentError(f"'{mapper.class_.__name__}' has no primary key")
     if target_mapper.pk_column is None or target_mapper.pk_attr is None:
         raise ArgumentError(f"Target '{target.__name__}' has no primary key")
-    prop.local_col = mapper.pk_column
+    # Association foreign keys conventionally target each hierarchy's root
+    # table, so the join columns are the root-level primary keys.
+    local_pk = cast("Column", mapper.table_levels[0].pk_column or mapper.pk_column)
+    remote_pk = cast("Column", target_mapper.table_levels[0].pk_column or target_mapper.pk_column)
+    prop.local_col = local_pk
     prop.local_attr = mapper.pk_attr
-    prop.remote_col = target_mapper.pk_column
+    prop.remote_col = remote_pk
     prop.remote_attr = target_mapper.pk_attr
     self_ref = table.name == target_table.name
     if decl.primaryjoin is not None:
@@ -902,11 +938,13 @@ def _configure_secondary(
             f"'{secondary.name}'. Specify the 'primaryjoin' and 'secondaryjoin' "
             "keyword arguments."
         )
+    local_names = {level.table.name for level in mapper.table_levels}
+    target_names = {level.table.name for level in target_mapper.table_levels}
     if prop.secondary_local is None:
         candidates = [
             column
             for column in secondary.columns
-            if column.foreign_key is not None and column.foreign_key.target_table == table.name
+            if column.foreign_key is not None and column.foreign_key.target_table in local_names
         ]
         if len(candidates) != 1:
             raise AmbiguousForeignKeysError(
@@ -919,8 +957,7 @@ def _configure_secondary(
         candidates = [
             column
             for column in secondary.columns
-            if column.foreign_key is not None
-            and column.foreign_key.target_table == target_table.name
+            if column.foreign_key is not None and column.foreign_key.target_table in target_names
         ]
         if len(candidates) != 1:
             raise AmbiguousForeignKeysError(
@@ -1682,6 +1719,9 @@ def _map_sti_subclass(cls: type[object], parent_mapper: Mapper[Any], mapper_args
     while ancestor is not None:
         ancestor.self_and_descendants.append(mapper)
         ancestor = ancestor.inherits
+    # An STI subclass of a joined-table mapper still needs the joined
+    # SELECT spec — it shares the leaf table but reads through the join.
+    _init_table_spec(mapper)
     cls_any.__mapper__ = mapper
     registry = parent_mapper.class_registry
     registry[cls.__name__] = cls
@@ -1689,6 +1729,209 @@ def _map_sti_subclass(cls: type[object], parent_mapper: Mapper[Any], mapper_args
     _MAPPERS.append(mapper)
     for name, column in merged.items():
         if name in parent_mapper.attr_columns:
+            continue
+        object.__setattr__(column, "key", name)
+        setattr(cls, name, column)
+    _configure_inheritance(
+        mapper,
+        cast("dict[object, object]", mapper_args) if isinstance(mapper_args, dict) else {},
+    )
+    configure_mappers()
+
+
+def _init_table_spec(mapper: Mapper[Any]) -> None:
+    """Compute ``table_levels`` and the whole-entity SELECT spec for a mapper.
+
+    The ``inherits`` chain is walked root -> leaf, collapsing links that share
+    a table (STI subclasses contribute their attributes to the level they
+    share).  With more than one level the mapper is a joined-table
+    inheritance mapper: whole-entity SELECTs go ``FROM`` the root table with
+    inner joins down the chain, ordered like SQLAlchemy — PK columns
+    leaf -> root (later duplicates alias ``id_1`` ...) then non-PK columns
+    root -> leaf.
+    """
+    chain: list[Mapper[Any]] = []
+    link: Mapper[Any] | None = mapper
+    while link is not None:
+        chain.append(link)
+        link = link.inherits
+    chain.reverse()
+    levels: list[_TableLevel] = []
+    for link_mapper in chain:
+        table = link_mapper.local_table
+        if levels and levels[-1].table is table:
+            # STI link sharing the previous level's table.
+            continue
+        pk_column = next((column for column in table.columns if column.primary_key), None)
+        pk_attr = next(
+            (attr for attr, column in link_mapper.attr_columns.items() if column is pk_column),
+            None,
+        )
+        non_pk = tuple(
+            attr
+            for attr, column in mapper.attr_columns.items()
+            if column.owner is table and column is not pk_column
+        )
+        join_column: Column | None = None
+        if levels:
+            parent_table = levels[-1].table
+            join_column = next(
+                (
+                    column
+                    for column in table.columns
+                    if column.foreign_key is not None
+                    and column.foreign_key.target_table == parent_table.name
+                ),
+                None,
+            )
+            if join_column is None:
+                raise ArgumentError(
+                    f"Could not determine join condition between parent "
+                    f"table '{parent_table.name}' and child table "
+                    f"'{table.name}' on joined-table-inheritance mapper "
+                    f"{mapper.class_.__name__}; child tables must foreign-key "
+                    "to the parent primary key"
+                )
+        levels.append(_TableLevel(table, pk_column, pk_attr, non_pk, join_column))
+    mapper.table_levels = tuple(levels)
+    if len(levels) == 1:
+        mapper.select_columns = tuple(mapper.attr_columns.values())
+        mapper.select_attrs = mapper.attrs
+        mapper.select_from = levels[0].table
+        mapper.select_joins = ()
+        return
+    columns: list[Column] = []
+    attrs: list[str] = []
+    for level in reversed(levels):
+        if level.pk_column is not None:
+            columns.append(cast("Column", level.pk_column))
+            attrs.append(cast("str", level.pk_attr))
+    for level in levels:
+        for attr in level.attrs:
+            columns.append(mapper.attr_columns[attr])
+            attrs.append(attr)
+    joins: list[tuple[object, ...]] = []
+    for previous, level in zip(levels[:-1], levels[1:], strict=True):
+        if previous.pk_column is None or level.join_column is None:
+            continue
+        joins.append(
+            (
+                "join",
+                level.table.name,
+                None,
+                (
+                    "binary",
+                    cast("Column", previous.pk_column).serialize(),
+                    "=",
+                    cast("Column", level.join_column).serialize(),
+                ),
+            )
+        )
+    mapper.select_columns = tuple(columns)
+    mapper.select_attrs = tuple(attrs)
+    mapper.select_from = levels[0].table
+    mapper.select_joins = tuple(joins)
+
+
+def _deferred_level(mapper: Mapper[Any], attr: str, expired: Iterable[str]) -> _TableLevel | None:
+    """The joined-table level ``attr`` lazy-loads from, or ``None``.
+
+    A parent query that resolved to a subclass leaves exactly the subclass
+    tables' attributes expired; accessing one loads just that child table's
+    columns (SQLAlchemy's deferred subclass-column SELECT).  Any expired
+    attribute on the hierarchy root means whole-row expiry — the refresh
+    then reads through the full join instead.
+    """
+    levels = mapper.table_levels
+    if len(levels) < 2:
+        return None
+    expired_set = set(expired)
+    if expired_set & set(levels[0].attrs):
+        return None
+    for level in levels[1:]:
+        if attr in expired_set and attr in level.attrs:
+            return level
+    return None
+
+
+def _entity_select_columns(mapper: Mapper[Any]) -> tuple[Column | Expression, ...]:
+    """SELECT items for a mapper's whole-entity column list.
+
+    Marking each column ``entity_column`` makes the compiler label repeats
+    ``id_1``-style like SQLAlchemy's ORM loads; plain repeated columns
+    dedupe ``id__1``.
+    """
+    return tuple(
+        Expression(
+            (
+                "entity_column",
+                column.table_name,
+                column.name,
+                _column_type_tag(column.type),
+            )
+        )
+        for column in mapper.select_columns
+    )
+
+
+def _map_jti_subclass(
+    cls: type[object],
+    parent_mapper: Mapper[Any],
+    tablename: object,
+    mapper_args: object,
+) -> None:
+    """Map ``cls`` onto its own table under ``parent_mapper`` (JTI).
+
+    The subclass declares ``__tablename__`` plus a primary-key column that
+    foreign-keys to the parent table — SQLAlchemy's joined-table
+    inheritance.  Its mapper keeps the hierarchy's attributes in
+    ``attr_columns`` (child declarations win name collisions) while
+    ``table_levels`` tracks the per-table split for flush DML and the
+    joined SELECT layout.
+    """
+    cls_any = cast(Any, cls)
+    attr_columns, specs, rel_attrs, rel_decls = _collect_mapped_members(
+        cls, _type_hints(cls), stop_at_mapped=True
+    )
+    if not attr_columns:
+        raise ArgumentError(f"{cls.__name__} declares __tablename__ but no mapped attributes")
+    metadata = parent_mapper.local_table.metadata
+    cls_any.metadata = metadata
+    table = Table(str(tablename), metadata, *(column for _name, column in attr_columns))
+    cls_any.__table__ = table
+    merged: dict[str, Column] = dict(parent_mapper.attr_columns)
+    for (name, _unbound), column in zip(attr_columns, table.columns, strict=True):
+        merged[name] = column
+    attrs = [
+        *parent_mapper.attrs,
+        *(name for name, _column in attr_columns if name not in parent_mapper.attr_columns),
+    ]
+    mapper = Mapper(cls, table, tuple(attrs), {**parent_mapper.specs, **specs}, merged)
+    mapper.relationship_attrs = tuple(
+        dict.fromkeys([*parent_mapper.relationship_attrs, *rel_attrs])
+    )
+    mapper.relationships = dict(parent_mapper.relationships)
+    mapper.pending_relationships = list(rel_decls)
+    mapper.class_registry = parent_mapper.class_registry
+    mapper.inherits = parent_mapper
+    mapper.base_mapper = parent_mapper.base_mapper
+    mapper.polymorphic_on = parent_mapper.polymorphic_on
+    mapper.polymorphic_on_attr = parent_mapper.polymorphic_on_attr
+    # Every mapper in the hierarchy shares the root's identity map.
+    mapper.polymorphic_map = parent_mapper.base_mapper.polymorphic_map
+    mapper.self_and_descendants = [mapper]
+    ancestor: Mapper[Any] | None = parent_mapper
+    while ancestor is not None:
+        ancestor.self_and_descendants.append(mapper)
+        ancestor = ancestor.inherits
+    _init_table_spec(mapper)
+    cls_any.__mapper__ = mapper
+    registry = parent_mapper.class_registry
+    registry[cls.__name__] = cls
+    registry.setdefault(f"{cls.__module__}.{cls.__qualname__}", cls)
+    _MAPPERS.append(mapper)
+    for name, column in merged.items():
+        if parent_mapper.attr_columns.get(name) is column:
             continue
         object.__setattr__(column, "key", name)
         setattr(cls, name, column)
@@ -1717,11 +1960,11 @@ def _map_declarative_class(cls: type[object]) -> None:
             cls_any.metadata = MetaData()
         return
     if parent_mapper is not None:
-        raise ArgumentError(
-            f"Cannot map class '{cls.__name__}': joined-table inheritance "
-            "(a subclass declaring __tablename__ under a mapped parent) is "
-            "not implemented"
-        )
+        # A subclass declaring ``__tablename__`` under a mapped parent is
+        # joined-table inheritance: the child table carries only its own
+        # columns and links back via a primary-key foreign key.
+        _map_jti_subclass(cls, parent_mapper, tablename, mapper_args)
+        return
     metadata = getattr(cls, "metadata", None)
     if not isinstance(metadata, MetaData):
         metadata = MetaData()
@@ -1738,6 +1981,7 @@ def _map_declarative_class(cls: type[object]) -> None:
     mapper.relationship_attrs = tuple(rel_attrs)
     mapper.pending_relationships = list(rel_decls)
     mapper.class_registry = registry
+    _init_table_spec(mapper)
     cls_any.__mapper__ = mapper
     registry[cls.__name__] = cls
     registry.setdefault(f"{cls.__module__}.{cls.__qualname__}", cls)
@@ -1897,6 +2141,9 @@ class Session:
         self._txn_active = False
         self._pending_rollback = False
         self._flushing = False
+        # Objects bulk-DML marked deleted: the DELETE already ran, so flush
+        # drops their state without re-emitting a per-row DELETE.
+        self._synced_deleted: set[int] = set()
 
     # -- state collections -------------------------------------------------
 
@@ -1975,6 +2222,7 @@ class Session:
                 # is marked deleted cancels the pending delete.
                 if uow.status(instance) == _STATUS_DELETED:
                     uow.un_delete(instance)
+                    self._synced_deleted.discard(id(instance))
                 return
             raise InvalidRequestError(
                 f"Object '{instance}' is already attached to session "
@@ -2163,12 +2411,14 @@ class Session:
         info = uow.detach(instance)
         if info is not None:
             self._stamp_detached(instance, info)
+        self._synced_deleted.discard(id(instance))
 
     def expunge_all(self) -> None:
         """Detach every managed object; loaded values stay on the instances."""
         for info in self._uow.detach_all():
             obj, pk, status, dirty, expired = info
             self._stamp_detached(obj, (pk, status, dirty, expired))
+        self._synced_deleted.clear()
 
     # -- merge --------------------------------------------------------------
 
@@ -2315,75 +2565,97 @@ class Session:
         """Gather and execute one flush batch; reconcile uow state after."""
         uow = self._uow
         ops: list[tuple[str, list[object], list[str | None], bool]] = []
-        persisted: list[tuple[object, object]] = []
+        # ``persisted`` carries the op index whose rowid supplies each new
+        # object's PK — the root-table op for joined-table subclasses.
+        persisted: list[tuple[object, object, int]] = []
         cleaned: list[object] = []
         dropped: list[object] = []
         # FK assignments resolved after the batch from an earlier op's rowid.
         deferred_fk: list[tuple[object, str, int]] = []
         insert_index: dict[int, int] = {}
         new_order = self._dependency_order(uow.new_objects())
-        deleted_order = self._dependent_first_order(uow.deleted_objects())
+        deleted_all = self._dependent_first_order(uow.deleted_objects())
+        # Bulk-DML-synchronized deletes already ran their SQL: they drop out
+        # of the session here without emitting a per-row DELETE again.
+        synced_deleted = [obj for obj in deleted_all if id(obj) in self._synced_deleted]
+        deleted_order = [obj for obj in deleted_all if id(obj) not in self._synced_deleted]
         for obj in new_order:
             mapper = _mapper_of(obj)
             pk_attr = mapper.pk_attr
             pk_value = obj.__dict__.get(pk_attr) if pk_attr is not None else None
             rel_fk = self._pending_relationship_refs(obj, mapper)
-            values: dict[str, object] = {}
-            deferred: list[tuple[str, str, int]] = []
-            for attr in mapper.attrs:
-                column = mapper.attr_columns[attr]
-                if attr == pk_attr and pk_value is None:
-                    # Autoincrement PKs are omitted so SQLite assigns them.
-                    continue
-                if attr in rel_fk:
-                    related = rel_fk[attr]
-                    if related is None:
-                        values[column.name] = None
-                    else:
-                        dep = insert_index.get(id(related))
-                        if dep is not None:
+            pk_op_index = -1
+            # One INSERT per inheritance-table level, root -> leaf (JTI
+            # subclasses emit parent then child; ordinary mappers emit one).
+            for level_index, level in enumerate(mapper.table_levels):
+                values: dict[str, object] = {}
+                deferred: list[tuple[str, str, int]] = []
+                level_pk = cast("Column | None", level.pk_column)
+                if level_pk is not None:
+                    if pk_value is not None:
+                        values[level_pk.name] = pk_value
+                    elif level_index > 0:
+                        # JTI child row: the PK arrives from the parent
+                        # INSERT's rowid inside this same batch (deferred).
+                        values[level_pk.name] = None
+                for attr in level.attrs:
+                    column = mapper.attr_columns[attr]
+                    if attr in rel_fk:
+                        related = rel_fk[attr]
+                        if related is None:
                             values[column.name] = None
-                            deferred.append((column.name, attr, dep))
                         else:
-                            values[column.name] = self._related_pk(related)
-                            obj.__dict__[attr] = values[column.name]
-                else:
-                    values[column.name] = obj.__dict__.get(attr)
-            discriminator = mapper.polymorphic_on
-            if discriminator is not None:
-                # Auto-write the mapper's polymorphic identity (SQLAlchemy
-                # stamps the discriminator at INSERT; an explicitly set
-                # value wins, like SA's flush).
-                identity = mapper.polymorphic_identity
-                current = values.get(discriminator.name)
-                if current is None:
-                    values[discriminator.name] = identity
-                    if mapper.polymorphic_on_attr is not None:
-                        obj.__dict__[mapper.polymorphic_on_attr] = identity
-                elif identity is not None and current != identity:
-                    warnings.warn(
-                        f"Flushing object {obj!r} with incompatible "
-                        f"polymorphic identity {current!r}; the row may not "
-                        "load correctly",
-                        SAWarning,
-                        stacklevel=2,
+                            dep = insert_index.get(id(related))
+                            if dep is not None:
+                                values[column.name] = None
+                                deferred.append((column.name, attr, dep))
+                            else:
+                                values[column.name] = self._related_pk(related)
+                                obj.__dict__[attr] = values[column.name]
+                    else:
+                        values[column.name] = obj.__dict__.get(attr)
+                discriminator = mapper.polymorphic_on
+                if discriminator is not None and discriminator.table_name == level.table.name:
+                    # Auto-write the mapper's polymorphic identity (SQLAlchemy
+                    # stamps the discriminator at INSERT; an explicitly set
+                    # value wins, like SA's flush).
+                    identity = mapper.polymorphic_identity
+                    current = values.get(discriminator.name)
+                    if current is None:
+                        values[discriminator.name] = identity
+                        if mapper.polymorphic_on_attr is not None:
+                            obj.__dict__[mapper.polymorphic_on_attr] = identity
+                    elif identity is not None and current != identity:
+                        warnings.warn(
+                            f"Flushing object {obj!r} with incompatible "
+                            f"polymorphic identity {current!r}; the row may not "
+                            "load correctly",
+                            SAWarning,
+                            stacklevel=2,
+                        )
+                compiled = Insert(level.table).values(values).compile()
+                self._raise_bind_error(compiled)
+                ordered = list(compiled._ordered)
+                for col_name, attr, dep in deferred:
+                    ordered[compiled._bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
+                    deferred_fk.append((obj, attr, dep))
+                if level_index > 0 and pk_value is None and level_pk is not None:
+                    ordered[compiled._bind_names.index(level_pk.name)] = (
+                        "__catalyst_rowid__",
+                        pk_op_index,
                     )
-            compiled = Insert(mapper.local_table).values(values).compile()
-            self._raise_bind_error(compiled)
-            ordered = list(compiled._ordered)
-            for col_name, attr, dep in deferred:
-                ordered[compiled._bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
-                deferred_fk.append((obj, attr, dep))
-            ops.append(
-                (
-                    compiled.string,
-                    ordered,
-                    compiled._bind_types,
-                    pk_value is None and pk_attr is not None,
+                ops.append(
+                    (
+                        compiled.string,
+                        ordered,
+                        compiled._bind_types,
+                        level_index == 0 and pk_value is None and pk_attr is not None,
+                    )
                 )
-            )
-            insert_index[id(obj)] = len(ops) - 1
-            persisted.append((obj, pk_value))
+                if level_index == 0:
+                    pk_op_index = len(ops) - 1
+                    insert_index[id(obj)] = pk_op_index
+            persisted.append((obj, pk_value, pk_op_index))
         for obj in uow.dirty_objects():
             mapper = _mapper_of(obj)
             pk = uow.pk_of(obj)
@@ -2419,15 +2691,27 @@ class Session:
             if not changes:
                 cleaned.append(obj)
                 continue
-            values = {mapper.attr_columns[attr].name: changes[attr] for attr in changes}
-            compiled = (
-                Update(mapper.local_table).values(values).where(mapper.pk_column == pk).compile()
-            )
-            self._raise_bind_error(compiled)
-            ordered = list(compiled._ordered)
-            for _fk_attr, (col_name, dep) in deferred_cols.items():
-                ordered[compiled._bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
-            ops.append((compiled.string, ordered, compiled._bind_types, False))
+            # One UPDATE per table level holding dirty columns — joined-table
+            # subclasses split parent/child changes like SQLAlchemy.
+            for level in mapper.table_levels:
+                level_pk = level.pk_column
+                level_values = {
+                    mapper.attr_columns[attr].name: changes[attr]
+                    for attr in level.attrs
+                    if attr in changes
+                }
+                if not level_values or level_pk is None:
+                    continue
+                compiled = Update(level.table).values(level_values).where(level_pk == pk).compile()
+                self._raise_bind_error(compiled)
+                ordered = list(compiled._ordered)
+                for _fk_attr, (col_name, dep) in deferred_cols.items():
+                    if col_name in compiled._bind_names:
+                        ordered[compiled._bind_names.index(col_name)] = (
+                            "__catalyst_rowid__",
+                            dep,
+                        )
+                ops.append((compiled.string, ordered, compiled._bind_types, False))
             cleaned.append(obj)
         # Many-to-many association writes: deduped deletes then inserts,
         # all ahead of object deletes so delete-orphan ordering holds and
@@ -2436,7 +2720,7 @@ class Session:
         assoc_dels: list[tuple[RelationshipProperty, object, object]] = []
         seen_pairs: set[tuple[object, frozenset[object]]] = set()
         base_refresh: list[tuple[dict[str, object], str, list[object]]] = []
-        persisted_pk: dict[int, object] = {id(obj): pk_value for obj, pk_value in persisted}
+        persisted_pk: dict[int, object] = {id(obj): pk_value for obj, pk_value, _op in persisted}
         scan: list[tuple[object, int]] = (
             [(obj, _STATUS_PENDING) for obj in new_order]
             + [(obj, _STATUS_PERSISTENT) for obj in uow.dirty_objects()]
@@ -2549,10 +2833,16 @@ class Session:
         for obj in deleted_order:
             mapper = _mapper_of(obj)
             pk = uow.pk_of(obj)
-            compiled = Delete(mapper.local_table).where(mapper.pk_column == pk).compile()
-            self._raise_bind_error(compiled)
-            ops.append((compiled.string, compiled._ordered, compiled._bind_types, False))
+            # Joined-table deletes run leaf -> root so the child row goes
+            # before the parent it references (SQLAlchemy's delete order).
+            for level in reversed(mapper.table_levels):
+                if level.pk_column is None:
+                    continue
+                compiled = Delete(level.table).where(level.pk_column == pk).compile()
+                self._raise_bind_error(compiled)
+                ops.append((compiled.string, compiled._ordered, compiled._bind_types, False))
             dropped.append(obj)
+        dropped.extend(synced_deleted)
         try:
             assigned = self._conn()._native.execute_flush(ops)
         except Exception:
@@ -2561,16 +2851,20 @@ class Session:
             self._pending_rollback = True
             raise
         final: list[tuple[object, object]] = []
-        for index, (obj, pk_value) in enumerate(persisted):
+        for obj, pk_value, op_index in persisted:
             mapper = _mapper_of(obj)
-            pk = pk_value if pk_value is not None else assigned[index]
+            pk = pk_value if pk_value is not None else assigned[op_index]
             if mapper.pk_attr is not None:
                 object.__setattr__(obj, mapper.pk_attr, pk)
             final.append((obj, pk))
+        # Deferred FK markers reference an op index — resolve each through
+        # the op -> object map before reading the assigned rowid.
+        persisted_by_op = {op: (obj, pk) for obj, pk, op in persisted}
         for obj, attr, dep in deferred_fk:
-            _dep_obj, dep_pk = persisted[dep]
+            _dep_obj, dep_pk = persisted_by_op[dep]
             obj.__dict__[attr] = dep_pk if dep_pk is not None else assigned[dep]
         uow.flush_transition(final, cleaned, dropped)
+        self._synced_deleted.difference_update(id(obj) for obj in synced_deleted)
         # Association diffs succeeded: current membership is the new
         # committed baseline for every scanned relationship.
         for instance_dict, key, members in base_refresh:
@@ -2719,6 +3013,37 @@ class Session:
             target.__dict__[prop.sibling.key] = instance
         return target
 
+    def _reconcile_loaded(
+        self, entity: type[object], target_mapper: Mapper[Any], instances: list[object]
+    ) -> list[object]:
+        """Reconcile loaded instances, expiring unfetched subclass columns.
+
+        A query against an inheritance parent resolves subclass instances
+        through the discriminator without fetching their joined-table
+        columns; those attributes lazy-load on first access.
+        """
+        items = self._uow.reconcile(
+            entity,
+            cast(str, target_mapper.pk_attr),
+            list(target_mapper.attrs),
+            instances,
+        )
+        for instance in items:
+            inst_mapper = getattr(type(instance), "__mapper__", None)
+            if inst_mapper is None:
+                continue
+            # Attributes the SELECT never carried (a subclass's joined-table
+            # columns) stay absent from ``__dict__``; mark them expired along
+            # with anything already expired so the flags survive reconcile.
+            missing = [
+                attr
+                for attr in inst_mapper.attrs
+                if attr not in instance.__dict__ or self._uow.attr_expired(instance, attr)
+            ]
+            if missing:
+                self._uow.expire_attrs(instance, missing)
+        return items
+
     def _relationship_children(self, prop: RelationshipProperty, value: object) -> list[object]:
         """One lazy-load SELECT: rows of the target table keyed by the FK."""
         target_mapper = prop.target_mapper
@@ -2732,18 +3057,21 @@ class Session:
             )
         )
         statement = Select(
-            tuple(target_mapper.attr_columns.values()), target_mapper.local_table, predicate
+            _entity_select_columns(target_mapper),
+            target_mapper.select_from,
+            predicate,
+            (),
+            None,
+            None,
+            None,
+            target_mapper.select_joins,
         )
         result = self._conn().execute(statement)
+        select_attrs = list(target_mapper.select_attrs)
         instances = result.native_result.hydrate(
-            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+            prop.entity, select_attrs, _hydrate_polymorphic(target_mapper, select_attrs)
         )
-        return self._uow.reconcile(
-            prop.entity,
-            cast(str, target_mapper.pk_attr),
-            list(target_mapper.attrs),
-            instances,
-        )
+        return self._reconcile_loaded(prop.entity, target_mapper, instances)
 
     def _m2m_children(self, prop: RelationshipProperty, owner_pk: object) -> list[object]:
         """Lazy m2m SELECT: implicit comma join through the association table.
@@ -2777,25 +3105,21 @@ class Session:
             )
         )
         statement = Select(
-            tuple(target_mapper.attr_columns.values()),
-            target_mapper.local_table,
+            _entity_select_columns(target_mapper),
+            target_mapper.select_from,
             predicate,
             (),
             None,
             None,
             None,
-            (("implicit_from", assoc.name),),
+            target_mapper.select_joins + (("implicit_from", assoc.name),),
         )
         result = self._conn().execute(statement)
+        select_attrs = list(target_mapper.select_attrs)
         instances = result.native_result.hydrate(
-            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+            prop.entity, select_attrs, _hydrate_polymorphic(target_mapper, select_attrs)
         )
-        return self._uow.reconcile(
-            prop.entity,
-            cast(str, target_mapper.pk_attr),
-            list(target_mapper.attrs),
-            instances,
-        )
+        return self._reconcile_loaded(prop.entity, target_mapper, instances)
 
     def _execute_loader_select(self, statement: Select) -> CursorResult:
         """Execute a ``select(Entity)`` carrying joinedload/selectinload options."""
@@ -2841,19 +3165,20 @@ class Session:
         """Single LEFT OUTER JOIN query hydrating parent and related slices."""
         specs: list[
             tuple[type[object], list[str], tuple[int, dict[object, type[object]]] | None]
-        ] = [(entity, list(mapper.attrs), _hydrate_polymorphic(mapper))]
-        columns: list[Column | Expression] = list(mapper.attr_columns.values())
-        joins: list[tuple[object, ...]] = []
+        ] = [
+            (
+                entity,
+                list(mapper.select_attrs),
+                _hydrate_polymorphic(mapper, list(mapper.select_attrs)),
+            )
+        ]
+        columns: list[Column | Expression] = list(_entity_select_columns(mapper))
+        joins: list[tuple[object, ...]] = list(mapper.select_joins)
         joined_props: list[RelationshipProperty] = []
         for index, prop in enumerate(joined):
             target_mapper = prop.target_mapper
-            alias = f"{target_mapper.local_table.name}_{index + 1}"
-            left = (
-                "column",
-                mapper.local_table.name,
-                prop.local_col.name,
-                _column_type_tag(prop.local_col.type),
-            )
+            alias = f"{target_mapper.select_from.name}_{index + 1}"
+            left = prop.local_col.serialize()
             right = (
                 "column",
                 alias,
@@ -2899,7 +3224,7 @@ class Session:
                         "left_outer_join_nested",
                         assoc.name,
                         assoc_alias,
-                        target_mapper.local_table.name,
+                        target_mapper.select_from.name,
                         alias,
                         inner_on,
                         outer_on,
@@ -2909,22 +3234,35 @@ class Session:
                 joins.append(
                     (
                         "left_outer_join",
-                        target_mapper.local_table.name,
+                        target_mapper.select_from.name,
                         alias,
                         ("binary", left, "=", right),
                     )
                 )
-            for column in target_mapper.attr_columns.values():
+            # Only the target's root table is joined (aliased); subclass-table
+            # attributes are hydrated as missing and lazy-load on access.
+            target_level = target_mapper.table_levels[0]
+            target_attrs = [
+                attr
+                for attr, column in target_mapper.attr_columns.items()
+                if column.owner is target_level.table
+            ]
+            for attr in target_attrs:
+                column = target_mapper.attr_columns[attr]
                 columns.append(
-                    Expression(("column", alias, column.name, _column_type_tag(column.type)))
+                    Expression(("entity_column", alias, column.name, _column_type_tag(column.type)))
                 )
             specs.append(
-                (prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper))
+                (
+                    prop.entity,
+                    target_attrs,
+                    _hydrate_polymorphic(target_mapper, target_attrs),
+                )
             )
             joined_props.append(prop)
         joined_stmt = Select(
             tuple(columns),
-            mapper.local_table,
+            mapper.select_from,
             cast("Column | Expression | None", statement.predicate),
             statement.ordering,
             statement.row_limit,
@@ -2941,9 +3279,7 @@ class Session:
         for spec_index, (cls, _attrs, _poly) in enumerate(specs):
             raw_items = [row[spec_index] for row in rows if row[spec_index] is not None]
             cls_mapper = _mapper_of(cls)
-            reconciled = self._uow.reconcile(
-                cls, cast(str, cls_mapper.pk_attr), list(cls_mapper.attrs), raw_items
-            )
+            reconciled = self._reconcile_loaded(cls, cls_mapper, raw_items)
             canon.append({id(raw): item for raw, item in zip(raw_items, reconciled, strict=True)})
         entity_rows: list[tuple[object, ...]] = []
         for row in rows:
@@ -2988,9 +3324,10 @@ class Session:
                     parents[pk] = parent
             if not parents:
                 return
-            target_pk = cast(Column, target_mapper.pk_column)
+            root_level = target_mapper.table_levels[0]
+            target_pk = cast(Column, root_level.pk_column or target_mapper.pk_column)
             statement = Select(
-                (Expression(local_fk.serialize()), *target_mapper.attr_columns.values()),
+                (Expression(local_fk.serialize()), *_entity_select_columns(target_mapper)),
                 assoc,
                 local_fk.in_(list(parents)),
                 (),
@@ -3000,10 +3337,11 @@ class Session:
                 (
                     (
                         "join",
-                        target_mapper.local_table.name,
+                        target_mapper.select_from.name,
                         None,
                         ("binary", target_pk.serialize(), "=", remote_fk.serialize()),
                     ),
+                    *target_mapper.select_joins,
                 ),
             )
             result = self._conn().execute(statement)
@@ -3011,13 +3349,14 @@ class Session:
             # consumes the grouping FK column so the real spec hydrates only
             # target columns (one FFI crossing for the whole batch).
             pk_attr = cast(str, target_mapper.pk_attr)
+            select_attrs = list(target_mapper.select_attrs)
             rows = result.native_result.hydrate_entities(
                 [
                     (prop.entity, [pk_attr], None),
                     (
                         prop.entity,
-                        list(target_mapper.attrs),
-                        _hydrate_polymorphic(target_mapper),
+                        select_attrs,
+                        _hydrate_polymorphic(target_mapper, select_attrs),
                     ),
                 ]
             )
@@ -3029,7 +3368,7 @@ class Session:
                     continue
                 owners.append(getattr(stub, pk_attr) if stub is not None else None)
                 raw_items.append(item)
-            items = self._uow.reconcile(prop.entity, pk_attr, list(target_mapper.attrs), raw_items)
+            items = self._reconcile_loaded(prop.entity, target_mapper, raw_items)
             for owner_key, item in zip(owners, items, strict=True):
                 parent = parents.get(owner_key)
                 if parent is not None:
@@ -3056,20 +3395,34 @@ class Session:
             fk_col = prop.remote_col
             fk_attr = prop.remote_attr
             # SA selects the foreign key first in the batch query.
-            cols = [fk_col] + [
-                column for column in target_mapper.attr_columns.values() if column is not fk_col
+            cols: list[Column | Expression] = [fk_col] + [
+                Expression(
+                    (
+                        "entity_column",
+                        column.table_name,
+                        column.name,
+                        _column_type_tag(column.type),
+                    )
+                )
+                for column in target_mapper.select_columns
+                if column is not fk_col
             ]
-            attrs = [fk_attr] + [attr for attr in target_mapper.attrs if attr != fk_attr]
-            statement = Select(tuple(cols), target_mapper.local_table).where(
-                fk_col.in_(list(parents))
-            )
+            attrs = [fk_attr] + [attr for attr in target_mapper.select_attrs if attr != fk_attr]
+            statement = Select(
+                tuple(cols),
+                target_mapper.select_from,
+                None,
+                (),
+                None,
+                None,
+                None,
+                target_mapper.select_joins,
+            ).where(fk_col.in_(list(parents)))
             result = self._conn().execute(statement)
             instances = result.native_result.hydrate(
                 prop.entity, attrs, _hydrate_polymorphic(target_mapper, attrs)
             )
-            instances = self._uow.reconcile(
-                prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
-            )
+            instances = self._reconcile_loaded(prop.entity, target_mapper, instances)
             for item in instances:
                 parent = parents.get(item.__dict__.get(fk_attr))
                 if parent is not None:
@@ -3090,15 +3443,21 @@ class Session:
                 child.__dict__[prop.key] = None
             return
         statement = Select(
-            tuple(target_mapper.attr_columns.values()), target_mapper.local_table
+            _entity_select_columns(target_mapper),
+            target_mapper.select_from,
+            None,
+            (),
+            None,
+            None,
+            None,
+            target_mapper.select_joins,
         ).where(prop.remote_col.in_(fks))
         result = self._conn().execute(statement)
+        select_attrs = list(target_mapper.select_attrs)
         instances = result.native_result.hydrate(
-            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+            prop.entity, select_attrs, _hydrate_polymorphic(target_mapper, select_attrs)
         )
-        instances = self._uow.reconcile(
-            prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
-        )
+        instances = self._reconcile_loaded(prop.entity, target_mapper, instances)
         pk_attr = cast(str, target_mapper.pk_attr)
         by_pk = {instance.__dict__.get(pk_attr): instance for instance in instances}
         for child, fk_value in children:
@@ -3154,6 +3513,7 @@ class Session:
             self._connection.rollback()
         for obj in self._uow.rollback():
             _expire_instance(obj)
+        self._synced_deleted.clear()
         self._txn_active = False
 
     def expire(self, instance: object) -> None:
@@ -3197,13 +3557,11 @@ class Session:
             )
         mapper = cast("Mapper[Any]", mapper)
         # Select only the queried mapper's columns: on a shared STI table a
-        # sibling's columns would otherwise shift positional hydration.
-        statement = Select(tuple(mapper.attr_columns.values()), mapper.local_table).where(
-            mapper.pk_column == ident
-        )
-        criterion = _polymorphic_criterion(entity)
-        if criterion is not None:
-            statement = statement.where(criterion)
+        # sibling's columns would otherwise shift positional hydration, and a
+        # joined-table subclass reads through its parent/child join.  The PK
+        # predicate targets the hierarchy root's column like SQLAlchemy.
+        pk_column = mapper.base_mapper.pk_column or mapper.pk_column
+        statement = Select((), mapper.select_from, entity=entity).where(pk_column == ident)
         compiled = statement.compile()
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
@@ -3216,7 +3574,7 @@ class Session:
         cached = self._uow.identity_get(resolved, ident)
         if cached is not None:
             # populate_existing: refresh the mapped instance, keep identity.
-            for attr, value in zip(resolved_mapper.attrs, row, strict=False):
+            for attr, value in zip(mapper.select_attrs, row, strict=False):
                 object.__setattr__(cached, attr, value)
             self._uow.mark_clean(cached)
             self._expire_unloaded(cached, resolved_mapper, mapper)
@@ -3224,7 +3582,7 @@ class Session:
                 cached.__dict__.pop(key, None)
             return cast(_T, cached)
         instance = resolved.__new__(resolved)
-        for attr, value in zip(resolved_mapper.attrs, row, strict=False):
+        for attr, value in zip(mapper.select_attrs, row, strict=False):
             object.__setattr__(instance, attr, value)
         self._uow.attach_persistent(instance, resolved, list(resolved_mapper.attrs), ident)
         instance._catalyst_state = self._uow  # type: ignore[attr-defined]
@@ -3239,7 +3597,9 @@ class Session:
         attr = mapper.polymorphic_on_attr
         if attr is None or not mapper.polymorphic_map:
             return entity
-        index = mapper.attrs.index(attr) if attr in mapper.attrs else -1
+        # The row layout follows the SELECT spec (``select_attrs``), which
+        # differs from ``attrs`` on joined-table mappers.
+        index = mapper.select_attrs.index(attr) if attr in mapper.select_attrs else -1
         if index < 0 or index >= len(row):
             return entity
         return cast("type[_T]", mapper.polymorphic_map.get(row[index], entity))
@@ -3273,16 +3633,15 @@ class Session:
         self._mark_active()
         mapper = _mapper_of(instance)
         pk = uow.pk_of(instance)
+        pk_column = mapper.base_mapper.pk_column or mapper.pk_column
         compiled = (
-            Select(tuple(mapper.attr_columns.values()), mapper.local_table)
-            .where(mapper.pk_column == pk)
-            .compile()
+            Select((), mapper.select_from, entity=mapper.class_).where(pk_column == pk).compile()
         )
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
         if row is None:
             raise ObjectDeletedError(self._deleted_message(instance))
-        for attr, value in zip(mapper.attrs, row, strict=True):
+        for attr, value in zip(mapper.select_attrs, row, strict=True):
             object.__setattr__(instance, attr, value)
         uow.mark_clean(instance)
         for key in mapper.relationship_attrs:
@@ -3294,7 +3653,11 @@ class Session:
         Like SQLAlchemy's ``_load_expired``, one SELECT repopulates every
         attribute in the expired set at once and clears the whole set —
         sibling attributes stay consistent with the row snapshot rather than
-        reloading separately.
+        reloading separately.  Joined-table instances add one twist: when
+        only subclass-table attributes are pending (a parent query resolved
+        the subclass without fetching its child columns), the load narrows
+        to that child table — SQLAlchemy's deferred subclass-column SELECT
+        ``SELECT <child cols> FROM <child> WHERE ? = <child>.<pk>``.
         """
         if self._pending_rollback:
             raise PendingRollbackError(
@@ -3314,10 +3677,13 @@ class Session:
             return
         if self.autoflush:
             self.flush()
+        level = _deferred_level(mapper, attr, uow.expired_attrs_of(instance))
+        if level is not None:
+            self._load_deferred_level(instance, uow, mapper, level, attr, pk)
+            return
+        pk_column = mapper.base_mapper.pk_column or mapper.pk_column
         compiled = (
-            Select(tuple(mapper.attr_columns.values()), mapper.local_table)
-            .where(mapper.pk_column == pk)
-            .compile()
+            Select((), mapper.select_from, entity=mapper.class_).where(pk_column == pk).compile()
         )
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
@@ -3325,8 +3691,57 @@ class Session:
         if row is None:
             raise ObjectDeletedError(self._deleted_message(instance))
         for expired in uow.expired_attrs_of(instance):
-            object.__setattr__(instance, expired, row[mapper.attrs.index(expired)])
+            object.__setattr__(instance, expired, row[mapper.select_attrs.index(expired)])
         uow.mark_loaded(instance)
+
+    def _load_deferred_level(
+        self,
+        instance: object,
+        uow: NativeUow,
+        mapper: Mapper[Any],
+        level: _TableLevel,
+        attr: str,
+        pk: object,
+    ) -> None:
+        """Deferred subclass-table load for a joined-table instance.
+
+        ``select(Parent)`` resolves subclass instances without fetching the
+        child table's columns; the first access loads the whole child-table
+        attribute group in one SELECT keyed by the child primary key —
+        SQLAlchemy's ``SELECT <child cols> FROM <child> WHERE ? = <pk>``.
+        """
+        expired = set(uow.expired_attrs_of(instance))
+        load_attrs = [name for name in level.attrs if name in expired]
+        pk_column = cast("Column | None", level.pk_column)
+        if not load_attrs or pk_column is None:
+            return
+        predicate = Expression(
+            (
+                "binary",
+                (
+                    "literal",
+                    pk,
+                    pk_column.name,
+                    _column_type_tag(pk_column.type),
+                ),
+                "=",
+                pk_column.serialize(),
+            )
+        )
+        statement = Select(
+            tuple(mapper.attr_columns[name] for name in load_attrs),
+            level.table,
+            predicate,
+        )
+        row = self._conn().execute(statement).fetchone()
+        self._mark_active()
+        if row is None:
+            # Orphaned parent row (e.g. after a bulk parent delete): SA's
+            # deferred loader reports the missing child row as a KeyError.
+            raise KeyError(f"Deferred loader for attribute '{attr}' failed to populate correctly")
+        for name, value in zip(load_attrs, row, strict=True):
+            object.__setattr__(instance, name, value)
+            uow.attr_loaded(instance, name)
 
     @staticmethod
     def _deleted_message(instance: object) -> str:
@@ -3442,7 +3857,13 @@ class Session:
             if not matches(inst):
                 continue
             if isinstance(statement, Delete):
+                # The bulk DELETE already ran; matching objects move to the
+                # deleted state (``session.deleted``, like SQLAlchemy's
+                # synchronize_session) but flush drops them without a
+                # follow-up per-row DELETE — joined-table child rows stay
+                # orphaned rather than cascade-deleted.
                 self._uow.mark_deleted(inst)
+                self._synced_deleted.add(id(inst))
                 continue
             for col_name, value in statement.values_map.items():
                 attr = col_to_attr.get(col_name, col_name)
@@ -3634,6 +4055,7 @@ class Session:
         for info in self._uow.detach_all():
             obj, pk, status, dirty, expired = info
             self._stamp_detached(obj, (pk, status, dirty, expired))
+        self._synced_deleted.clear()
         self._txn_active = False
 
     def __enter__(self) -> Session:

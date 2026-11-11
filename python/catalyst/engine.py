@@ -162,8 +162,12 @@ class CursorResult:
         self._seen: set[object] = set()
         if self.entity_rows is None and entity is not None:
             mapper = cast(Any, entity).__mapper__
+            # ``select_attrs`` aligns with the entity SELECT's column order —
+            # for joined-table inheritance that is the join spec order (child
+            # PK columns first, parent columns interleaved), not ``attrs``.
+            select_attrs = list(getattr(mapper, "select_attrs", mapper.attrs))
             instances = native_result.hydrate(
-                entity, list(mapper.attrs), _hydrate_polymorphic(mapper)
+                entity, select_attrs, _hydrate_polymorphic(mapper, select_attrs)
             )
             pk_attr = getattr(mapper, "pk_attr", None)
             if uow is not None and pk_attr is not None:

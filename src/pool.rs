@@ -23,6 +23,22 @@ struct PoolInner {
     available: Condvar,
 }
 
+/// Open one SQLite connection, mirroring Python ``sqlite3`` defaults.
+///
+/// The bundled libsqlite3-sys compiles ``SQLITE_DEFAULT_FOREIGN_KEYS=1``,
+/// while CPython's ``sqlite3`` module leaves the pragma off — and SQLAlchemy
+/// only enables it through user-attached events. Turning it back off keeps
+/// DML semantics aligned with SQLAlchemy (joined-table bulk deletes leave
+/// orphaned child rows instead of raising ``IntegrityError``).
+fn open_sqlite(path: Option<&str>) -> Result<Connection, rusqlite::Error> {
+    let connection = match path {
+        Some(path) => Connection::open(path)?,
+        None => Connection::open_in_memory()?,
+    };
+    connection.pragma_update(None, "foreign_keys", false)?;
+    Ok(connection)
+}
+
 /// Transaction bookkeeping belongs to the physical pool slot, not a Python checkout.
 #[derive(Default)]
 pub(crate) struct TransactionState {
@@ -78,9 +94,7 @@ impl Pool {
     ) -> Result<Self, PoolError> {
         let memory_slot = if path == ":memory:" {
             Some(PoolSlot {
-                connection: Arc::new(Mutex::new(
-                    Connection::open_in_memory().map_err(PoolError::Sqlite)?,
-                )),
+                connection: Arc::new(Mutex::new(open_sqlite(None).map_err(PoolError::Sqlite)?)),
                 transaction: Arc::new(Mutex::new(TransactionState::default())),
             })
         } else {
@@ -158,7 +172,7 @@ impl Pool {
         drop(state);
 
         let opened = (|| {
-            let connection = Connection::open(&self.inner.path).map_err(PoolError::Sqlite)?;
+            let connection = open_sqlite(Some(&self.inner.path)).map_err(PoolError::Sqlite)?;
             connection
                 .busy_timeout(self.inner.sqlite_timeout)
                 .map_err(PoolError::Sqlite)?;

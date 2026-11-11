@@ -513,9 +513,16 @@ impl NativeUow {
                     if !names.is_empty() {
                         let dict = existing.bind(py).getattr("__dict__")?;
                         let dict = dict.cast::<PyDict>()?;
+                        // Only refresh attributes the fresh row actually
+                        // carried: a parent-table row resolved to a subclass
+                        // leaves subclass-table columns unfetched, and writing
+                        // their `None` getattr fallback would clear the pending
+                        // deferred load with a wrong value.
+                        let fresh = instance.getattr("__dict__")?;
+                        let fresh = fresh.cast::<PyDict>()?;
                         let mut refreshed: Vec<String> = Vec::new();
                         for name in names {
-                            if let Ok(value) = instance.getattr(name.as_str()) {
+                            if let Some(value) = fresh.get_item(name.as_str())? {
                                 dict.set_item(name.as_str(), value)?;
                                 refreshed.push(name);
                             }

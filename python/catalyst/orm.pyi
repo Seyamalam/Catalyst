@@ -3,7 +3,7 @@
 import builtins
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from typing import Any, ClassVar, Generic, SupportsIndex, TypeVar, overload
+from typing import Any, ClassVar, Generic, NamedTuple, SupportsIndex, TypeVar, overload
 
 from typing_extensions import dataclass_transform
 
@@ -90,6 +90,15 @@ def mapped_column(
 class SAWarning(Warning):
     """SQLAlchemy-parity warning category (e.g. missing polymorphic_identity)."""
 
+class _TableLevel(NamedTuple):
+    """One distinct table in an inheritance chain's DML/SELECT layout."""
+
+    table: Table
+    pk_column: Column | None
+    pk_attr: str | None
+    attrs: tuple[str, ...]
+    join_column: Column | None
+
 class Mapper(Generic[_T]):
     class_: type[_T]
     local_table: Table
@@ -110,6 +119,11 @@ class Mapper(Generic[_T]):
     polymorphic_identity: object
     polymorphic_map: dict[object, type[object]]
     self_and_descendants: list[Mapper[Any]]
+    table_levels: tuple[_TableLevel, ...]
+    select_columns: tuple[Column, ...]
+    select_attrs: tuple[str, ...]
+    select_from: Table
+    select_joins: tuple[tuple[object, ...], ...]
     def __init__(
         self,
         class_: type[_T],

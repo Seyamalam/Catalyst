@@ -1118,20 +1118,56 @@ class Select:
         if table is not None:
             table_name = table.name
         columns: tuple[Column | Expression, ...]
+        from_name: str | None = table.name if table is not None else table_name
+        joins: tuple[tuple[object, ...], ...] = ()
+        entity_columns = False
         if self.columns:
             columns = self.columns
         elif self.entity is not None:
             # ``select(Entity)`` emits the *mapper's* columns: a
             # single-table-inheritance parent selects only its own mapped
-            # attributes even though subclass columns share its Table.
-            attr_columns = getattr(getattr(self.entity, "__mapper__", None), "attr_columns", None)
-            if isinstance(attr_columns, dict) and attr_columns:
-                columns = tuple(cast("dict[str, Column]", attr_columns).values())
+            # attributes even though subclass columns share its Table.  A
+            # joined-table subclass selects ``FROM`` the hierarchy root with
+            # inner joins down the chain (``mapper.select_*``).
+            mapper = getattr(self.entity, "__mapper__", None)
+            select_columns = getattr(mapper, "select_columns", None)
+            if isinstance(select_columns, tuple) and select_columns:
+                columns = cast("tuple[Column | Expression, ...]", select_columns)
+                entity_columns = True
+                select_from = getattr(mapper, "select_from", None)
+                if isinstance(select_from, Table):
+                    from_name = select_from.name
+                joins = tuple(
+                    cast(
+                        "tuple[tuple[object, ...], ...]",
+                        getattr(mapper, "select_joins", ()),
+                    )
+                )
             else:
-                columns = table.columns if table is not None else ()
+                attr_columns = getattr(mapper, "attr_columns", None)
+                if isinstance(attr_columns, dict) and attr_columns:
+                    columns = tuple(cast("dict[str, Column]", attr_columns).values())
+                else:
+                    columns = table.columns if table is not None else ()
         else:
             columns = table.columns if table is not None else ()
-        nodes = tuple(_node(column) for column in columns)
+        if entity_columns:
+            # Whole-entity columns mark their own serialization so the
+            # compiler labels repeats ``id_1``-style like SQLAlchemy's ORM
+            # loads; plain repeated columns dedupe ``id__1``.
+            nodes = tuple(
+                (
+                    "entity_column",
+                    column.table_name,
+                    column.name,
+                    _column_type_tag(column.type),
+                )
+                if isinstance(column, Column)
+                else _node(column)
+                for column in columns
+            )
+        else:
+            nodes = tuple(_node(column) for column in columns)
         stored = cast("Column | Expression | None", self.predicate)
         predicate = None if stored is None else _node(stored)
         if self.entity is not None:
@@ -1185,11 +1221,11 @@ class Select:
                 if has_pagination
                 else None
             )
-        joins = tuple(self.joins)
+        joins = joins + tuple(self.joins)
         return (
             "select",
             nodes,
-            table.name if table is not None else table_name,
+            from_name,
             predicate,
             ordering,
             limit,
@@ -1467,6 +1503,11 @@ def _polymorphic_criterion(entity: object) -> Expression | None:
     """
     mapper = getattr(entity, "__mapper__", None)
     if mapper is None or getattr(mapper, "inherits", None) is None:
+        return None
+    inherits = getattr(mapper, "inherits", None)
+    if getattr(mapper, "local_table", None) is not getattr(inherits, "local_table", None):
+        # Joined-table link: the inner join itself establishes subclass
+        # membership, so SA adds no discriminator predicate.
         return None
     discriminator = getattr(mapper, "polymorphic_on", None)
     if not isinstance(discriminator, Column):

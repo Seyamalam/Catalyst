@@ -49,6 +49,9 @@ struct ColumnDdl {
 #[derive(Clone)]
 enum Expr {
     Column(String, String, Option<String>),
+    /// Whole-entity select item (ORM/JTI entity loads): duplicates label
+    /// ``id_1``-style while plain repeated columns label ``id__1``.
+    EntityColumn(String, String, Option<String>),
     Literal(Value, String, Option<String>),
     Boolean(bool),
     BooleanWord(bool),
@@ -180,7 +183,9 @@ fn renders_empty(expr: &Expr) -> bool {
 /// SQLAlchemy concatenates string-typed operands with ``||`` instead of ``+``.
 fn is_string_operand(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(_, _, Some(tag)) | Expr::Literal(_, _, Some(tag)) => {
+        Expr::Column(_, _, Some(tag))
+        | Expr::EntityColumn(_, _, Some(tag))
+        | Expr::Literal(_, _, Some(tag)) => {
             matches!(tag.as_str(), "string" | "text")
         }
         _ => false,
@@ -308,7 +313,7 @@ impl Compiler {
 
     fn bind_in_values(&mut self, inner: &Expr, values: &[Expr]) {
         let base = match inner {
-            Expr::Column(_, column, _) => column.as_str(),
+            Expr::Column(_, column, _) | Expr::EntityColumn(_, column, _) => column.as_str(),
             _ => "param",
         };
         // SQLAlchemy allocates one name for the expanding bind, then uses it
@@ -343,7 +348,9 @@ impl Compiler {
                 }
             } else if let Expr::Boolean(value) = value {
                 let type_tag = match inner {
-                    Expr::Column(_, _, type_tag) => type_tag.clone(),
+                    Expr::Column(_, _, type_tag) | Expr::EntityColumn(_, _, type_tag) => {
+                        type_tag.clone()
+                    }
                     _ => None,
                 };
                 let cast_suffix = if self.dialect.is_postgres() {
@@ -377,7 +384,7 @@ impl Compiler {
     /// statement level); a child self-groups like SQLAlchemy's ``self_group``.
     fn expr(&mut self, expr: &Expr, against: Option<&str>) {
         match expr {
-            Expr::Column(table, column, _) => {
+            Expr::Column(table, column, _) | Expr::EntityColumn(table, column, _) => {
                 if !table.is_empty() {
                     self.ident(table);
                     self.sql.push('.');
@@ -583,7 +590,7 @@ impl Compiler {
             Expr::Neg(inner) => {
                 self.sql.push('-');
                 match inner.as_ref() {
-                    Expr::Column(_, _, _) => self.expr(inner, None),
+                    Expr::Column(_, _, _) | Expr::EntityColumn(_, _, _) => self.expr(inner, None),
                     _ => {
                         self.sql.push('(');
                         self.expr(inner, None);
@@ -621,7 +628,12 @@ impl Compiler {
         self.expr(expr, None);
         match expr {
             // A negated plain column stays column-like: SQLAlchemy emits no label.
-            Expr::Neg(inner) if matches!(inner.as_ref(), Expr::Column(_, _, _)) => {
+            Expr::Neg(inner)
+                if matches!(
+                    inner.as_ref(),
+                    Expr::Column(_, _, _) | Expr::EntityColumn(_, _, _)
+                ) =>
+            {
                 self.result_types.push(None);
             }
             Expr::Column(_, label, type_tag) => {
@@ -633,8 +645,24 @@ impl Compiler {
                     duplicate
                 };
                 if let Some(count) = duplicate {
+                    // Plain duplicate columns dedupe `id__N`-style.
                     self.sql.push_str(" AS ");
                     self.ident(&format!("{label}__{count}"));
+                }
+            }
+            Expr::EntityColumn(_, label, type_tag) => {
+                self.result_types.push(type_tag.clone());
+                let duplicate = {
+                    let count = self.column_labels.entry(label.clone()).or_insert(0);
+                    let duplicate = (*count > 0).then_some(*count);
+                    *count += 1;
+                    duplicate
+                };
+                if let Some(count) = duplicate {
+                    // ORM entity selects dedupe `id_N`-style (single
+                    // underscore): `id`, `id_1`, `id_2` on JTI joins.
+                    self.sql.push_str(" AS ");
+                    self.ident(&format!("{label}_{count}"));
                 }
             }
             Expr::Function(name, _) => {
@@ -1560,6 +1588,11 @@ fn parse_expr_at_depth(value: &Bound<'_, PyAny>, dialect: Dialect, depth: usize)
         .extract()?;
     match name.as_str() {
         "column" => Ok(Expr::Column(
+            string_at(value, 1)?,
+            string_at(value, 2)?,
+            optional_string_at(value, 3)?,
+        )),
+        "entity_column" => Ok(Expr::EntityColumn(
             string_at(value, 1)?,
             string_at(value, 2)?,
             optional_string_at(value, 3)?,
