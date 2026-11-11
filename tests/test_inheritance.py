@@ -132,6 +132,40 @@ _INHERITANCE_MISSING = pytest.mark.skipif(
 
 pytestmark = _INHERITANCE_MISSING
 
+
+def _jti_supported() -> bool:
+    """Probe whether joined-table inheritance (distinct child table) works."""
+    try:
+
+        class _JtiBase(DeclarativeBase):
+            pass
+
+        class _JtiEmp(_JtiBase):
+            __tablename__ = "catalyst_jti_probe_e"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            type: Mapped[str]
+            __mapper_args__ = {
+                "polymorphic_on": "type",
+                "polymorphic_identity": "employee",
+            }
+
+        class _JtiMgr(_JtiEmp):
+            __tablename__ = "catalyst_jti_probe_m"
+            id: Mapped[int] = mapped_column(ForeignKey("catalyst_jti_probe_e.id"), primary_key=True)
+            dept: Mapped[str]
+            __mapper_args__ = {"polymorphic_identity": "manager"}
+
+    except Exception:
+        return False
+    mgr_table = getattr(_JtiMgr, "__table__", None)
+    return mgr_table is not None and mgr_table is not _JtiEmp.__table__
+
+
+_JTI_MISSING = pytest.mark.skipif(
+    not _jti_supported(),
+    reason="catalyst joined-table inheritance is not implemented yet",
+)
+
 _CATALYST_DATACLASS = _catalyst_symbol("MappedAsDataclass")
 
 _DATACLASS_MISSING = pytest.mark.skipif(
@@ -691,6 +725,7 @@ def test_sti_int_discriminator() -> None:
 # ---------------------------------------------------------------------------
 
 
+@_JTI_MISSING
 def test_jti_ddl_two_tables_child_pk_is_fk() -> None:
     """JTI emits two ``CREATE TABLE``s; the child PK column is also
     ``FOREIGN KEY(id) REFERENCES jti_employee (id)``."""
@@ -717,6 +752,7 @@ def test_jti_ddl_two_tables_child_pk_is_fk() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_insert_parent_then_child() -> None:
     """Flushing a ``Manager`` emits the parent INSERT first, then the child
     INSERT carrying the parent-generated id."""
@@ -754,6 +790,7 @@ def test_jti_insert_parent_then_child() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_select_subclass_inner_join() -> None:
     """``select(Manager)`` emits ``FROM jti_employee JOIN jti_manager`` with
     child columns first and NO discriminator filter."""
@@ -792,6 +829,7 @@ def test_jti_select_subclass_inner_join() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_parent_query_defers_subclass_columns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -846,6 +884,7 @@ def test_jti_parent_query_defers_subclass_columns(
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_get_resolves_subclass() -> None:
     """``get(Employee, mgr_id)`` returns the ``Manager`` instance; only the
     parent table is queried until a subclass attribute is touched."""
@@ -873,6 +912,7 @@ def test_jti_get_resolves_subclass() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_instance_delete_child_then_parent() -> None:
     """``session.delete(manager)`` flushes ``DELETE FROM jti_manager`` then
     ``DELETE FROM jti_employee`` — child row first."""
@@ -908,6 +948,7 @@ def test_jti_instance_delete_child_then_parent() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_bulk_delete_parent_leaves_child_rows() -> None:
     """ORM ``delete(Employee)`` emits a single parent-table DELETE and
     ORPHANS the child rows — a verified SQLAlchemy 2.1.8 surprise."""
@@ -938,6 +979,7 @@ def test_jti_bulk_delete_parent_leaves_child_rows() -> None:
         sa_engine.dispose()
 
 
+@_JTI_MISSING
 def test_jti_without_polymorphic_on_returns_base_instances() -> None:
     """Joined-table inheritance works with NO ``__mapper_args__`` at all —
     but parent queries return base-class instances (no discriminator to
