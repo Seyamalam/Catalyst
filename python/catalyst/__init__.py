@@ -28,10 +28,12 @@ from ._catalyst import (
     NativeResult,
     NoSuchModuleError,
     OperationalError,
+    PendingRollbackError,
     ProgrammingError,
     SQLAlchemyError,
     StatementError,
     TimeoutError,
+    UnmappedInstanceError,
     sqlite_text,
 )
 from .engine import (
@@ -101,6 +103,8 @@ __all__ = [
     "StatementError",
     "TimeoutError",
     "InvalidRequestError",
+    "PendingRollbackError",
+    "UnmappedInstanceError",
     "SQLAlchemyError",
     "sqlite_text",
     "Engine",

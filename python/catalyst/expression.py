@@ -194,6 +194,27 @@ class Column:
     server_default: str | None = None
     table_name: str = field(default="", init=False, repr=False, compare=False)
     owner: Table | None = field(default=None, init=False, repr=False, compare=False)
+    # Mapped attribute name when bound to a declarative class; used by
+    # ``__get__`` to resolve instance state (the column name can differ).
+    key: str = field(default="", init=False, repr=False, compare=False)
+
+    def __get__(self, instance: object, owner: object = None) -> object:
+        # Non-data descriptor: the instance ``__dict__`` is consulted first, so
+        # this only fires for expired or never-assigned attributes.  When the
+        # owning session marked the attribute expired, trigger a lazy reload
+        # before returning the (now populated) instance value.
+        if instance is None:
+            return self
+        instance_dict = getattr(instance, "__dict__", None)
+        if instance_dict is None:
+            return None
+        key = self.key or self.name
+        uow = instance_dict.get("_catalyst_state")
+        if uow is not None and uow.attr_expired(instance, key):
+            session = uow.session
+            if session is not None:
+                session._load_expired(instance, key)
+        return instance_dict.get(key)
 
     def serialize(self) -> tuple[object, ...]:
         return ("column", self.table_name, self.name, _column_type_tag(self.type))
@@ -788,7 +809,7 @@ class Select:
         )
         predicate = nodes[0] if len(nodes) == 1 else and_(*nodes)  # noqa: PR01
         if self.predicate is not None:
-            predicate = and_(self.predicate, predicate)
+            predicate = and_(cast("Column | Expression", self.predicate), predicate)
         return Select(
             self.columns,
             self.table,
@@ -803,7 +824,7 @@ class Select:
         return Select(
             self.columns,
             self.table,
-            self.predicate,
+            cast("Column | Expression | None", self.predicate),
             self.ordering + clauses,
             self.row_limit,
             self.row_offset,
@@ -814,7 +835,7 @@ class Select:
         return Select(
             self.columns,
             self.table,
-            self.predicate,
+            cast("Column | Expression | None", self.predicate),
             self.ordering,
             value,
             self.row_offset,
@@ -825,7 +846,7 @@ class Select:
         return Select(
             self.columns,
             self.table,
-            self.predicate,
+            cast("Column | Expression | None", self.predicate),
             self.ordering,
             self.row_limit,
             value,
@@ -850,7 +871,8 @@ class Select:
             table.columns if table is not None and self.columns == () else self.columns
         )
         nodes = tuple(_node(column) for column in columns)
-        predicate = None if self.predicate is None else _node(self.predicate)
+        stored = cast("Column | Expression | None", self.predicate)
+        predicate = None if stored is None else _node(stored)
         ordering = tuple(_node(item) for item in self.ordering)
         has_pagination = self.row_limit is not None or self.row_offset is not None
         if dialect == "postgresql":
@@ -1000,7 +1022,7 @@ class Update:
         if values is not None:
             merged.update(values)
         merged.update(kwargs)
-        return Update(self.table, merged, self.predicate)
+        return Update(self.table, merged, cast("Column | Expression | None", self.predicate))
 
     def where(self, *clauses: Column | Expression | bool) -> Update:
         if not clauses:
@@ -1011,7 +1033,7 @@ class Update:
         )
         predicate = nodes[0] if len(nodes) == 1 else and_(*nodes)  # noqa: PR01
         if self.predicate is not None:
-            predicate = and_(self.predicate, predicate)
+            predicate = and_(cast("Column | Expression", self.predicate), predicate)
         return Update(self.table, self.values_map, predicate)
 
     def compile(self, dialect: str | None = None) -> Compiled:
@@ -1025,7 +1047,8 @@ class Update:
             for column in self.table.columns
             if column.name in self.values_map
         }
-        predicate = None if self.predicate is None else _node(self.predicate)
+        stored = cast("Column | Expression | None", self.predicate)
+        predicate = None if stored is None else _node(stored)
         (
             sql,
             params,
@@ -1060,11 +1083,12 @@ class Delete:
         )
         predicate = nodes[0] if len(nodes) == 1 else and_(*nodes)  # noqa: PR01
         if self.predicate is not None:
-            predicate = and_(self.predicate, predicate)
+            predicate = and_(cast("Column | Expression", self.predicate), predicate)
         return Delete(self.table, predicate)
 
     def compile(self, dialect: str | None = None) -> Compiled:
-        predicate = None if self.predicate is None else _node(self.predicate)
+        stored = cast("Column | Expression | None", self.predicate)
+        predicate = None if stored is None else _node(stored)
         (
             sql,
             params,

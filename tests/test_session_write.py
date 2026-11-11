@@ -393,8 +393,10 @@ def test_commit_flushes_and_persists() -> None:
 
 def test_commit_expires_attributes_by_default() -> None:
     """``expire_on_commit=True`` (SA default): after commit every attribute is
-    expired; the next attribute access re-SELECTs, so an external UPDATE is
-    visible through the already-loaded instance."""
+    expired; the first subsequent attribute access re-SELECTs the whole row,
+    so an external UPDATE that lands before that access is visible. (Verified:
+    SA caches the row at the first expired access — an UPDATE made after it
+    would NOT be seen, so the update must precede the ``id``/``name`` reads.)"""
     catalyst_engine = _catalyst_engine()
     sa_engine = _sa_engine()
     try:
@@ -405,7 +407,6 @@ def test_commit_expires_attributes_by_default() -> None:
             sa_session.add(sa_user)
             session.commit()
             sa_session.commit()
-            assert user.id == sa_user.id == 1
             with catalyst_engine.begin() as connection:
                 connection.execute(update(User.__table__).where(User.id == 1).values(name="after"))
             with sa_engine.begin() as connection:
@@ -414,6 +415,7 @@ def test_commit_expires_attributes_by_default() -> None:
                 )
             assert user.name == "after"
             assert sa_user.name == "after"
+            assert user.id == sa_user.id == 1
     finally:
         catalyst_engine.dispose()
         sa_engine.dispose()

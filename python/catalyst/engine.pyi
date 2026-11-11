@@ -11,6 +11,8 @@ from ._catalyst import (
     NativeMysqlConnection,
     NativePgConnection,
     NativeResult,
+    NativeUow,
+    StatementError,
 )
 from .expression import Compiled, Delete, Insert, Select, Update
 
@@ -23,7 +25,12 @@ class TextClause:
 
 @final
 class CursorResult:
-    def __init__(self, native_result: NativeResult, entity: type[object] | None = ...) -> None: ...
+    def __init__(
+        self,
+        native_result: NativeResult,
+        entity: type[object] | None = ...,
+        uow: NativeUow | None = ...,
+    ) -> None: ...
     @property
     def native_result(self) -> NativeResult: ...
     @property
@@ -60,8 +67,11 @@ class ScalarResult:
     def one_or_none(self) -> object | None: ...
     def __iter__(self) -> Iterator[object]: ...
 
+def _statement_error(orig: BaseException, statement: str, params: object) -> StatementError: ...
+
 @final
 class Connection:
+    _native: NativeConnection
     def __init__(self, native: NativeConnection, *, echo: bool = False) -> None: ...
     def execute(
         self,

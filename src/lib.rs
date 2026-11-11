@@ -4,6 +4,7 @@ mod expr;
 mod mysql;
 mod pool;
 mod postgres;
+mod session;
 
 use pyo3::PyTypeInfo;
 use pyo3::create_exception;
@@ -101,6 +102,20 @@ create_exception!(
     InvalidRequestError,
     SQLAlchemyError,
     "Raised when a connection transaction operation is invalid."
+);
+
+create_exception!(
+    _catalyst,
+    PendingRollbackError,
+    InvalidRequestError,
+    "Raised when a session operation is attempted while a rollback is pending."
+);
+
+create_exception!(
+    _catalyst,
+    UnmappedInstanceError,
+    InvalidRequestError,
+    "Raised when an operation is attempted on an object that is not mapped."
 );
 
 /// A native SQLite engine owning a bounded connection pool.
@@ -480,6 +495,113 @@ impl NativeConnection {
             rows,
             next_row: 0,
             rowcount,
+        })
+    }
+
+    /// Execute one unit-of-work flush batch in a single FFI crossing.
+    ///
+    /// `ops` is a list of `(sql, positional_params, bind_type_tags, wants_pk)`
+    /// tuples describing INSERT/UPDATE/DELETE statements in execution order.
+    /// Every op runs inside this holder's autobegun transaction; each op
+    /// flagged `wants_pk` reports `last_insert_rowid()`, so the returned list
+    /// is index-aligned with `ops` (`None` for non-PK-returning ops).
+    fn execute_flush(&self, ops: &Bound<'_, PyList>, py: Python<'_>) -> PyResult<Vec<Option<i64>>> {
+        struct PreparedOp {
+            sql: String,
+            values: Vec<Value>,
+            wants_pk: bool,
+        }
+        let mut prepared = Vec::with_capacity(ops.len());
+        let mut contexts = Vec::with_capacity(ops.len());
+        for item in ops.iter() {
+            let op = item.cast::<PyTuple>()?;
+            let sql: String = op.get_item(0)?.extract()?;
+            let params = op.get_item(1)?;
+            let params_list = params.cast::<PyList>()?;
+            let bind_types: Vec<Option<String>> = op.get_item(2)?.extract()?;
+            let wants_pk: bool = op.get_item(3)?.extract()?;
+            // Typed bind conversion happens under the GIL like execute(); a
+            // conversion failure is wrapped in StatementError before the batch
+            // runs so no statement is partially applied.
+            let values = params_list
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    python_to_sqlite_typed(&value, bind_types.get(index).and_then(Option::as_deref))
+                })
+                .collect::<PyResult<Vec<Value>>>()
+                .map_err(|error| wrap_statement_error(py, error, &sql, &params))?;
+            prepared.push(PreparedOp {
+                sql: sql.clone(),
+                values,
+                wants_pk,
+            });
+            contexts.push((sql, params.unbind()));
+        }
+        let connection_guard = self
+            .connection
+            .lock()
+            .map_err(|_| OperationalError::new_err("SQLite connection lock was poisoned"))?;
+        let checkout = connection_guard
+            .as_ref()
+            .ok_or_else(|| OperationalError::new_err("Connection is closed"))?;
+        let connection = checkout.connection_handle().map_err(map_pool_error)?;
+        let transaction_state = checkout.transaction_handle().map_err(map_pool_error)?;
+        let holder_active = &self.holder_active;
+        drop(connection_guard);
+
+        let executed = py.detach(move || {
+            let preamble = |error: PyErr| (usize::MAX, error);
+            let mut state = transaction_state.lock().map_err(|_| {
+                preamble(OperationalError::new_err(
+                    "Transaction state lock was poisoned",
+                ))
+            })?;
+            let connection = connection.lock().map_err(|_| {
+                preamble(OperationalError::new_err(
+                    "SQLite connection lock was poisoned",
+                ))
+            })?;
+            if connection.is_autocommit() {
+                state.active = false;
+                state.savepoints.clear();
+                connection
+                    .execute_batch("BEGIN")
+                    .map_err(|error| preamble(map_sqlite_error(error)))?;
+                state.active = true;
+            } else {
+                state.active = true;
+            }
+            holder_active.store(true, Ordering::Release);
+            let mut results = Vec::with_capacity(prepared.len());
+            for (index, op) in prepared.iter().enumerate() {
+                let outcome = (|| -> Result<Option<i64>, rusqlite::Error> {
+                    let mut statement = connection.prepare_cached(&op.sql)?;
+                    statement.execute(params_from_iter(op.values.iter()))?;
+                    Ok(if op.wants_pk {
+                        Some(connection.last_insert_rowid())
+                    } else {
+                        None
+                    })
+                })();
+                match outcome {
+                    Ok(pk) => results.push(pk),
+                    Err(error) => {
+                        return Err::<Vec<Option<i64>>, (usize, PyErr)>((
+                            index,
+                            map_sqlite_error(error),
+                        ));
+                    }
+                }
+            }
+            Ok(results)
+        });
+        executed.map_err(|(index, error)| {
+            if index >= contexts.len() {
+                return error;
+            }
+            let (sql, params) = &contexts[index];
+            annotate_flush_error(py, error, sql, params.bind(py))
         })
     }
 
@@ -1353,6 +1475,46 @@ pub(crate) fn wrap_statement_error(
     wrapped
 }
 
+/// Rebuild a driver error from a flush op with SQLAlchemy's statement context:
+/// the concrete `DBAPIError` class is preserved while the message gains the
+/// `(<module>.<Class>) <cause>\n[SQL: ...]\n[parameters: ...]` shape, and
+/// `.orig`, `.statement`, and `.params` are attached like `StatementError`.
+fn annotate_flush_error(
+    py: Python<'_>,
+    error: PyErr,
+    sql: &str,
+    parameters: &Bound<'_, PyAny>,
+) -> PyErr {
+    let ty = error.get_type(py);
+    let detail = error
+        .value(py)
+        .str()
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    let module = ty
+        .module()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "catalyst._catalyst".to_owned());
+    let qualname = ty
+        .qualname()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "Error".to_owned());
+    let mut message = format!("({module}.{qualname}) {detail}\n[SQL: {sql}]");
+    if parameters.is_truthy().unwrap_or(false) {
+        let rendered = parameters
+            .repr()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        message.push_str(&format!("\n[parameters: {rendered}]"));
+    }
+    let wrapped = PyErr::from_type(ty, (message,));
+    let instance = wrapped.value(py);
+    let _ = instance.setattr("orig", error.value(py));
+    let _ = instance.setattr("statement", sql);
+    let _ = instance.setattr("params", parameters);
+    wrapped
+}
+
 fn convert_positional_values(
     values: &Bound<'_, PyAny>,
     types: &[Option<String>],
@@ -1448,6 +1610,14 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "InvalidRequestError",
         module.py().get_type::<InvalidRequestError>(),
     )?;
+    module.add(
+        "PendingRollbackError",
+        module.py().get_type::<PendingRollbackError>(),
+    )?;
+    module.add(
+        "UnmappedInstanceError",
+        module.py().get_type::<UnmappedInstanceError>(),
+    )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
     module.add_class::<postgres::NativePgEngine>()?;
@@ -1455,6 +1625,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<mysql::NativeMysqlEngine>()?;
     module.add_class::<mysql::NativeMysqlConnection>()?;
     module.add_class::<NativeResult>()?;
+    module.add_class::<session::NativeUow>()?;
     module.add_function(wrap_pyfunction!(sqlite_text, module)?)?;
     module.add_function(wrap_pyfunction!(expr::compile_expression, module)?)?;
     module.add(
@@ -1473,11 +1644,14 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "DataError",
             "TimeoutError",
             "InvalidRequestError",
+            "PendingRollbackError",
+            "UnmappedInstanceError",
             "sqlite_text",
             "compile_expression",
             "NativeEngine",
             "NativeConnection",
             "NativeResult",
+            "NativeUow",
             "NativePgEngine",
             "NativePgConnection",
             "NativeMysqlEngine",

@@ -24,6 +24,7 @@ from ._catalyst import (
     NativePgConnection,
     NativePgEngine,
     NativeResult,
+    NativeUow,
     StatementError,
 )
 from .expression import Compiled, Delete, Insert, Select, Table, Update
@@ -115,9 +116,17 @@ class CursorResult:
     With ``entity``, the buffered rows hydrate into mapped class instances in
     one batched Rust call and each result row is the one-tuple ``(entity,)``,
     matching SQLAlchemy's ORM-level ``Session.execute(select(Entity))``.
+    When a session's ``uow`` is supplied, hydrated instances are reconciled
+    with the identity map in the same crossing: rows whose primary key is
+    already mapped yield the previously returned instance.
     """
 
-    def __init__(self, native_result: NativeResult, entity: type[object] | None = None) -> None:
+    def __init__(
+        self,
+        native_result: NativeResult,
+        entity: type[object] | None = None,
+        uow: NativeUow | None = None,
+    ) -> None:
         self._native_result = native_result
         self._entity = entity
         self._entity_rows: list[tuple[object, ...]] | None = None
@@ -125,6 +134,9 @@ class CursorResult:
         if entity is not None:
             mapper = cast(Any, entity).__mapper__
             instances = native_result.hydrate(entity, list(mapper.attrs))
+            pk_attr = getattr(mapper, "pk_attr", None)
+            if uow is not None and pk_attr is not None:
+                instances = uow.reconcile(entity, pk_attr, list(mapper.attrs), instances)
             self._entity_rows = [(instance,) for instance in instances]
 
     @property
@@ -300,6 +312,15 @@ class Connection:
         """Execute SQL with positional, named, or batched parameters."""
         if self._closed:
             raise RuntimeError("Connection is closed")
+        duck_statement = cast(object, statement)
+        if not isinstance(
+            duck_statement, (str, TextClause, Compiled, Select, Insert, Update, Delete)
+        ):
+            # Duck-type SQLAlchemy-shaped text clauses so cross-toolkit
+            # helpers (``sqlalchemy.text(...)`` on a Catalyst connection) run.
+            text_value = getattr(duck_statement, "text", None)
+            if isinstance(text_value, str):
+                statement = TextClause(text_value)
         if (
             isinstance(statement, TextClause)
             and parameters is not None

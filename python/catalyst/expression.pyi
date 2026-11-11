@@ -46,6 +46,8 @@ class Column:
     server_default: str | None
     table_name: str
     owner: Table | None
+    key: str
+    def __get__(self, instance: object, owner: object = ...) -> object: ...
     def __init__(
         self,
         name: str,
