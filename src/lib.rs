@@ -506,9 +506,18 @@ impl NativeConnection {
     /// flagged `wants_pk` reports `last_insert_rowid()`, so the returned list
     /// is index-aligned with `ops` (`None` for non-PK-returning ops).
     fn execute_flush(&self, ops: &Bound<'_, PyList>, py: Python<'_>) -> PyResult<Vec<Option<i64>>> {
+        /// One positional bind: a converted value, or `Deferred(op_index)` for
+        /// ORM relationship FK sync — the marker ``("__catalyst_rowid__", i)``
+        /// resolves at execution time to op `i`'s returned rowid so dependent
+        /// children can bind their parent's fresh primary key inside the same
+        /// single FFI crossing.
+        enum FlushBind {
+            Bound(Value),
+            Deferred(usize),
+        }
         struct PreparedOp {
             sql: String,
-            values: Vec<Value>,
+            values: Vec<FlushBind>,
             wants_pk: bool,
         }
         let mut prepared = Vec::with_capacity(ops.len());
@@ -526,10 +535,20 @@ impl NativeConnection {
             let values = params_list
                 .iter()
                 .enumerate()
-                .map(|(index, value)| {
-                    python_to_sqlite_typed(&value, bind_types.get(index).and_then(Option::as_deref))
+                .map(|(index, value)| -> PyResult<FlushBind> {
+                    if let Ok(marker) = value.cast::<PyTuple>()
+                        && marker.len() == 2
+                        && let Ok(tag) = marker.get_item(0)?.extract::<String>()
+                        && tag == "__catalyst_rowid__"
+                    {
+                        return Ok(FlushBind::Deferred(marker.get_item(1)?.extract::<usize>()?));
+                    }
+                    Ok(FlushBind::Bound(python_to_sqlite_typed(
+                        &value,
+                        bind_types.get(index).and_then(Option::as_deref),
+                    )?))
                 })
-                .collect::<PyResult<Vec<Value>>>()
+                .collect::<PyResult<Vec<FlushBind>>>()
                 .map_err(|error| wrap_statement_error(py, error, &sql, &params))?;
             prepared.push(PreparedOp {
                 sql: sql.clone(),
@@ -573,11 +592,23 @@ impl NativeConnection {
                 state.active = true;
             }
             holder_active.store(true, Ordering::Release);
-            let mut results = Vec::with_capacity(prepared.len());
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(prepared.len());
             for (index, op) in prepared.iter().enumerate() {
                 let outcome = (|| -> Result<Option<i64>, rusqlite::Error> {
                     let mut statement = connection.prepare_cached(&op.sql)?;
-                    statement.execute(params_from_iter(op.values.iter()))?;
+                    let bound: Vec<Value> = op
+                        .values
+                        .iter()
+                        .map(|bind| match bind {
+                            FlushBind::Bound(value) => value.clone(),
+                            FlushBind::Deferred(dep) => results
+                                .get(*dep)
+                                .and_then(|rowid| *rowid)
+                                .map(Value::Integer)
+                                .unwrap_or(Value::Null),
+                        })
+                        .collect();
+                    statement.execute(params_from_iter(bound.iter()))?;
                     Ok(if op.wants_pk {
                         Some(connection.last_insert_rowid())
                     } else {
@@ -943,6 +974,47 @@ impl NativeResult {
         }
         self.next_row = self.rows.len();
         Ok(instances)
+    }
+
+    /// Hydrate a joined (eager-load) result set in one crossing.
+    ///
+    /// `specs` is a list of `(cls, attrs)` pairs; each row is partitioned
+    /// left-to-right across the specs' attribute lists. Returns one tuple per
+    /// row holding an instance per spec — `None` where that spec's whole
+    /// column slice is NULL (outer-join misses). Consumes remaining rows.
+    fn hydrate_entities(
+        &mut self,
+        py: Python<'_>,
+        specs: Vec<(Bound<'_, PyAny>, Vec<String>)>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let allocators = specs
+            .iter()
+            .map(|(cls, _)| cls.getattr("__new__"))
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut out = Vec::with_capacity(self.rows.len().saturating_sub(self.next_row));
+        for row in &self.rows[self.next_row..] {
+            let mut offset = 0usize;
+            let mut items: Vec<Py<PyAny>> = Vec::with_capacity(specs.len());
+            for ((cls, attrs), allocator) in specs.iter().zip(allocators.iter()) {
+                let end = offset + attrs.len();
+                let slice = &row[offset.min(row.len())..end.min(row.len())];
+                let all_null =
+                    slice.len() == attrs.len() && slice.iter().all(|v| v.bind(py).is_none());
+                if all_null {
+                    items.push(py.None());
+                } else {
+                    let instance = allocator.call1((cls,))?;
+                    for (attr, value) in attrs.iter().zip(slice.iter()) {
+                        instance.setattr(attr.as_str(), value.clone_ref(py))?;
+                    }
+                    items.push(instance.unbind().into_any());
+                }
+                offset = end;
+            }
+            out.push(PyTuple::new(py, items)?.into_any().unbind());
+        }
+        self.next_row = self.rows.len();
+        Ok(out)
     }
 }
 

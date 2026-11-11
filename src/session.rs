@@ -341,6 +341,18 @@ impl NativeUow {
         Ok(expired)
     }
 
+    /// Drop one object's state and identity entry entirely (SQLAlchemy
+    /// detach/expunge semantics); returns whether the object was managed.
+    fn detach(&mut self, obj: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
+        match self.states.remove(&object_id(obj)) {
+            Some(state) => {
+                self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Drop all tracking (Session.close releases the whole registry).
     fn clear(&mut self) {
         self.states.clear();

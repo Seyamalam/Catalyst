@@ -126,18 +126,26 @@ class CursorResult:
         native_result: NativeResult,
         entity: type[object] | None = None,
         uow: NativeUow | None = None,
+        *,
+        entity_rows: list[tuple[object, ...]] | None = None,
+        requires_unique: bool = False,
     ) -> None:
         self._native_result = native_result
         self._entity = entity
-        self._entity_rows: list[tuple[object, ...]] | None = None
+        self.entity_rows = entity_rows
         self._entity_index = 0
-        if entity is not None:
+        # SQLAlchemy requires .unique() before consuming results that carry a
+        # joined eager load against collections.
+        self._requires_unique = requires_unique
+        self._unique = False
+        self._seen: set[object] = set()
+        if self.entity_rows is None and entity is not None:
             mapper = cast(Any, entity).__mapper__
             instances = native_result.hydrate(entity, list(mapper.attrs))
             pk_attr = getattr(mapper, "pk_attr", None)
             if uow is not None and pk_attr is not None:
                 instances = uow.reconcile(entity, pk_attr, list(mapper.attrs), instances)
-            self._entity_rows = [(instance,) for instance in instances]
+            self.entity_rows = [(instance,) for instance in instances]
 
     @property
     def native_result(self) -> NativeResult:
@@ -147,7 +155,7 @@ class CursorResult:
     @property
     def keys(self) -> tuple[str, ...]:
         """Return result column names in database order."""
-        if self._entity_rows is not None and self._entity is not None:
+        if self.entity_rows is not None and self._entity is not None:
             return (self._entity.__name__,)
         return tuple(self._native_result.keys)
 
@@ -156,23 +164,66 @@ class CursorResult:
         """Return the number of rows changed by the statement."""
         return int(self._native_result.rowcount)
 
+    def unique(self) -> CursorResult:
+        """Deduplicate rows, matching SQLAlchemy's ``Result.unique()``.
+
+        Required before consuming results from a joined eager load against a
+        collection relationship; elsewhere it dedupes identity rows.
+        """
+        self._unique = True
+        return self
+
+    def _check_unique_required(self) -> None:
+        if self._requires_unique and not self._unique:
+            raise InvalidRequestError(
+                "The unique() method must be invoked on this Result, as it "
+                "contains results that include joined eager loads against "
+                "collections"
+            )
+
+    def _claim(self, row: tuple[object, ...]) -> bool:
+        """Register ``row`` for unique() dedupe; True when first seen."""
+        if self.entity_rows is not None:
+            key: object = id(row[0])
+        else:
+            try:
+                hash(row)
+                key = row
+            except TypeError:
+                key = id(row)
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        return True
+
     def fetchone(self) -> tuple[object, ...] | None:
         """Fetch the next row, or ``None`` when the result is exhausted."""
-        if self._entity_rows is None:
-            return self._native_result.fetchone()
-        if self._entity_index >= len(self._entity_rows):
-            return None
-        row = self._entity_rows[self._entity_index]
-        self._entity_index += 1
-        return row
+        self._check_unique_required()
+        if self.entity_rows is None:
+            if not self._unique:
+                return self._native_result.fetchone()
+            while True:
+                row = self._native_result.fetchone()
+                if row is None or self._claim(row):
+                    return row
+        while self._entity_index < len(self.entity_rows):
+            row = self.entity_rows[self._entity_index]
+            self._entity_index += 1
+            if not self._unique or self._claim(row):
+                return row
+        return None
 
     def fetchall(self) -> list[tuple[object, ...]]:
         """Fetch all remaining rows."""
-        if self._entity_rows is None:
-            return self._native_result.fetchall()
-        rows = self._entity_rows[self._entity_index :]
-        self._entity_index = len(self._entity_rows)
-        return rows
+        self._check_unique_required()
+        if self.entity_rows is None:
+            rows = self._native_result.fetchall()
+        else:
+            rows = self.entity_rows[self._entity_index :]
+            self._entity_index = len(self.entity_rows)
+        if not self._unique:
+            return rows
+        return [row for row in rows if self._claim(row)]
 
     def all(self) -> list[tuple[object, ...]]:
         """Fetch all remaining rows."""
@@ -263,6 +314,15 @@ class ScalarResult:
     def all(self) -> list[object]:
         """Fetch the first column of all remaining rows."""
         return self.fetchall()
+
+    def unique(self) -> ScalarResult:
+        """Deduplicate results, matching SQLAlchemy's ``ScalarResult.unique()``.
+
+        Required before consuming results from a joined eager load against a
+        collection relationship.
+        """
+        self._result.unique()
+        return self
 
     def first(self) -> object | None:
         """Fetch the first row's first column, or ``None``."""

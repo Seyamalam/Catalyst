@@ -1,8 +1,9 @@
 """Type information for Catalyst's declarative ORM mapping surface."""
 
+import builtins
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from typing import Any, ClassVar, Generic, TypeVar, overload
+from typing import Any, ClassVar, Generic, SupportsIndex, TypeVar, overload
 
 from typing_extensions import dataclass_transform
 
@@ -18,6 +19,7 @@ from .expression import (
     Column,
     Compiled,
     Delete,
+    ForeignKey,
     Insert,
     MetaData,
     Select,
@@ -53,6 +55,7 @@ class MappedColumn(Mapped[_T]):
     name: str | None
     init: bool
     kw_only: bool
+    foreign_key: ForeignKey | None
     def __init__(
         self,
         type_: object = ...,
@@ -65,12 +68,13 @@ class MappedColumn(Mapped[_T]):
         name: str | None = ...,
         init: bool = ...,
         kw_only: bool = ...,
+        foreign_key: ForeignKey | None = ...,
     ) -> None: ...
 
 def mapped_column(
     name_or_type: object = ...,
     type_: object = ...,
-    *,
+    *args: object,
     primary_key: bool = ...,
     nullable: bool | None = ...,
     unique: bool = ...,
@@ -91,6 +95,10 @@ class Mapper(Generic[_T]):
     attr_columns: dict[str, Column]
     pk_column: Column | None
     pk_attr: str | None
+    relationships: dict[str, RelationshipProperty]
+    pending_relationships: list[Relationship[Any]]
+    relationship_attrs: tuple[str, ...]
+    class_registry: dict[str, type[object]]
     def __init__(
         self,
         class_: type[_T],
@@ -99,9 +107,100 @@ class Mapper(Generic[_T]):
         specs: dict[str, MappedColumn[Any] | None],
     ) -> None: ...
 
+class RelationshipProperty:
+    """A configured relationship: resolved target, direction, and join columns."""
+
+    key: str
+    mapper: Mapper[Any]
+    entity: type[object]
+    target_mapper: Mapper[Any]
+    direction: str
+    uselist: bool
+    lazy: str
+    cascade: frozenset[str]
+    back_populates: str | None
+    sibling: RelationshipProperty | None
+    descriptor: Relationship[Any]
+    local_attr: str
+    local_col: Column
+    remote_attr: str
+    remote_col: Column
+
+class Relationship(Generic[_T]):
+    """Declarative relationship marker installed as a class attribute.
+
+    Runtime class access yields :class:`InstrumentedAttribute` and instance
+    access returns the stored/lazily-loaded value.
+    """
+
+    argument: object
+    back_populates: str | None
+    backref: str | None
+    lazy: str
+    uselist: bool | None
+    cascade: object
+    key: str | None
+    declaring_cls: type[object] | None
+    container: str | None
+    target_hint: object
+    configured: RelationshipProperty | None
+    def __init__(
+        self,
+        argument: object = ...,
+        *,
+        back_populates: str | None = ...,
+        backref: str | None = ...,
+        lazy: str = ...,
+        uselist: bool | None = ...,
+        cascade: object = ...,
+    ) -> None: ...
+    def __get__(self, instance: object, owner: object = ...) -> object: ...
+    def __set__(self, instance: object, value: object) -> None: ...
+    def __delete__(self, instance: object) -> None: ...
+    def configure(self) -> RelationshipProperty: ...
+    @builtins.property
+    def property(self) -> RelationshipProperty: ...
+
+def relationship(
+    argument: object = ...,
+    *,
+    back_populates: str | None = ...,
+    backref: str | None = ...,
+    lazy: str = ...,
+    uselist: bool | None = ...,
+    cascade: object = ...,
+    **kw: object,
+) -> Relationship[Any]: ...
+
+class InstrumentedAttribute:
+    """Class-level view of a mapped relationship attribute."""
+
+    def __init__(self, owner: type[object] | None, decl: Relationship[Any]) -> None: ...
+    @builtins.property
+    def key(self) -> str | None: ...
+    @builtins.property
+    def property(self) -> RelationshipProperty: ...
+
+class InstrumentedList(list[object]):
+    """List subclass tracking membership for back-population."""
+
+    owner: object | None
+    def __init__(self, iterable: Iterable[object] = ...) -> None: ...
+    def bind(self, instance: object, prop: RelationshipProperty) -> InstrumentedList: ...
+    def append(self, item: object) -> None: ...
+    def extend(self, items: Iterable[object]) -> None: ...
+    def insert(self, index: SupportsIndex, item: object) -> None: ...
+    def remove(self, item: object) -> None: ...
+    def pop(self, index: SupportsIndex = ...) -> object: ...
+    def clear(self) -> None: ...
+
+def joinedload(attr: object) -> object: ...
+def selectinload(attr: object) -> object: ...
+def configure_mappers() -> None: ...
+
 @dataclass_transform(
     kw_only_default=True,
-    field_specifiers=(MappedColumn, mapped_column),
+    field_specifiers=(MappedColumn, mapped_column, relationship),
 )
 class DeclarativeBase:
     metadata: ClassVar[MetaData]

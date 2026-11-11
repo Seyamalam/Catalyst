@@ -62,6 +62,7 @@ from .expression import (
     Double,
     Expression,
     Float,
+    ForeignKey,
     Integer,
     LargeBinary,
     MetaData,
@@ -87,7 +88,10 @@ from .orm import (
     Mapper,
     Session,
     declarative_base,
+    joinedload,
     mapped_column,
+    relationship,
+    selectinload,
 )
 
 __all__ = [
@@ -137,6 +141,7 @@ __all__ = [
     "Numeric",
     "Expression",
     "Compiled",
+    "ForeignKey",
     "select",
     "insert",
     "update",
@@ -154,6 +159,9 @@ __all__ = [
     "Mapper",
     "Session",
     "mapped_column",
+    "relationship",
+    "joinedload",
+    "selectinload",
     "NativeEngine",
     "NativeConnection",
     "NativeResult",

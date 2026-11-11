@@ -180,6 +180,43 @@ class Numeric(TypeEngine):
 
 
 @dataclass(frozen=True, slots=True)
+class ForeignKey:
+    """Reference to a remote column, e.g. ``ForeignKey("parent.id")``.
+
+    The target is stored as ``"table.column"`` text and resolved lazily
+    against table names in the owning :class:`MetaData`, matching
+    SQLAlchemy's string-target behavior.
+    """
+
+    target: str
+
+    def __post_init__(self) -> None:
+        if "." not in self.target:
+            raise ArgumentError(
+                f"ForeignKey target '{self.target}' must be of the form 'table.column'"
+            )
+
+    @property
+    def target_table(self) -> str:
+        return self.target.rsplit(".", 1)[0]
+
+    @property
+    def target_column(self) -> str:
+        return self.target.rsplit(".", 1)[1]
+
+
+# Defaults restored when a positionally-passed ForeignKey is relocated into
+# the ``foreign_key`` field by ``Column.__post_init__``.
+_COLUMN_FIELD_DEFAULTS: dict[str, object] = {
+    "primary_key": False,
+    "nullable": None,
+    "unique": False,
+    "default": None,
+    "server_default": None,
+}
+
+
+@dataclass(frozen=True, slots=True)
 class Column:
     name: str
     type: object = None
@@ -192,11 +229,23 @@ class Column:
     # matching SQLAlchemy's ``Column.default``).
     default: object = None
     server_default: str | None = None
+    foreign_key: ForeignKey | None = None
     table_name: str = field(default="", init=False, repr=False, compare=False)
     owner: Table | None = field(default=None, init=False, repr=False, compare=False)
     # Mapped attribute name when bound to a declarative class; used by
     # ``__get__`` to resolve instance state (the column name can differ).
     key: str = field(default="", init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Accept ``Column("x", Integer, ForeignKey("t.c"))`` positionally like
+        # SQLAlchemy's ``*args`` handling: a ForeignKey found among the scalar
+        # fields is relocated into ``foreign_key``.
+        for fname in ("primary_key", "nullable", "unique", "default", "server_default"):
+            value = getattr(self, fname)
+            if isinstance(value, ForeignKey):
+                if self.foreign_key is None:
+                    object.__setattr__(self, "foreign_key", value)
+                object.__setattr__(self, fname, _COLUMN_FIELD_DEFAULTS[fname])
 
     def __get__(self, instance: object, owner: object = None) -> object:
         # Non-data descriptor: the instance ``__dict__`` is consulted first, so
@@ -423,6 +472,7 @@ class Table:
                 column.unique,
                 column.default,
                 column.server_default,
+                column.foreign_key,
             )
             object.__setattr__(bound, "table_name", name)
             object.__setattr__(bound, "owner", self)
@@ -447,6 +497,11 @@ class Table:
             for column in self.columns
         )
         primary_key = tuple(column.name for column in self.columns if column.primary_key)
+        foreign_keys = tuple(
+            (column.name, column.foreign_key.target_table, column.foreign_key.target_column)
+            for column in self.columns
+            if column.foreign_key is not None
+        )
         (
             sql,
             _params,
@@ -457,7 +512,8 @@ class Table:
             _result_types,
             _bind_error,
         ) = compile_expression(
-            ("create_table", self.name, columns, primary_key), _dialect_name(dialect)
+            ("create_table", self.name, columns, primary_key, foreign_keys),
+            _dialect_name(dialect),
         )
         return Compiled(sql, {}, kind, [], [], [], [])
 
@@ -799,6 +855,10 @@ class Select:
     row_limit: int | None = None
     row_offset: int | None = None
     entity: type[object] | None = None
+    # ORM-side LEFT OUTER JOIN specs: (table name, alias, serialized ON node).
+    joins: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
+    # Loader options (joinedload/selectinload) applied by Session.execute.
+    loader_options: tuple[object, ...] = ()
 
     def where(self, *clauses: Column | Expression | bool) -> Select:
         if not clauses:
@@ -818,6 +878,8 @@ class Select:
             self.row_limit,
             self.row_offset,
             self.entity,
+            self.joins,
+            self.loader_options,
         )
 
     def order_by(self, *clauses: Column | Expression) -> Select:
@@ -829,6 +891,8 @@ class Select:
             self.row_limit,
             self.row_offset,
             self.entity,
+            self.joins,
+            self.loader_options,
         )
 
     def limit(self, value: int) -> Select:
@@ -840,6 +904,8 @@ class Select:
             value,
             self.row_offset,
             self.entity,
+            self.joins,
+            self.loader_options,
         )
 
     def offset(self, value: int) -> Select:
@@ -851,6 +917,24 @@ class Select:
             self.row_limit,
             value,
             self.entity,
+            self.joins,
+            self.loader_options,
+        )
+
+    def options(self, *opts: object) -> Select:
+        """Attach ORM loader options (``joinedload``/``selectinload``)."""
+        if not opts:
+            return self
+        return Select(
+            self.columns,
+            self.table,
+            cast("Column | Expression | None", self.predicate),
+            self.ordering,
+            self.row_limit,
+            self.row_offset,
+            self.entity,
+            self.joins,
+            self.loader_options + tuple(opts),
         )
 
     def _serialize(self, dialect: str = "sqlite") -> tuple[object, ...]:
@@ -919,6 +1003,10 @@ class Select:
                 if has_pagination
                 else None
             )
+        joins = tuple(
+            ("left_outer_join", join_table, alias, on_node)
+            for join_table, alias, on_node in self.joins
+        )
         return (
             "select",
             nodes,
@@ -927,6 +1015,7 @@ class Select:
             ordering,
             limit,
             offset,
+            joins,
         )
 
     def compile(self, dialect: str | None = None) -> Compiled:

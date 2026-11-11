@@ -69,15 +69,26 @@ enum Expr {
     Neg(Box<Expr>),
 }
 
+/// A LEFT OUTER JOIN clause serialized from the ORM eager-loading path:
+/// target table name, render alias, and the ON expression.
+#[derive(Clone)]
+struct JoinSpec {
+    table: String,
+    alias: String,
+    on: Expr,
+}
+
 #[derive(Clone)]
 enum Statement {
     Select {
         columns: Vec<Expr>,
         table: Option<String>,
-        predicate: Option<Expr>,
+        // Boxed to keep the variant small (clippy::large_enum_variant).
+        predicate: Option<Box<Expr>>,
         order: Vec<Expr>,
-        limit: Option<Expr>,
-        offset: Option<Expr>,
+        limit: Option<Box<Expr>>,
+        offset: Option<Box<Expr>>,
+        joins: Vec<JoinSpec>,
     },
     Insert {
         table: String,
@@ -96,6 +107,7 @@ enum Statement {
         table: String,
         columns: Vec<ColumnDdl>,
         primary_key: Vec<String>,
+        foreign_keys: Vec<(String, String, String)>,
     },
     DropTable {
         table: String,
@@ -629,6 +641,7 @@ impl Compiler {
                 order,
                 limit,
                 offset,
+                joins,
             } => {
                 self.sql.push_str("SELECT");
                 if !columns.is_empty() {
@@ -643,6 +656,16 @@ impl Compiler {
                 if let Some(table) = table {
                     self.sql.push_str(" \nFROM ");
                     self.ident(table);
+                }
+                for join in joins {
+                    // SQLAlchemy renders eager LEFT OUTER JOINs with an alias:
+                    // ``LEFT OUTER JOIN rel_child AS rel_child_1 ON ...``.
+                    self.sql.push_str(" LEFT OUTER JOIN ");
+                    self.ident(&join.table);
+                    self.sql.push_str(" AS ");
+                    self.ident(&join.alias);
+                    self.sql.push_str(" ON ");
+                    self.expr(&join.on, None);
                 }
                 if let Some(predicate) = predicate
                     && !renders_empty(predicate)
@@ -771,6 +794,7 @@ impl Compiler {
                 table,
                 columns,
                 primary_key,
+                foreign_keys,
             } => {
                 let dialect = self.dialect;
                 let quote = |value: &str| quote_ident(value, dialect);
@@ -828,6 +852,16 @@ impl Compiler {
                 }
                 for column in columns.iter().filter(|column| column.unique) {
                     lines.push(format!("UNIQUE ({})", quote(&column.name)));
+                }
+                // SQLAlchemy emits one table-level FK clause per foreign key
+                // column, after PRIMARY KEY/UNIQUE: ``FOREIGN KEY(a) REFERENCES t (b)``.
+                for (column, ref_table, ref_column) in foreign_keys {
+                    lines.push(format!(
+                        "FOREIGN KEY({}) REFERENCES {} ({})",
+                        quote(column),
+                        quote(ref_table),
+                        quote(ref_column)
+                    ));
                 }
                 self.sql.push_str(&lines.join(", \n\t"));
                 if lines.is_empty() {
@@ -1745,7 +1779,7 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
             let predicate = if predicate_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&predicate_value, dialect)?)
+                Some(Box::new(parse_expr(&predicate_value, dialect)?))
             };
             let order = seq(&item(value, 4)?)?
                 .iter()
@@ -1755,13 +1789,32 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
             let limit = if limit_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&limit_value, dialect)?)
+                Some(Box::new(parse_expr(&limit_value, dialect)?))
             };
             let offset_value = item(value, 6)?;
             let offset = if offset_value.is_none() {
                 None
             } else {
-                Some(parse_expr(&offset_value, dialect)?)
+                Some(Box::new(parse_expr(&offset_value, dialect)?))
+            };
+            let joins = match seq(value)?.get(7) {
+                Some(join_values) if !join_values.is_none() => seq(join_values)?
+                    .iter()
+                    .map(|join| {
+                        let kind = tag(join)?;
+                        if kind != "left_outer_join" {
+                            return Err(ArgumentError::new_err(format!(
+                                "Unsupported join kind '{kind}'"
+                            )));
+                        }
+                        Ok(JoinSpec {
+                            table: string_at(join, 1)?,
+                            alias: string_at(join, 2)?,
+                            on: parse_expr(&item(join, 3)?, dialect)?,
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+                _ => Vec::new(),
             };
             Ok(Statement::Select {
                 columns,
@@ -1770,6 +1823,7 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
                 order,
                 limit,
                 offset,
+                joins,
             })
         }
         "insert" => Ok(Statement::Insert {
@@ -1808,10 +1862,19 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
                 .iter()
                 .map(|key| key.extract())
                 .collect::<PyResult<Vec<_>>>()?;
+            // Optional element 4 carries (column, ref_table, ref_column) FKs.
+            let foreign_keys = match seq(value)?.get(4) {
+                Some(fk_values) if !fk_values.is_none() => seq(fk_values)?
+                    .iter()
+                    .map(|fk| Ok((string_at(fk, 0)?, string_at(fk, 1)?, string_at(fk, 2)?)))
+                    .collect::<PyResult<Vec<_>>>()?,
+                _ => Vec::new(),
+            };
             Ok(Statement::CreateTable {
                 table: string_at(value, 1)?,
                 columns,
                 primary_key,
+                foreign_keys,
             })
         }
         "drop_table" => Ok(Statement::DropTable {
