@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
 
-from ._catalyst import ArgumentError, compile_expression
+from ._catalyst import ArgumentError, DetachedInstanceError, compile_expression
 
 # Compiled statements are deterministic: memoize by the serialized form of the
 # frozen statement. Keys that are not hashable (arbitrary Python objects in
@@ -263,6 +263,14 @@ class Column:
             session = uow.session
             if session is not None:
                 session._load_expired(instance, key)
+        elif uow is None:
+            detached = instance_dict.get("_catalyst_detached")
+            if detached is not None and key in detached[2]:
+                raise DetachedInstanceError(
+                    f"Instance '<{type(instance).__name__} at 0x{id(instance):x}>' "
+                    "is not bound to a Session; attribute refresh operation "
+                    "cannot proceed"
+                )
         return instance_dict.get(key)
 
     def serialize(self) -> tuple[object, ...]:
@@ -1104,6 +1112,8 @@ class Update:
     table: Table
     values_map: Mapping[str, object] = field(default_factory=lambda: dict[str, object]())
     predicate: Column | Expression | None = None
+    entity: type[object] | None = None
+    exec_options: Mapping[str, object] = field(default_factory=lambda: dict[str, object]())
 
     def values(self, values: Mapping[str, object] | None = None, **kwargs: object) -> Update:
         # Chained .values() calls accumulate, matching SQLAlchemy semantics.
@@ -1111,7 +1121,13 @@ class Update:
         if values is not None:
             merged.update(values)
         merged.update(kwargs)
-        return Update(self.table, merged, cast("Column | Expression | None", self.predicate))
+        return Update(
+            self.table,
+            merged,
+            cast("Column | Expression | None", self.predicate),
+            self.entity,
+            self.exec_options,
+        )
 
     def where(self, *clauses: Column | Expression | bool) -> Update:
         if not clauses:
@@ -1123,7 +1139,18 @@ class Update:
         predicate = nodes[0] if len(nodes) == 1 else and_(*nodes)  # noqa: PR01
         if self.predicate is not None:
             predicate = and_(cast("Column | Expression", self.predicate), predicate)
-        return Update(self.table, self.values_map, predicate)
+        return Update(self.table, self.values_map, predicate, self.entity, self.exec_options)
+
+    def execution_options(self, **options: object) -> Update:
+        merged = dict(self.exec_options)
+        merged.update(options)
+        return Update(
+            self.table,
+            self.values_map,
+            cast("Column | Expression | None", self.predicate),
+            self.entity,
+            merged,
+        )
 
     def compile(self, dialect: str | None = None) -> Compiled:
         values: dict[str, tuple[object, ...]] = {
@@ -1162,6 +1189,8 @@ class Update:
 class Delete:
     table: Table
     predicate: Column | Expression | None = None
+    entity: type[object] | None = None
+    exec_options: Mapping[str, object] = field(default_factory=lambda: dict[str, object]())
 
     def where(self, *clauses: Column | Expression | bool) -> Delete:
         if not clauses:
@@ -1173,7 +1202,14 @@ class Delete:
         predicate = nodes[0] if len(nodes) == 1 else and_(*nodes)  # noqa: PR01
         if self.predicate is not None:
             predicate = and_(cast("Column | Expression", self.predicate), predicate)
-        return Delete(self.table, predicate)
+        return Delete(self.table, predicate, self.entity, self.exec_options)
+
+    def execution_options(self, **options: object) -> Delete:
+        merged = dict(self.exec_options)
+        merged.update(options)
+        return Delete(
+            self.table, cast("Column | Expression | None", self.predicate), self.entity, merged
+        )
 
     def compile(self, dialect: str | None = None) -> Compiled:
         stored = cast("Column | Expression | None", self.predicate)
@@ -1217,22 +1253,24 @@ def select(*columns: Column | Expression | Table | type[object]) -> Select:
     return Select(tuple(column for column in columns if isinstance(column, (Column, Expression))))
 
 
-def _dml_table(table: Table | type[object], verb: str) -> Table:
+def _dml_table(table: Table | type[object], verb: str) -> tuple[Table, type[object] | None]:
     if isinstance(table, Table):
-        return table
+        return table, None
     resolved = _entity_table(table)
     if resolved is None:
         raise ArgumentError(f"{verb}() expected a Table or mapped declarative class")
-    return resolved
+    return resolved, table
 
 
 def insert(table: Table | type[object]) -> Insert:
-    return Insert(_dml_table(table, "insert"))
+    return Insert(_dml_table(table, "insert")[0])
 
 
 def update(table: Table | type[object]) -> Update:
-    return Update(_dml_table(table, "update"))
+    resolved, entity = _dml_table(table, "update")
+    return Update(resolved, entity=entity)
 
 
 def delete(table: Table | type[object]) -> Delete:
-    return Delete(_dml_table(table, "delete"))
+    resolved, entity = _dml_table(table, "delete")
+    return Delete(resolved, entity=entity)

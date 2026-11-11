@@ -19,6 +19,9 @@ __all__ = [
     "InvalidRequestError",
     "PendingRollbackError",
     "UnmappedInstanceError",
+    "StaleDataError",
+    "ObjectDeletedError",
+    "DetachedInstanceError",
     "sqlite_text",
     "compile_expression",
     "NativeEngine",
@@ -247,6 +250,15 @@ class PendingRollbackError(InvalidRequestError):
 class UnmappedInstanceError(InvalidRequestError):
     """An operation was attempted on an object that is not mapped."""
 
+class StaleDataError(CatalystError):
+    """An UPDATE or DELETE matched fewer rows than expected."""
+
+class ObjectDeletedError(InvalidRequestError):
+    """An operation expected an object row that no longer exists."""
+
+class DetachedInstanceError(CatalystError):
+    """An unloaded attribute was accessed on a detached object."""
+
 @final
 class NativeUow:
     """Per-session unit-of-work registry: identity map plus object state.
@@ -284,7 +296,12 @@ class NativeUow:
     def un_delete(self, obj: object) -> None: ...
     def commit_transition(self) -> None: ...
     def rollback(self) -> list[object]: ...
-    def detach(self, obj: object) -> bool: ...
+    def expire_attrs(self, obj: object, names: list[str]) -> None: ...
+    def detach(self, obj: object) -> tuple[object | None, int, list[str], list[str]] | None: ...
+    def detach_all(
+        self,
+    ) -> list[tuple[object, object | None, int, list[str], list[str]]]: ...
+    def persistent_objects(self, cls: object) -> list[object]: ...
     def clear(self) -> None: ...
     def flush_transition(
         self,

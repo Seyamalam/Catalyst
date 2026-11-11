@@ -222,6 +222,8 @@ impl NativeUow {
     }
 
     /// Identity-map lookup: same `(class, pk)` returns the same instance.
+    /// Entries marked deleted are skipped — SQLAlchemy drops them from the
+    /// identity map when the delete is registered.
     fn identity_get(
         &self,
         cls: &Bound<'_, PyAny>,
@@ -231,7 +233,12 @@ impl NativeUow {
         let key = (cls.as_ptr() as usize, pk.hash()?);
         if let Some(entries) = self.identity.get(&key) {
             for (stored_pk, obj) in entries {
-                if stored_pk.bind(py).eq(pk)? {
+                let deleted = self
+                    .states
+                    .get(&(obj.as_ptr() as usize))
+                    .map(|state| state.status == DELETED)
+                    .unwrap_or(false);
+                if !deleted && stored_pk.bind(py).eq(pk)? {
                     return Ok(Some(obj.clone_ref(py)));
                 }
             }
@@ -341,16 +348,67 @@ impl NativeUow {
         Ok(expired)
     }
 
+    /// Set the expired set to exactly `names` (used when re-attaching a
+    /// detached object whose expired attribute set must be preserved).
+    fn expire_attrs(&mut self, obj: &Bound<'_, PyAny>, names: Vec<String>) {
+        if let Some(state) = self.states.get_mut(&object_id(obj)) {
+            state.expired_attrs = names.into_iter().collect();
+        }
+    }
+
     /// Drop one object's state and identity entry entirely (SQLAlchemy
-    /// detach/expunge semantics); returns whether the object was managed.
-    fn detach(&mut self, obj: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
+    /// detach/expunge semantics); returns `(pk, status, dirty, expired)` so
+    /// Python can stamp the detached-object marker that preserves
+    /// `state.modified`/`state.key` semantics, or `None` when unmanaged.
+    #[allow(clippy::type_complexity)]
+    fn detach(
+        &mut self,
+        obj: &Bound<'_, PyAny>,
+        py: Python<'_>,
+    ) -> PyResult<Option<(Option<Py<PyAny>>, u8, Vec<String>, Vec<String>)>> {
         match self.states.remove(&object_id(obj)) {
             Some(state) => {
                 self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
-                Ok(true)
+                let dirty = state.dirty_attrs.iter().cloned().collect();
+                let expired = state.expired_attrs.iter().cloned().collect();
+                Ok(Some((state.pk, state.status, dirty, expired)))
             }
-            None => Ok(false),
+            None => Ok(None),
         }
+    }
+
+    /// Detach every managed object in one crossing (expunge_all/close):
+    /// returns `(obj, pk, status, dirty, expired)` per object so Python can
+    /// stamp detached markers.
+    #[allow(clippy::type_complexity)]
+    fn detach_all(&mut self) -> Vec<(Py<PyAny>, Option<Py<PyAny>>, u8, Vec<String>, Vec<String>)> {
+        let states = self
+            .states
+            .drain()
+            .map(|(_, state)| state)
+            .collect::<Vec<_>>();
+        self.identity.clear();
+        states
+            .into_iter()
+            .map(|state| {
+                (
+                    state.obj,
+                    state.pk,
+                    state.status,
+                    state.dirty_attrs.into_iter().collect(),
+                    state.expired_attrs.into_iter().collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Managed persistent instances of `cls`, sequence ordered — the candidate
+    /// set ORM DML `synchronize_session` evaluates against.
+    fn persistent_objects(&self, py: Python<'_>, cls: &Bound<'_, PyAny>) -> Vec<Py<PyAny>> {
+        let class_ptr = cls.as_ptr() as usize;
+        self.ordered(py, |state| {
+            state.class_ptr == class_ptr && state.status == PERSISTENT
+        })
     }
 
     /// Drop all tracking (Session.close releases the whole registry).

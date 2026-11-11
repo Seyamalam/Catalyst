@@ -47,9 +47,12 @@ from typing_extensions import dataclass_transform
 
 from ._catalyst import (
     ArgumentError,
+    DetachedInstanceError,
     InvalidRequestError,
     NativeUow,
+    ObjectDeletedError,
     PendingRollbackError,
+    StaleDataError,
     UnmappedInstanceError,
 )
 from .engine import (
@@ -94,6 +97,14 @@ _T = TypeVar("_T")
 _STATUS_PENDING = 1
 _STATUS_PERSISTENT = 2
 _STATUS_DELETED = 3
+
+# ``__dict__`` marker stamped on detached objects: ``(pk, dirty, expired)`` —
+# the equivalent of SQLAlchemy's surviving ``InstanceState.key``/``.modified``
+# after expunge.  ``dirty``/``expired`` are tuples of attribute names.
+_DETACHED = "_catalyst_detached"
+
+# Sentinel for "no client-side column default" during bulk inserts.
+_MISSING = object()
 
 
 class Mapped(Generic[_T]):
@@ -808,6 +819,13 @@ def _load_relationship(instance: object, prop: RelationshipProperty) -> object:
     instance_dict = instance.__dict__
     if uow is None or not uow.is_managed(instance):
         # Transient/detached: an empty collection or the stored scalar.
+        detached = instance_dict.get(_DETACHED)
+        if detached is not None and prop.key in detached[2]:
+            raise DetachedInstanceError(
+                f"Instance '<{type(instance).__name__} at 0x{id(instance):x}>' "
+                "is not bound to a Session; attribute refresh operation "
+                "cannot proceed"
+            )
         if prop.uselist:
             return _collection_for(instance, prop)
         return instance_dict.get(prop.key)
@@ -1214,6 +1232,26 @@ def _require_mapper(instance: object) -> Mapper[Any]:
     return cast("Mapper[Any]", mapper)
 
 
+def _require_class_mapper(cls: type[object]) -> Mapper[Any]:
+    """Return the mapper for a mapped *class* (bulk APIs take the class)."""
+    mapper = getattr(cls, "__mapper__", None)
+    if mapper is None:
+        raise UnmappedInstanceError(f"Class '{cls.__module__}.{cls.__qualname__}' is not mapped")
+    return cast("Mapper[Any]", mapper)
+
+
+def _detached_marker(
+    instance_dict: dict[str, object],
+) -> tuple[object, tuple[str, ...], tuple[str, ...]] | None:
+    """The ``_catalyst_detached`` marker triple, or ``None``."""
+    marker = instance_dict.get(_DETACHED)
+    triple = cast("tuple[object, ...]", marker) if isinstance(marker, tuple) else ()
+    return cast(
+        "tuple[object, tuple[str, ...], tuple[str, ...]] | None",
+        triple if len(triple) == 3 else None,
+    )
+
+
 def _state_of(instance: object) -> NativeUow | None:
     """Return the unit of work recorded on ``instance`` by a session, if any."""
     instance_dict = getattr(instance, "__dict__", None)
@@ -1276,8 +1314,8 @@ class Session:
         expire_on_commit: bool = True,
     ) -> None:
         self._owns_connection = isinstance(bind, Engine)
-        self._connection = bind.connect() if isinstance(bind, Engine) else bind
-        self._closed = False
+        self._engine: Engine | None = bind if isinstance(bind, Engine) else None
+        self._connection: Connection | None = bind.connect() if isinstance(bind, Engine) else bind
         self.autoflush = autoflush
         self.expire_on_commit = expire_on_commit
         self._uow = NativeUow(self)
@@ -1314,14 +1352,26 @@ class Session:
     # -- guards ------------------------------------------------------------
 
     def _check_active(self) -> None:
-        if self._closed:
-            raise RuntimeError("Session is closed")
         if self._pending_rollback:
             raise PendingRollbackError(
                 "This Session's transaction has been rolled back due to a previous "
                 "exception during flush. To begin a new transaction with this "
                 "Session, first issue Session.rollback()."
             )
+        self._ensure_connection()
+
+    def _ensure_connection(self) -> None:
+        """Lazily re-acquire an engine checkout after ``close()`` (SA reuse)."""
+        if self._connection is None:
+            if self._engine is None:
+                raise RuntimeError("Session is closed")
+            self._connection = self._engine.connect()
+
+    def _conn(self) -> Connection:
+        """The live connection, re-acquired when the session was closed."""
+        self._ensure_connection()
+        assert self._connection is not None  # noqa: S101
+        return self._connection
 
     def _mark_active(self) -> None:
         self._txn_active = True
@@ -1334,7 +1384,13 @@ class Session:
     # -- add / delete ------------------------------------------------------
 
     def add(self, instance: object) -> None:
-        """Attach ``instance`` to the session as pending insertion."""
+        """Attach ``instance`` to the session as pending insertion.
+
+        Re-adding an object previously expunged from this session (or detached
+        elsewhere) restores it as *persistent* with its stored primary key —
+        matching SQLAlchemy, whose detached ``InstanceState.key`` survives
+        expunge so ``add`` resumes the same identity rather than inserting.
+        """
         self._check_active()
         mapper = _require_mapper(instance)
         uow = _state_of(instance)
@@ -1349,6 +1405,20 @@ class Session:
                 f"Object '{instance}' is already attached to session "
                 f"'{id(uow.session) & 0xFF}' (this is '{id(self) & 0xFF}')"
             )
+        detached = _detached_marker(instance.__dict__)
+        if detached is not None:
+            pk, dirty, expired = detached
+            del instance.__dict__[_DETACHED]
+            self._uow.attach_persistent(instance, type(instance), list(mapper.attrs), pk)
+            instance._catalyst_state = self._uow  # type: ignore[attr-defined]
+            col_expired = [attr for attr in expired if attr in mapper.attr_columns]
+            if col_expired:
+                self._uow.expire_attrs(instance, col_expired)
+            for attr in dirty:
+                self._uow.attr_set(instance, attr)
+            self._mark_active()
+            self._cascade_save_update(instance, {id(instance)})
+            return
         self._uow.attach_pending(instance, type(instance), list(mapper.attrs))
         instance._catalyst_state = self._uow  # type: ignore[attr-defined]
         self._mark_active()
@@ -1445,7 +1515,183 @@ class Session:
             return list(cast("list[object]", value))
         return [value]
 
-    # -- flush -------------------------------------------------------------
+    # -- detach ------------------------------------------------------------
+
+    def _stamp_detached(
+        self, instance: object, info: tuple[object, int, list[str], list[str]]
+    ) -> None:
+        """Stamp the detached marker after native detach, like SA's key.
+
+        The ``(pk, dirty, expired)`` triple preserves ``InstanceState.key`` /
+        ``.modified`` semantics across expunge so ``merge(load=False)`` can
+        still reject dirty objects and ``add`` can re-attach persistently.
+        """
+        pk, status, dirty, expired = info
+        instance.__dict__.pop("_catalyst_state", None)
+        if pk is None or status == _STATUS_PENDING:
+            return
+        mapper = _mapper_of(instance)
+        instance_dict = instance.__dict__
+        rel_expired = [k for k in mapper.relationship_attrs if k not in instance_dict]
+        instance_dict[_DETACHED] = (pk, tuple(dirty), tuple(expired) + tuple(rel_expired))
+
+    def expunge(self, instance: object) -> None:
+        """Detach ``instance`` from this session (no autoflush)."""
+        _require_mapper(instance)
+        self._expunge_instance(instance, set())
+
+    def _expunge_instance(self, instance: object, seen: set[int]) -> None:
+        """Detach one instance, cascading ``"expunge"`` to loaded relationships."""
+        uow = _state_of(instance)
+        if uow is None or uow is not self._uow or not uow.is_managed(instance):
+            raise InvalidRequestError(f"Instance '{instance}' is not present in this Session")
+        if id(instance) in seen:
+            return
+        seen.add(id(instance))
+        mapper = _mapper_of(instance)
+        _configure_mapper(mapper)
+        for prop in mapper.relationships.values():
+            if "expunge" not in prop.cascade:
+                continue
+            # Only already-loaded state cascades — an unloaded relationship
+            # is left alone (it will raise DetachedInstanceError on access).
+            value = instance.__dict__.get(prop.key)
+            if value is None:
+                continue
+            items = cast("list[object]", value) if prop.uselist else [value]
+            for item in items:
+                if item is None or id(item) in seen:
+                    continue
+                item_uow = _state_of(item)
+                if item_uow is self._uow and item_uow is not None and item_uow.is_managed(item):
+                    self._expunge_instance(item, seen)
+        info = uow.detach(instance)
+        if info is not None:
+            self._stamp_detached(instance, info)
+
+    def expunge_all(self) -> None:
+        """Detach every managed object; loaded values stay on the instances."""
+        for info in self._uow.detach_all():
+            obj, pk, status, dirty, expired = info
+            self._stamp_detached(obj, (pk, status, dirty, expired))
+
+    # -- merge --------------------------------------------------------------
+
+    def merge(self, instance: _T, load: bool = True) -> _T:
+        """Copy ``instance``'s state onto this session's persistent instance.
+
+        Returns the session's own instance for the incoming object's identity
+        (usually *not* the passed object).  Autoflushes pending work like any
+        other load path — only when ``autoflush`` is enabled — and cascades
+        through ``"merge"`` relationship cascades recursively.
+        """
+        self._check_active()
+        _require_mapper(instance)
+        # SA: Session.merge calls _autoflush() — honored only when enabled.
+        if self.autoflush:
+            self.flush()
+        return cast(_T, self._merge_instance(instance, load, {}))
+
+    def _merge_instance(self, instance: object, load: bool, cache: dict[int, object]) -> object:
+        """Recursive worker for :meth:`merge`; ``cache`` dedupes source objects."""
+        hit = cache.get(id(instance))
+        if hit is not None:
+            return hit
+        mapper = _require_mapper(instance)
+        _configure_mapper(mapper)
+        cls = mapper.class_
+        instance_dict = instance.__dict__
+        # Resolve the source object's identity + modified flag across the
+        # three storage forms (managed uow state, detached marker, transient).
+        src_uow = _state_of(instance)
+        managed = src_uow is not None and src_uow.is_managed(instance)
+        detached = None if managed else _detached_marker(instance_dict)
+        if managed:
+            assert src_uow is not None
+            status = src_uow.status(instance)
+            if status == _STATUS_PENDING:
+                has_key, pk = (
+                    False,
+                    (instance_dict.get(mapper.pk_attr) if mapper.pk_attr is not None else None),
+                )
+            else:
+                has_key, pk = True, src_uow.pk_of(instance)
+            modified = bool(src_uow.dirty_attrs_of(instance))
+        elif detached is not None:
+            has_key, pk = True, detached[0]
+            modified = bool(detached[1])
+        else:
+            has_key, pk = (
+                False,
+                (instance_dict.get(mapper.pk_attr) if mapper.pk_attr is not None else None),
+            )
+            modified = False
+        key_is_persistent = pk is not None
+        if not has_key and not load:
+            raise InvalidRequestError(
+                "load=False option does not support merging transient objects"
+            )
+        merged: object | None = self._uow.identity_get(cls, pk) if key_is_persistent else None
+        if merged is None:
+            if not load:
+                # Only key-having states reach here under load=False (transient
+                # and pending raised above).  SA: clean detached merges
+                # straight into a persistent slot with no SELECT; dirty rejects.
+                if modified:
+                    raise InvalidRequestError(
+                        "load=False option does not support merging dirty objects"
+                    )
+                merged = self._attach_persistent_stub(cls, mapper, pk)
+            elif key_is_persistent:
+                merged = self.get(cls, pk)
+        if merged is None:
+            merged = object.__new__(cls)
+            self._uow.attach_pending(merged, cls, list(mapper.attrs))
+            merged._catalyst_state = self._uow  # type: ignore[attr-defined]
+        cache[id(instance)] = merged
+        if merged is instance:
+            if not load:
+                # Self-merge of an in-session dirty object commits its state.
+                self._uow.mark_clean(merged)
+            return merged
+        merged_dict = merged.__dict__
+        for attr in mapper.attrs:
+            if attr not in instance_dict:
+                continue
+            value = instance_dict[attr]
+            if load:
+                if merged_dict.get(attr, _MISSING) != value:
+                    setattr(merged, attr, value)  # dirty only on actual change
+            else:
+                object.__setattr__(merged, attr, value)
+        for prop in mapper.relationships.values():
+            if "merge" not in prop.cascade or prop.key not in instance_dict:
+                continue
+            value = instance_dict[prop.key]
+            if prop.uselist:
+                items = [
+                    self._merge_instance(item, load, cache)
+                    for item in cast("list[object]", value)
+                    if item is not None
+                ]
+                collection = _collection_for(merged, prop)
+                for item in list(collection):
+                    if item not in items:
+                        list[object].remove(collection, item)
+                for item in items:
+                    if item not in collection:
+                        _stitch_loaded(merged, prop, item)
+            else:
+                item = None if value is None else self._merge_instance(value, load, cache)
+                _stitch_loaded(merged, prop, item)
+        return merged
+
+    def _attach_persistent_stub(self, cls: type[object], mapper: Mapper[Any], pk: object) -> object:
+        """Empty persistent slot for ``merge(load=False)`` — no SELECT."""
+        merged = object.__new__(cls)
+        self._uow.attach_persistent(merged, cls, list(mapper.attrs), pk)
+        merged._catalyst_state = self._uow  # type: ignore[attr-defined]
+        return merged
 
     def flush(self) -> None:
         """Emit batched INSERT/UPDATE/DELETE for the unit of work.
@@ -1575,7 +1821,7 @@ class Session:
             ops.append((compiled.string, compiled._ordered, compiled._bind_types, False))
             dropped.append(obj)
         try:
-            assigned = self._connection._native.execute_flush(ops)
+            assigned = self._conn()._native.execute_flush(ops)
         except Exception:
             # A failed flush puts the session in partial rollback; every
             # operation must raise PendingRollbackError until rollback().
@@ -1651,10 +1897,6 @@ class Session:
 
     def _lazy_load(self, instance: object, prop: RelationshipProperty) -> object:
         """Lazy-load one relationship attribute for a persistent instance."""
-        if self._closed:
-            if prop.uselist:
-                return _collection_for(instance, prop)
-            return instance.__dict__.get(prop.key)
         self._check_active()
         if prop.lazy == "raise":
             raise InvalidRequestError(
@@ -1713,7 +1955,7 @@ class Session:
         statement = Select(
             tuple(target_mapper.local_table.columns), target_mapper.local_table, predicate
         )
-        result = self._connection.execute(statement)
+        result = self._conn().execute(statement)
         instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
         return self._uow.reconcile(
             prop.entity,
@@ -1741,7 +1983,7 @@ class Session:
         if joined:
             result = self._joined_select(statement, entity, mapper, joined)
         else:
-            raw = self._connection.execute(statement)
+            raw = self._conn().execute(statement)
             result = CursorResult(raw.native_result, entity=entity, uow=self._uow)
         if selectin:
             for prop in selectin:
@@ -1801,7 +2043,7 @@ class Session:
             tuple(joins),
             (),
         )
-        result = self._connection.execute(joined_stmt)
+        result = self._conn().execute(joined_stmt)
         rows = result.native_result.hydrate_entities(specs)
         # Reconcile every hydrated slice through the identity map so related
         # rows yield the same instance session.get() would return.
@@ -1859,7 +2101,7 @@ class Session:
             statement = Select(tuple(cols), target_mapper.local_table).where(
                 fk_col.in_(list(parents))
             )
-            result = self._connection.execute(statement)
+            result = self._conn().execute(statement)
             instances = result.native_result.hydrate(prop.entity, attrs)
             instances = self._uow.reconcile(
                 prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
@@ -1886,7 +2128,7 @@ class Session:
         statement = Select(
             tuple(target_mapper.local_table.columns), target_mapper.local_table
         ).where(prop.remote_col.in_(fks))
-        result = self._connection.execute(statement)
+        result = self._conn().execute(statement)
         instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
         instances = self._uow.reconcile(
             prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
@@ -1913,7 +2155,7 @@ class Session:
         """Create a SAVEPOINT within the session's transaction."""
         self._check_active()
         self._mark_active()
-        return self._connection.begin_nested()
+        return self._conn().begin_nested()
 
     def in_transaction(self) -> bool:
         """Whether the session currently has an open transaction."""
@@ -1924,7 +2166,9 @@ class Session:
         self._check_active()
         try:
             self.flush()
-            self._connection.commit()
+            connection = self._connection
+            if connection is not None:
+                connection.commit()
         except Exception:
             self._pending_rollback = True
             raise
@@ -1939,10 +2183,9 @@ class Session:
 
     def rollback(self) -> None:
         """Roll back the open transaction and reset unit-of-work state."""
-        if self._closed:
-            return
         self._pending_rollback = False
-        self._connection.rollback()
+        if self._connection is not None:
+            self._connection.rollback()
         for obj in self._uow.rollback():
             _expire_instance(obj)
         self._txn_active = False
@@ -1963,19 +2206,24 @@ class Session:
 
     # -- reads -------------------------------------------------------------
 
-    def get(self, entity: type[_T], ident: object) -> _T | None:
+    def get(self, entity: type[_T], ident: object, populate_existing: bool = False) -> _T | None:
         """Return the instance for primary key ``ident``, or ``None``.
 
-        Autoflushes first; the identity map is consulted before the database
-        so repeated calls return the identical object.
+        The identity map is consulted before autoflush and the database so
+        repeated calls return the identical object without emitting pending
+        writes.  ``populate_existing`` always SELECTs and refreshes the
+        already-mapped instance in place.
         """
         self._check_active()
         self._mark_active()
+        if not populate_existing:
+            # SA's identity-map lookup precedes autoflush: an identity hit
+            # returns without emitting pending writes.
+            cached = self._uow.identity_get(entity, ident)
+            if cached is not None:
+                return cast(_T, cached)
         if self.autoflush:
             self.flush()
-        cached = self._uow.identity_get(entity, ident)
-        if cached is not None:
-            return cast(_T, cached)
         mapper = getattr(entity, "__mapper__", None)
         if mapper is None or cast("Mapper[Any]", mapper).pk_column is None:
             raise UnmappedInstanceError(
@@ -1984,9 +2232,18 @@ class Session:
         mapper = cast("Mapper[Any]", mapper)
         compiled = select(mapper.local_table).where(mapper.pk_column == ident).compile()
         self._raise_bind_error(compiled)
-        row = self._connection.execute(compiled).fetchone()
+        row = self._conn().execute(compiled).fetchone()
         if row is None:
             return None
+        cached = self._uow.identity_get(entity, ident)
+        if cached is not None:
+            # populate_existing: refresh the mapped instance, keep identity.
+            for attr, value in zip(mapper.attrs, row, strict=True):
+                object.__setattr__(cached, attr, value)
+            self._uow.mark_clean(cached)
+            for key in mapper.relationship_attrs:
+                cached.__dict__.pop(key, None)
+            return cast(_T, cached)
         instance = entity.__new__(entity)
         for attr, value in zip(mapper.attrs, row, strict=True):
             object.__setattr__(instance, attr, value)
@@ -2010,10 +2267,11 @@ class Session:
         pk = uow.pk_of(instance)
         compiled = select(mapper.local_table).where(mapper.pk_column == pk).compile()
         self._raise_bind_error(compiled)
-        row = self._connection.execute(compiled).fetchone()
-        if row is not None:
-            for attr, value in zip(mapper.attrs, row, strict=True):
-                object.__setattr__(instance, attr, value)
+        row = self._conn().execute(compiled).fetchone()
+        if row is None:
+            raise ObjectDeletedError(self._deleted_message(instance))
+        for attr, value in zip(mapper.attrs, row, strict=True):
+            object.__setattr__(instance, attr, value)
         uow.mark_clean(instance)
         for key in mapper.relationship_attrs:
             instance.__dict__.pop(key, None)
@@ -2026,14 +2284,13 @@ class Session:
         sibling attributes stay consistent with the row snapshot rather than
         reloading separately.
         """
-        if self._closed:
-            return
         if self._pending_rollback:
             raise PendingRollbackError(
                 "This Session's transaction has been rolled back due to a previous "
                 "exception during flush. To begin a new transaction with this "
                 "Session, first issue Session.rollback()."
             )
+        self._ensure_connection()
         uow = _state_of(instance)
         if uow is None or uow is not self._uow:
             return
@@ -2047,12 +2304,22 @@ class Session:
             self.flush()
         compiled = select(mapper.local_table).where(mapper.pk_column == pk).compile()
         self._raise_bind_error(compiled)
-        row = self._connection.execute(compiled).fetchone()
+        row = self._conn().execute(compiled).fetchone()
         self._mark_active()
+        if row is None:
+            raise ObjectDeletedError(self._deleted_message(instance))
         for expired in uow.expired_attrs_of(instance):
-            value = row[mapper.attrs.index(expired)] if row is not None else None
-            object.__setattr__(instance, expired, value)
+            object.__setattr__(instance, expired, row[mapper.attrs.index(expired)])
         uow.mark_loaded(instance)
+
+    @staticmethod
+    def _deleted_message(instance: object) -> str:
+        """SQLAlchemy's ``ObjectDeletedError`` message shape."""
+        cls = type(instance)
+        return (
+            f"Instance '<{cls.__name__} at 0x{id(instance):x}>' has been "
+            "deleted, or its row is otherwise not present."
+        )
 
     def execute(
         self,
@@ -2070,11 +2337,245 @@ class Session:
             and statement.loader_options
         ):
             return self._execute_loader_select(statement)
-        result = self._connection.execute(statement, parameters)
+        if isinstance(statement, (Update, Delete)) and statement.entity is not None:
+            return self._execute_orm_dml(statement)
+        result = self._conn().execute(statement, parameters)
         entity = getattr(statement, "entity", None)
         if entity is None:
             return result
         return CursorResult(result.native_result, entity=entity, uow=self._uow)
+
+    # -- ORM-enabled DML ----------------------------------------------------
+
+    def _execute_orm_dml(self, statement: Update | Delete) -> CursorResult:
+        """``session.execute(update(Entity)/delete(Entity))`` with sync.
+
+        ``synchronize_session`` resolution mirrors SQLAlchemy: ``"auto"``
+        (the default) evaluates simple predicates in memory and falls back to
+        ``fetch``; ``"evaluate"`` requires an evaluable predicate; ``"fetch"``
+        selects affected keys via ``RETURNING``; ``False`` executes without
+        touching session state.
+        """
+        entity = cast("type[object]", statement.entity)
+        mapper = _mapper_of(entity)
+        mode = statement.exec_options.get("synchronize_session", "auto")
+        if mode is True:
+            mode = "evaluate"
+        if mode is False or mode == "false":
+            result = self._conn().execute(statement)
+            return result
+        evaluable = self._predicate_evaluable(getattr(statement, "predicate", None))
+        if mode == "auto":
+            mode = "evaluate" if evaluable else "fetch"
+        elif mode == "evaluate" and not evaluable:
+            raise InvalidRequestError(
+                "Could not evaluate current criteria in Python. Specify 'fetch' "
+                "or False for the synchronize_session execution option."
+            )
+        if mode == "fetch":
+            pk_column = mapper.pk_column
+            if pk_column is None:
+                raise InvalidRequestError(
+                    "Could not evaluate current criteria in Python. Specify 'fetch' "
+                    "or False for the synchronize_session execution option."
+                )
+            compiled = statement.compile()
+            self._raise_bind_error(compiled)
+            returning = Compiled(
+                f"{compiled.string} RETURNING {pk_column.name}",
+                compiled.params,
+                compiled.statement_kind,
+                compiled._ordered,
+                compiled._bind_types,
+                compiled._bind_names,
+                [_column_type_tag(pk_column.type)],
+                entity,
+            )
+            result = self._conn().execute(returning)
+            pks = {row[0] for row in result.fetchall()}
+            self._sync_orm_dml(
+                statement,
+                mapper,
+                lambda inst: self._uow.pk_of(inst) in pks,
+            )
+            return result
+        result = self._conn().execute(statement)
+        self._sync_orm_dml(statement, mapper, self._predicate_matcher(statement, mapper))
+        return result
+
+    def _sync_orm_dml(
+        self,
+        statement: Update | Delete,
+        mapper: Mapper[Any],
+        matches: Callable[[object], bool],
+    ) -> None:
+        """Apply an ORM DML statement to matching in-session instances."""
+        col_to_attr = {column.name: attr for attr, column in mapper.attr_columns.items()}
+        for inst in self._uow.persistent_objects(mapper.class_):
+            if not matches(inst):
+                continue
+            if isinstance(statement, Delete):
+                self._uow.mark_deleted(inst)
+                continue
+            for col_name, value in statement.values_map.items():
+                attr = col_to_attr.get(col_name, col_name)
+                if isinstance(value, (Column, Expression)):
+                    # Expression values (e.g. col=col+1) can't be computed
+                    # locally — expire so the next access reloads them.
+                    inst.__dict__.pop(attr, None)
+                    expired = list(self._uow.expired_attrs_of(inst))
+                    if attr not in expired:
+                        self._uow.expire_attrs(inst, expired + [attr])
+                else:
+                    inst.__dict__[attr] = value
+
+    @staticmethod
+    def _predicate_evaluable(predicate: Column | Expression | None) -> bool:
+        """Whether the WHERE clause supports in-memory evaluation."""
+        if predicate is None:
+            return True
+        node = predicate.serialize() if isinstance(predicate, Column) else predicate.node
+        return _node_evaluable(node)
+
+    def _predicate_matcher(
+        self, statement: Update | Delete, mapper: Mapper[Any]
+    ) -> Callable[[object], bool]:
+        """Compile the WHERE clause into an instance predicate."""
+        predicate = getattr(statement, "predicate", None)
+        col_to_attr = {column.name: attr for attr, column in mapper.attr_columns.items()}
+        if predicate is None:
+            return lambda _inst: True
+        node = predicate.serialize() if isinstance(predicate, Column) else predicate.node
+        return lambda inst: _eval_node(node, inst.__dict__, col_to_attr)
+
+    # -- bulk operations ----------------------------------------------------
+
+    def bulk_insert_mappings(
+        self,
+        mapper: type[object],
+        mappings: Iterable[Mapping[str, object]],
+        return_defaults: bool = False,
+        render_nulls: bool = False,
+    ) -> None:
+        """INSERT each mapping in one batch, bypassing the unit of work.
+
+        No autoflush, no identity-map involvement, no PK write-back —
+        matching SQLAlchemy's ``Session.bulk_insert_mappings``.
+        """
+        self._check_active()
+        self._mark_active()
+        cls_mapper = _require_class_mapper(mapper)
+        rows: list[dict[str, object]] = []
+        for mapping in mappings:
+            row: dict[str, object] = {}
+            for attr, column in cls_mapper.attr_columns.items():
+                if attr in mapping:
+                    value = mapping[attr]
+                elif column.name in mapping:
+                    value = mapping[column.name]
+                elif attr == cls_mapper.pk_attr:
+                    continue  # let the database assign the primary key
+                else:
+                    value = _client_default(cls_mapper, attr)
+                    if value is _MISSING:
+                        if render_nulls:
+                            value = None
+                        else:
+                            continue
+                row[column.name] = value
+            rows.append(row)
+        if not rows:
+            return
+        self._conn().execute(Insert(cls_mapper.local_table), rows)
+
+    def bulk_update_mappings(
+        self,
+        mapper: type[object],
+        mappings: Iterable[Mapping[str, object]],
+    ) -> None:
+        """One single-row UPDATE per mapping; ``StaleDataError`` on misses."""
+        self._check_active()
+        self._mark_active()
+        cls_mapper = _require_class_mapper(mapper)
+        pk_col = cls_mapper.pk_column
+        pk_attr = cls_mapper.pk_attr
+        for mapping in mappings:
+            if (
+                pk_col is None
+                or pk_attr is None
+                or (pk_attr not in mapping and pk_col.name not in mapping)
+            ):
+                raise InvalidRequestError(
+                    f"No primary key value supplied for column(s) "
+                    f"{cls_mapper.local_table.name}.{pk_col.name if pk_col else '?'}; "
+                    "per-row ORM Bulk UPDATE by Primary Key requires that "
+                    "records contain primary key values"
+                )
+            pk = mapping.get(pk_attr, mapping.get(pk_col.name))
+            values: dict[str, object] = {}
+            for key, value in mapping.items():
+                attr = key if key in cls_mapper.attr_columns else _attr_for_name(cls_mapper, key)
+                if attr is None or attr == pk_attr:
+                    continue
+                values[cls_mapper.attr_columns[attr].name] = value
+            compiled = Update(cls_mapper.local_table).values(values).where(pk_col == pk).compile()
+            self._raise_bind_error(compiled)
+            result = self._conn().execute(compiled)
+            if result.rowcount == 0:
+                raise StaleDataError(
+                    f"UPDATE statement on table '{cls_mapper.local_table.name}' "
+                    f"expected to update 1 row(s); 0 were matched."
+                )
+
+    def bulk_save_objects(
+        self,
+        objects: Iterable[object],
+        return_defaults: bool = False,
+        update_changed_only: bool = True,
+        preserve_order: bool = True,
+    ) -> None:
+        """INSERT/UPDATE objects without involving the unit of work.
+
+        Objects are not added to the session, generated primary keys are not
+        written back, and already-persistent dirty objects emit their UPDATE
+        yet stay dirty (SQLAlchemy's legacy ``bulk_save_objects`` contract).
+        """
+        self._check_active()
+        self._mark_active()
+        for obj in objects:
+            mapper = _require_mapper(obj)
+            uow = _state_of(obj)
+            if (
+                uow is self._uow
+                and uow is not None
+                and uow.is_managed(obj)
+                and uow.status(obj) == _STATUS_PERSISTENT
+            ):
+                attrs = list(uow.dirty_attrs_of(obj)) if update_changed_only else list(mapper.attrs)
+                values = {
+                    mapper.attr_columns[attr].name: obj.__dict__.get(attr)
+                    for attr in attrs
+                    if attr in mapper.attr_columns
+                }
+                if not values:
+                    continue
+                compiled = (
+                    Update(mapper.local_table)
+                    .values(values)
+                    .where(mapper.pk_column == uow.pk_of(obj))
+                    .compile()
+                )
+                self._raise_bind_error(compiled)
+                self._conn().execute(compiled)
+            else:
+                values = {
+                    mapper.attr_columns[attr].name: obj.__dict__.get(attr)
+                    for attr in mapper.attrs
+                    if attr != mapper.pk_attr or obj.__dict__.get(attr) is not None
+                }
+                compiled = Insert(mapper.local_table).values(values).compile()
+                self._raise_bind_error(compiled)
+                self._conn().execute(compiled)
 
     def scalars(
         self,
@@ -2085,28 +2586,186 @@ class Session:
         return ScalarResult(self.execute(statement, parameters))
 
     def close(self) -> None:
-        """Roll back uncommitted work and release the owned connection.
+        """Roll back uncommitted work, detach everything, and release resources.
 
-        Like SQLAlchemy, closing detaches objects rather than expiring them:
-        values already loaded stay readable on the instance.
+        Mirrors SQLAlchemy: closing detaches objects rather than expiring
+        them (loaded values stay readable on the instance), and the session
+        remains usable — engine-bound sessions lazily re-acquire a connection
+        on the next operation, while a ``Session`` built on a borrowed
+        ``Connection`` keeps using that same connection.
         """
-        if self._closed:
-            return
         self._pending_rollback = False
-        try:
-            self._connection.rollback()
-        except Exception:
-            pass
-        self._uow.clear()
-        if self._owns_connection:
-            self._connection.close()
+        connection = self._connection
+        if connection is not None:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+            if self._owns_connection:
+                connection.close()
+                self._connection = None
+        for info in self._uow.detach_all():
+            obj, pk, status, dirty, expired = info
+            self._stamp_detached(obj, (pk, status, dirty, expired))
         self._txn_active = False
-        self._closed = True
 
     def __enter__(self) -> Session:
-        if self._closed:
-            raise RuntimeError("Session is closed")
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+# -- ORM DML predicate evaluation --------------------------------------------
+#
+# ``synchronize_session="auto"/"evaluate"`` mirrors SQLAlchemy's Python-side
+# evaluation of simple WHERE clauses: comparisons/IN/IS composed with AND/OR
+# on column-versus-literal operands evaluate in memory; anything else falls
+# back to the "fetch" (RETURNING) strategy.
+
+_EVAL_OPS = frozenset({"=", "!=", "<", "<=", ">", ">="})
+
+
+def _leaf(node: object) -> bool:
+    return isinstance(node, tuple) and node[0] in ("column", "literal")
+
+
+def _node_evaluable(node: object) -> bool:
+    """Whether a WHERE expression node supports in-memory evaluation."""
+    if not isinstance(node, tuple) or not node:
+        return False
+    children = cast("tuple[object, ...]", node)
+    tag = children[0]
+    if tag == "binary":
+        return (
+            len(children) == 4
+            and children[2] in _EVAL_OPS
+            and _leaf(children[1])
+            and _leaf(children[3])
+        )
+    if tag in ("and", "or"):
+        return all(_node_evaluable(child) for child in cast("Iterable[object]", children[1]))
+    if tag in ("in", "not_in"):
+        return _leaf(children[1]) and all(
+            _leaf(item) for item in cast("Iterable[object]", children[2])
+        )
+    if tag in ("between", "not_between"):
+        return len(children) == 4 and all(_leaf(item) for item in children[1:4])
+    if tag in ("is", "is_not"):
+        return _leaf(children[1])
+    if tag in ("is_scalar", "is_not_scalar"):
+        return _leaf(children[1]) and _leaf(children[2])
+    if tag == "not":
+        return _node_evaluable(children[1])
+    if tag in ("boolean_word", "column"):
+        return True
+    return False
+
+
+def _operand_value(
+    node: tuple[object, ...],
+    instance_dict: dict[str, object],
+    col_to_attr: dict[str, str],
+) -> object:
+    """Resolve a column/literal operand against an instance's ``__dict__``."""
+    if node[0] == "column":
+        return instance_dict.get(col_to_attr.get(cast(str, node[2]), cast(str, node[2])))
+    return node[1]  # literal
+
+
+def _eval_node(
+    node: object,
+    instance_dict: dict[str, object],
+    col_to_attr: dict[str, str],
+) -> bool:
+    """Evaluate an evaluable WHERE node against an instance."""
+
+    def operand(child: object) -> object:
+        return _operand_value(cast("tuple[object, ...]", child), instance_dict, col_to_attr)
+
+    if not isinstance(node, tuple) or not node:
+        return False
+    children = cast("tuple[object, ...]", node)
+    tag = children[0]
+    if tag == "binary":
+        left = operand(children[1])
+        right = operand(children[3])
+        op = children[2]
+        if op == "=":
+            return left == right
+        if op == "!=":
+            return left != right
+        if left is None or right is None:
+            return False
+        if op == "<":
+            return cast(Any, left) < cast(Any, right)
+        if op == "<=":
+            return cast(Any, left) <= cast(Any, right)
+        if op == ">":
+            return cast(Any, left) > cast(Any, right)
+        if op == ">=":
+            return cast(Any, left) >= cast(Any, right)
+        return False
+    if tag == "and":
+        return all(
+            _eval_node(child, instance_dict, col_to_attr)
+            for child in cast("Iterable[object]", children[1])
+        )
+    if tag == "or":
+        return any(
+            _eval_node(child, instance_dict, col_to_attr)
+            for child in cast("Iterable[object]", children[1])
+        )
+    if tag in ("in", "not_in"):
+        value = operand(children[1])
+        values = [operand(item) for item in cast("Iterable[object]", children[2])]
+        result = value in values
+        return not result if tag == "not_in" else result
+    if tag in ("between", "not_between"):
+        value = operand(children[1])
+        lo = operand(children[2])
+        hi = operand(children[3])
+        result = (
+            lo is not None
+            and hi is not None
+            and value is not None
+            and cast(Any, lo) <= value <= cast(Any, hi)
+        )
+        return not result if tag == "not_between" else result
+    if tag == "is":
+        return operand(children[1]) is None
+    if tag == "is_not":
+        return operand(children[1]) is not None
+    if tag == "is_scalar":
+        return operand(children[1]) == operand(children[2])
+    if tag == "is_not_scalar":
+        return operand(children[1]) != operand(children[2])
+    if tag == "not":
+        return not _eval_node(children[1], instance_dict, col_to_attr)
+    if tag == "boolean_word":
+        return bool(children[1])
+    if tag == "column":
+        return bool(_operand_value(children, instance_dict, col_to_attr))
+    return False
+
+
+def _client_default(mapper: Mapper[Any], attr: str) -> object:
+    """The mapped client-side default for ``attr``, or ``_MISSING``."""
+    spec = mapper.specs.get(attr)
+    if isinstance(spec, MappedColumn):
+        if spec.default_factory is not None:
+            return spec.default_factory()
+        if spec.default is not None:
+            return spec.default
+    default = mapper.attr_columns[attr].default
+    if default is None:
+        return _MISSING
+    return default() if callable(default) else default
+
+
+def _attr_for_name(mapper: Mapper[Any], name: str) -> str | None:
+    """Map a column *name* back to its attribute (bulk dict keys)."""
+    for attr, column in mapper.attr_columns.items():
+        if column.name == name:
+            return attr
+    return None

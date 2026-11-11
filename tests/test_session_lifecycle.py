@@ -180,7 +180,7 @@ def test_merge_transient_existing_pk_copies_state() -> None:
             assert merged.name == "merged-name"
             assert merged.score == 99
             assert obj not in session.new
-            session.flush()
+            session.commit()
         with SASession(sa_engine) as sa_session:
             sa_obj = SAUser(id=1, name="merged-name", score=99)
             sa_merged = sa_session.merge(sa_obj)
@@ -189,7 +189,7 @@ def test_merge_transient_existing_pk_copies_state() -> None:
             assert sa_merged.name == "merged-name"
             assert sa_merged.score == 99
             assert sa_obj not in sa_session.new
-            sa_session.flush()
+            sa_session.commit()
         assert _db_names(catalyst_engine, "lc_users") == [(1, "merged-name", 99)]
         assert _db_names(sa_engine, "lc_users") == [(1, "merged-name", 99)]
     finally:
@@ -204,12 +204,12 @@ def test_merge_transient_unknown_pk_inserts_with_supplied_pk() -> None:
         with Session(catalyst_engine) as session:
             merged = session.merge(User(id=999, name="ghost", score=5))
             assert merged in session.new
-            session.flush()
+            session.commit()
             assert merged.id == 999
         with SASession(sa_engine) as sa_session:
             sa_merged = sa_session.merge(SAUser(id=999, name="ghost", score=5))
             assert sa_merged in sa_session.new
-            sa_session.flush()
+            sa_session.commit()
             assert sa_merged.id == 999
         assert _db_names(catalyst_engine, "lc_users") == [(999, "ghost", 5)]
         assert _db_names(sa_engine, "lc_users") == [(999, "ghost", 5)]
@@ -352,9 +352,10 @@ def test_merge_autoflushes_even_when_autoflush_false() -> None:
             sa_session.add(sa_pending)
             merged = session.merge(User(id=1, name="merged-over", score=2))
             sa_merged = sa_session.merge(SAUser(id=1, name="merged-over", score=2))
-            # The pending INSERT was flushed by merge despite autoflush=False.
-            assert pending.id is not None
-            assert sa_pending.id is not None
+            # Verified SQLAlchemy 2.1.8: merge's load path honors autoflush —
+            # with autoflush=False the pending INSERT is NOT flushed.
+            assert pending.id is None
+            assert sa_pending.id is None
             assert merged.id == 1
             assert sa_merged.id == 1
             session.rollback()
@@ -375,15 +376,25 @@ def test_merge_load_false_rejects_transient_and_dirty() -> None:
                 session.merge(User(id=1, name="x", score=0), load=False)
             with pytest.raises(sa.exc.InvalidRequestError):
                 sa_session.merge(SAUser(id=1, name="x", score=0), load=False)
-            # Dirty objects are also rejected.
-            u = session.get(User, 1)
-            u.name = "dirty"
-            sa_u = sa_session.get(SAUser, 1)
-            sa_u.name = "dirty"
-            with pytest.raises(InvalidRequestError):
-                session.merge(u, load=False)
-            with pytest.raises(sa.exc.InvalidRequestError):
-                sa_session.merge(sa_u, load=False)
+            # Dirty objects are also rejected — but only when the identity is
+            # not already in the session's map.  Verified SQLAlchemy 2.1.8:
+            # a dirty object attached to a DIFFERENT session (or detached
+            # dirty) raises InvalidRequestError; an object dirty in THIS
+            # session merges onto itself without raising.
+            s_other = Session(catalyst_engine)
+            sa_other = SASession(sa_engine)
+            try:
+                u = s_other.get(User, 1)
+                u.name = "dirty"
+                sa_u = sa_other.get(SAUser, 1)
+                sa_u.name = "dirty"
+                with pytest.raises(InvalidRequestError):
+                    session.merge(u, load=False)
+                with pytest.raises(sa.exc.InvalidRequestError):
+                    sa_session.merge(sa_u, load=False)
+            finally:
+                s_other.close()
+                sa_other.close()
             session.rollback()
             sa_session.rollback()
     finally:
@@ -478,12 +489,12 @@ def test_merge_cascades_to_relationship_graph() -> None:
             p = GParent(id=1, name="par")
             p.children = [GChild(id=1, name="kid1"), GChild(id=2, name="kid2")]
             session.add(p)
-            session.flush()
+            session.commit()
         with SASession(sa_engine) as sa_session:
             sa_p = SAParent(id=1, name="par")
             sa_p.children = [SAChild(id=1, name="kid1"), SAChild(id=2, name="kid2")]
             sa_session.add(sa_p)
-            sa_session.flush()
+            sa_session.commit()
 
         # Detach both graphs with loaded state; edit child 1, add a new child.
         with Session(catalyst_engine) as s1:
@@ -1019,7 +1030,9 @@ def test_execute_orm_delete_moves_instance_to_deleted() -> None:
             session.execute(c_delete(User).where(User.id == 1))
             sa_session.execute(sa_delete(SAUser).where(SAUser.id == 1))
             assert u1 in session.deleted
-            assert sa_u1 in sa_session.deleted
+            # SA marks the state deleted but drops it from session.deleted
+            # (verified 2.1.8): the deleted-state check is inspect().deleted.
+            assert sa.inspect(sa_u1).deleted
             assert session.get(User, 1) is None
             assert sa_session.get(SAUser, 1) is None
             session.commit()
@@ -1068,14 +1081,9 @@ def test_close_rolls_back_and_detaches() -> None:
         sa_engine.dispose()
 
 
-@pytest.mark.xfail(
-    reason="catalyst Session.close() is permanent; SQLAlchemy sessions are reusable after close()",
-    strict=False,
-)
 def test_close_then_reuse_session() -> None:
     """SA Sessions are reusable after close(): add+commit autobegins a new
-    transaction. KNOWN GAP: catalyst Session.close() is permanent
-    (``_closed`` -> RuntimeError)."""
+    transaction — Catalyst matches by lazily re-acquiring an engine checkout."""
     catalyst_engine = _catalyst_engine()
     sa_engine = _sa_engine()
     try:

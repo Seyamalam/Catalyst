@@ -118,6 +118,27 @@ create_exception!(
     "Raised when an operation is attempted on an object that is not mapped."
 );
 
+create_exception!(
+    _catalyst,
+    StaleDataError,
+    SQLAlchemyError,
+    "Raised when an UPDATE or DELETE matched fewer rows than expected."
+);
+
+create_exception!(
+    _catalyst,
+    ObjectDeletedError,
+    InvalidRequestError,
+    "Raised when an operation expects an object row that no longer exists."
+);
+
+create_exception!(
+    _catalyst,
+    DetachedInstanceError,
+    SQLAlchemyError,
+    "Raised when an unloaded attribute is accessed on a detached object."
+);
+
 /// A native SQLite engine owning a bounded connection pool.
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeEngine {
@@ -518,7 +539,6 @@ impl NativeConnection {
         struct PreparedOp {
             sql: String,
             values: Vec<FlushBind>,
-            wants_pk: bool,
         }
         let mut prepared = Vec::with_capacity(ops.len());
         let mut contexts = Vec::with_capacity(ops.len());
@@ -528,7 +548,7 @@ impl NativeConnection {
             let params = op.get_item(1)?;
             let params_list = params.cast::<PyList>()?;
             let bind_types: Vec<Option<String>> = op.get_item(2)?.extract()?;
-            let wants_pk: bool = op.get_item(3)?.extract()?;
+            let _wants_pk: bool = op.get_item(3)?.extract()?;
             // Typed bind conversion happens under the GIL like execute(); a
             // conversion failure is wrapped in StatementError before the batch
             // runs so no statement is partially applied.
@@ -553,7 +573,6 @@ impl NativeConnection {
             prepared.push(PreparedOp {
                 sql: sql.clone(),
                 values,
-                wants_pk,
             });
             contexts.push((sql, params.unbind()));
         }
@@ -609,11 +628,11 @@ impl NativeConnection {
                         })
                         .collect();
                     statement.execute(params_from_iter(bound.iter()))?;
-                    Ok(if op.wants_pk {
-                        Some(connection.last_insert_rowid())
-                    } else {
-                        None
-                    })
+                    // Capture last_insert_rowid for every op: deferred FK
+                    // markers may point at an explicit-PK insert (wants_pk
+                    // false), and SQLite still reports its rowid.  UPDATE /
+                    // DELETE rowids are stale but never referenced.
+                    Ok(Some(connection.last_insert_rowid()))
                 })();
                 match outcome {
                     Ok(pk) => results.push(pk),
@@ -1690,6 +1709,15 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "UnmappedInstanceError",
         module.py().get_type::<UnmappedInstanceError>(),
     )?;
+    module.add("StaleDataError", module.py().get_type::<StaleDataError>())?;
+    module.add(
+        "ObjectDeletedError",
+        module.py().get_type::<ObjectDeletedError>(),
+    )?;
+    module.add(
+        "DetachedInstanceError",
+        module.py().get_type::<DetachedInstanceError>(),
+    )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
     module.add_class::<postgres::NativePgEngine>()?;
@@ -1718,6 +1746,9 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "InvalidRequestError",
             "PendingRollbackError",
             "UnmappedInstanceError",
+            "StaleDataError",
+            "ObjectDeletedError",
+            "DetachedInstanceError",
             "sqlite_text",
             "compile_expression",
             "NativeEngine",
