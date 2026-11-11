@@ -7,6 +7,7 @@ __all__ = [
     "SQLAlchemyError",
     "CatalystError",
     "ArgumentError",
+    "AmbiguousForeignKeysError",
     "NoSuchModuleError",
     "StatementError",
     "DBAPIError",
@@ -209,6 +210,9 @@ class NativeResult:
 
 class ArgumentError(CatalystError):
     """Invalid arguments to a database API call."""
+
+class AmbiguousForeignKeysError(ArgumentError):
+    """Raised when more than one foreign key path could satisfy a relationship join."""
 
 class NoSuchModuleError(ArgumentError):
     """Dialect plugin could not be loaded."""

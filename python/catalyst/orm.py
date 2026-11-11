@@ -46,6 +46,7 @@ from typing import (
 from typing_extensions import dataclass_transform
 
 from ._catalyst import (
+    AmbiguousForeignKeysError,
     ArgumentError,
     DetachedInstanceError,
     InvalidRequestError,
@@ -244,6 +245,11 @@ class Mapper(Generic[_T]):
 
 _MANYTOONE = "manytoone"
 _ONETOMANY = "onetomany"
+_MANYTOMANY = "manytomany"
+
+# ``__dict__`` key holding each m2m relationship's committed remote-PK set —
+# the flush-time diff baseline for association INSERT/DELETE emission.
+_M2M_BASE = "_catalyst_m2m_base"
 
 # SQLAlchemy's ``all`` cascade token expands to these operations; the separate
 # ``delete-orphan`` token opts into deleting removed children.
@@ -288,6 +294,11 @@ class RelationshipProperty:
         "local_col",
         "remote_attr",
         "remote_col",
+        "secondary",
+        "secondary_local",
+        "secondary_remote",
+        "single_parent",
+        "viewonly",
     )
 
     key: str
@@ -305,6 +316,13 @@ class RelationshipProperty:
     local_col: Column
     remote_attr: str
     remote_col: Column
+    # ``secondary`` is the association Table; ``secondary_local`` its column
+    # FK-ing back to the declaring table, ``secondary_remote`` to the target.
+    secondary: Table | None
+    secondary_local: Column | None
+    secondary_remote: Column | None
+    single_parent: bool
+    viewonly: bool
 
 
 class Relationship(Generic[_T]):
@@ -327,6 +345,11 @@ class Relationship(Generic[_T]):
         "container",
         "target_hint",
         "configured",
+        "secondary",
+        "primaryjoin",
+        "secondaryjoin",
+        "single_parent",
+        "viewonly",
     )
 
     def __init__(
@@ -338,6 +361,11 @@ class Relationship(Generic[_T]):
         lazy: str = "select",
         uselist: bool | None = None,
         cascade: object = "merge,save-update",
+        secondary: Table | str | None = None,
+        primaryjoin: Column | Expression | None = None,
+        secondaryjoin: Column | Expression | None = None,
+        single_parent: bool = False,
+        viewonly: bool = False,
     ) -> None:
         self.argument = argument
         self.back_populates = back_populates
@@ -350,6 +378,11 @@ class Relationship(Generic[_T]):
         self.container: str | None = None
         self.target_hint: object = None
         self.configured: RelationshipProperty | None = None
+        self.secondary = secondary
+        self.primaryjoin = primaryjoin
+        self.secondaryjoin = secondaryjoin
+        self.single_parent = single_parent
+        self.viewonly = viewonly
 
     def __get__(self, instance: object, owner: object = None) -> object:
         if instance is None:
@@ -365,6 +398,11 @@ class Relationship(Generic[_T]):
 
     def __set__(self, instance: object, value: object) -> None:
         prop = self.configure()
+        if prop.direction == _MANYTOMANY:
+            # Replacing an unloaded many-to-many attribute loads the
+            # committed membership first so the flush diff (and sibling
+            # back-population) see the prior association rows.
+            _ensure_loaded(instance, prop)
         if prop.uselist:
             _set_collection(instance, prop, value)
         else:
@@ -400,13 +438,23 @@ def relationship(
     lazy: str = "select",
     uselist: bool | None = None,
     cascade: object = "merge,save-update",
+    secondary: Table | str | None = None,
+    primaryjoin: Column | Expression | None = None,
+    secondaryjoin: Column | Expression | None = None,
+    single_parent: bool = False,
+    viewonly: bool = False,
     **kw: object,
 ) -> Relationship[Any]:
     """Declare a relationship between mapped classes, mirroring SQLAlchemy's.
 
     ``argument`` may be a mapped class or its name; when omitted the target is
     resolved from the ``Mapped[...]`` annotation once the class exists
-    (deferred mapper configuration).
+    (deferred mapper configuration).  ``secondary`` names an association
+    table (or metadata table name) for many-to-many relationships;
+    ``primaryjoin``/``secondaryjoin`` disambiguate its foreign-key paths
+    (required for self-referential mappings); ``single_parent`` permits the
+    ``delete-orphan`` cascade on a many-to-many; ``viewonly`` loads through
+    the association without ever writing rows.
     """
     if kw:
         raise ArgumentError(f"relationship() got unexpected keyword argument(s): {sorted(kw)}")
@@ -417,6 +465,11 @@ def relationship(
         lazy=lazy,
         uselist=uselist,
         cascade=cascade,
+        secondary=secondary,
+        primaryjoin=primaryjoin,
+        secondaryjoin=secondaryjoin,
+        single_parent=single_parent,
+        viewonly=viewonly,
     )
 
 
@@ -620,6 +673,22 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
         return False
     table = mapper.local_table
     target_table = target_mapper.local_table
+    secondary: object = decl.secondary
+    if secondary is not None:
+        # A string ``secondary`` resolves against the declaring mapper's
+        # MetaData registry; an unresolved name defers like an unresolved
+        # class target so later mapper passes can still succeed.
+        # Runtime guard for out-of-contract callers passing non-Table objects.
+        if not isinstance(secondary, (Table, str)):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ArgumentError(
+                f"relationship() secondary= expected a Table or table name, got "
+                f"{type(decl.secondary).__name__!r}"
+            )
+        if isinstance(secondary, str):
+            secondary = mapper.local_table.metadata.tables.get(secondary)
+            if secondary is None:
+                return False
+        return _configure_secondary(decl, mapper, target, target_mapper, secondary)
     a_fks = [
         column
         for column in table.columns
@@ -645,6 +714,12 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
     prop.cascade = decl.cascade
     prop.back_populates = decl.back_populates
     prop.sibling = None
+    prop.secondary = None
+    prop.secondary_local = None
+    prop.secondary_remote = None
+    prop.single_parent = bool(decl.single_parent)
+    prop.viewonly = bool(decl.viewonly)
+    fk_col: Column | None = None
     if a_fks:
         prop.direction = _MANYTOONE
         fk_col = a_fks[0]
@@ -679,6 +754,18 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
         else:
             uselist = False
     prop.uselist = bool(uselist)
+    _register_relationship(decl, mapper, prop, target, target_mapper)
+    return True
+
+
+def _register_relationship(
+    decl: Relationship[Any],
+    mapper: Mapper[Any],
+    prop: RelationshipProperty,
+    target: type[object],
+    target_mapper: Mapper[Any],
+) -> None:
+    """Install a configured property and materialize any ``backref`` peer."""
     mapper.relationships[prop.key] = prop
     decl.configured = prop
     if decl in mapper.pending_relationships:
@@ -687,12 +774,145 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
     if decl.backref is not None and decl.backref not in target_mapper.relationships:
         if not any(d.key == decl.backref for d in target_mapper.pending_relationships):
             rev: Relationship[Any] = Relationship(None, back_populates=prop.key)
+            # A m2m backref joins through the same association table with the
+            # explicit join directions swapped, like SQLAlchemy.
+            rev.secondary = prop.secondary
+            rev.primaryjoin = decl.secondaryjoin
+            rev.secondaryjoin = decl.primaryjoin
             rev.key = decl.backref
             rev.declaring_cls = target
             setattr(target, decl.backref, rev)
             target_mapper.relationship_attrs += (decl.backref,)
             target_mapper.pending_relationships.append(rev)
             _configure_relationship(rev, target_mapper)
+
+
+def _join_node(clause: object) -> tuple[object, ...]:
+    """Serialized AST node for a ``primaryjoin``/``secondaryjoin`` clause."""
+    if isinstance(clause, Column):
+        return clause.serialize()
+    if isinstance(clause, Expression):
+        return clause.node
+    return ()
+
+
+def _assoc_column_in(node: object, assoc_name: str) -> str | None:
+    """First ``("column", assoc, name)`` leaf inside a serialized join node."""
+    if isinstance(node, tuple):
+        parts = cast("tuple[object, ...]", node)
+        if parts and parts[0] == "column" and len(parts) >= 3 and parts[1] == assoc_name:
+            return cast(str, parts[2])
+        for part in parts:
+            found = _assoc_column_in(part, assoc_name)
+            if found is not None:
+                return found
+    return None
+
+
+def _configure_secondary(
+    decl: Relationship[Any],
+    mapper: Mapper[Any],
+    target: type[object],
+    target_mapper: Mapper[Any],
+    secondary: Table,
+) -> bool:
+    """Configure a ``secondary=`` declaration as a many-to-many relationship.
+
+    The two foreign-key paths through the association table are inferred
+    from each column's ``ForeignKey.target_table``; ``primaryjoin`` /
+    ``secondaryjoin`` override the inference per side (and are required for
+    self-referential mappings, where both paths are ambiguous).
+    """
+    table = mapper.local_table
+    target_table = target_mapper.local_table
+    prop = RelationshipProperty()
+    prop.key = cast(str, decl.key)
+    prop.mapper = mapper
+    prop.entity = target
+    prop.target_mapper = target_mapper
+    prop.descriptor = decl
+    prop.lazy = decl.lazy
+    prop.cascade = decl.cascade
+    prop.back_populates = decl.back_populates
+    prop.sibling = None
+    prop.direction = _MANYTOMANY
+    prop.secondary = secondary
+    prop.secondary_local = None
+    prop.secondary_remote = None
+    prop.single_parent = bool(decl.single_parent)
+    prop.viewonly = bool(decl.viewonly)
+    if "delete-orphan" in decl.cascade and not prop.single_parent:
+        raise ArgumentError(
+            f"'{prop.key}' relationship with delete-orphan cascade on a "
+            "many-to-many relationship must have single_parent=True set"
+        )
+    if mapper.pk_column is None or mapper.pk_attr is None:
+        raise ArgumentError(f"'{mapper.class_.__name__}' has no primary key")
+    if target_mapper.pk_column is None or target_mapper.pk_attr is None:
+        raise ArgumentError(f"Target '{target.__name__}' has no primary key")
+    prop.local_col = mapper.pk_column
+    prop.local_attr = mapper.pk_attr
+    prop.remote_col = target_mapper.pk_column
+    prop.remote_attr = target_mapper.pk_attr
+    self_ref = table.name == target_table.name
+    if decl.primaryjoin is not None:
+        found = _assoc_column_in(_join_node(decl.primaryjoin), secondary.name)
+        if found is not None:
+            prop.secondary_local = next(
+                column for column in secondary.columns if column.name == found
+            )
+    if decl.secondaryjoin is not None:
+        found = _assoc_column_in(_join_node(decl.secondaryjoin), secondary.name)
+        if found is not None:
+            prop.secondary_remote = next(
+                column for column in secondary.columns if column.name == found
+            )
+    if self_ref and (prop.secondary_local is None or prop.secondary_remote is None):
+        raise AmbiguousForeignKeysError(
+            f"Could not determine join condition between parent and child tables "
+            f"on relationship '{mapper.class_.__name__}.{prop.key}' - there are "
+            f"multiple foreign key paths linking the tables via secondary table "
+            f"'{secondary.name}'. Specify the 'primaryjoin' and 'secondaryjoin' "
+            "keyword arguments."
+        )
+    if prop.secondary_local is None:
+        candidates = [
+            column
+            for column in secondary.columns
+            if column.foreign_key is not None and column.foreign_key.target_table == table.name
+        ]
+        if len(candidates) != 1:
+            raise AmbiguousForeignKeysError(
+                f"Could not determine join condition between '{mapper.class_.__name__}' "
+                f"and '{target.__name__}' via secondary table '{secondary.name}' "
+                f"({len(candidates)} foreign key paths to '{table.name}')"
+            )
+        prop.secondary_local = candidates[0]
+    if prop.secondary_remote is None:
+        candidates = [
+            column
+            for column in secondary.columns
+            if column.foreign_key is not None
+            and column.foreign_key.target_table == target_table.name
+        ]
+        if len(candidates) != 1:
+            raise AmbiguousForeignKeysError(
+                f"Could not determine join condition between '{mapper.class_.__name__}' "
+                f"and '{target.__name__}' via secondary table '{secondary.name}' "
+                f"({len(candidates)} foreign key paths to '{target_table.name}')"
+            )
+        prop.secondary_remote = candidates[0]
+    uselist = decl.uselist
+    if uselist is None:
+        if decl.container == "collection":
+            uselist = True
+        elif decl.container == "scalar":
+            uselist = False
+        else:
+            # Many-to-many collections default to uselist=True on both sides.
+            uselist = True
+    prop.uselist = bool(uselist)
+    _register_relationship(decl, mapper, prop, target, target_mapper)
     return True
 
 
@@ -723,6 +943,60 @@ def _collection_for(instance: object, prop: RelationshipProperty) -> Instrumente
     return collection
 
 
+def _pk_value(uow: NativeUow, obj: object) -> object:
+    """Primary key of ``obj`` — uow-stored first, then the mapped attribute."""
+    pk = uow.pk_of(obj)
+    if pk is None:
+        pk_attr = _mapper_of(obj).pk_attr
+        if pk_attr is not None:
+            pk = obj.__dict__.get(pk_attr)
+    return pk
+
+
+def _ensure_loaded(obj: object, prop: RelationshipProperty) -> None:
+    """Materialize a persistent object's unloaded relationship attribute.
+
+    SQLAlchemy lazy-loads relationship state before mutating it; doing the
+    same keeps the in-memory collection authoritative and gives the m2m
+    flush diff a committed baseline for pair deletes.
+    """
+    if prop.key in obj.__dict__:
+        return
+    uow = _state_of(obj)
+    if uow is None or not uow.is_managed(obj):
+        return
+    if uow.status(obj) != _STATUS_PERSISTENT:
+        return
+    session = uow.session
+    if session is not None:
+        cast("Session", session)._lazy_load(obj, prop)  # pyright: ignore[reportPrivateUsage]
+
+
+def _m2m_committed(instance_dict: dict[str, object], key: str) -> frozenset[object] | None:
+    """Committed remote-PK set for a m2m attribute, or ``None`` if unobserved."""
+    base = instance_dict.get(_M2M_BASE)
+    if not isinstance(base, dict):
+        return None
+    return cast("dict[str, frozenset[object]]", base).get(key)
+
+
+def _m2m_committed_set(instance_dict: dict[str, object], key: str, pks: frozenset[object]) -> None:
+    """Record the committed remote-PK set for a m2m attribute."""
+    base = instance_dict.get(_M2M_BASE)
+    if not isinstance(base, dict):
+        base = {}
+        instance_dict[_M2M_BASE] = base
+    cast("dict[str, frozenset[object]]", base)[key] = pks
+
+
+def _is_deferred_bind(value: object) -> bool:
+    """Whether ``value`` is a deferred ``("__catalyst_rowid__", dep)`` marker."""
+    if not isinstance(value, tuple):
+        return False
+    pair = cast("tuple[object, ...]", value)
+    return len(pair) == 2 and pair[0] == "__catalyst_rowid__"
+
+
 def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> None:
     """Assign a scalar relationship attribute with back-population.
 
@@ -734,7 +1008,7 @@ def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> N
         return
     instance_dict[prop.key] = value
     uow = _state_of(obj)
-    if uow is not None:
+    if uow is not None and not (prop.direction == _MANYTOMANY and prop.viewonly):
         uow.attr_set(obj, prop.key)
     sibling = prop.sibling
     if sibling is not None:
@@ -762,13 +1036,21 @@ def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> N
 
 
 def _collection_append(owner: object, prop: RelationshipProperty, item: object) -> None:
+    if prop.direction == _MANYTOMANY and not prop.viewonly:
+        uow = _state_of(owner)
+        if uow is not None and uow.is_managed(owner):
+            uow.attr_set(owner, prop.key)
     sibling = prop.sibling
     if sibling is not None:
         if sibling.uselist:
+            if sibling.direction == _MANYTOMANY:
+                _ensure_loaded(item, sibling)
             other = _collection_for(item, sibling)
             if owner not in other:
                 list[object].append(other, owner)
         else:
+            if sibling.direction == _MANYTOMANY:
+                _ensure_loaded(item, sibling)
             _set_scalar_rel(item, sibling, owner)
     if "save-update" in prop.cascade:
         uow = _state_of(owner)
@@ -781,13 +1063,21 @@ def _collection_append(owner: object, prop: RelationshipProperty, item: object) 
 
 
 def _collection_remove(owner: object, prop: RelationshipProperty, item: object) -> None:
+    if prop.direction == _MANYTOMANY and not prop.viewonly:
+        uow = _state_of(owner)
+        if uow is not None and uow.is_managed(owner):
+            uow.attr_set(owner, prop.key)
     sibling = prop.sibling
     if sibling is not None:
         if sibling.uselist:
+            if sibling.direction == _MANYTOMANY:
+                _ensure_loaded(item, sibling)
             other = getattr(item, "__dict__", {}).get(sibling.key)
             if isinstance(other, list) and owner in other:
                 list[object].remove(cast("list[object]", other), owner)
         else:
+            if sibling.direction == _MANYTOMANY:
+                _ensure_loaded(item, sibling)
             _set_scalar_rel(item, sibling, None)
     if "delete-orphan" in prop.cascade:
         item_uow = _state_of(item)
@@ -849,16 +1139,39 @@ def _stitch_loaded(owner: object, prop: RelationshipProperty, item: object) -> N
     """
     instance_dict = owner.__dict__
     sibling = prop.sibling
-    if prop.direction == _ONETOMANY and prop.uselist:
+    if prop.uselist and prop.direction in (_ONETOMANY, _MANYTOMANY):
         if item is None:
+            if prop.direction == _MANYTOMANY:
+                # Eager loaders stitch empty collections too — the loaded
+                # (empty) membership is committed state.
+                _collection_for(owner, prop)
+                if _m2m_committed(instance_dict, prop.key) is None:
+                    _m2m_committed_set(instance_dict, prop.key, frozenset())
             return
         collection = _collection_for(owner, prop)
         if item not in collection:
             list[object].append(collection, item)
+        if prop.direction == _MANYTOMANY:
+            # Eagerly loaded membership is committed state: fold the item's
+            # pk into the association diff baseline.
+            uow = _state_of(owner)
+            if uow is not None:
+                item_pk = _pk_value(uow, item)
+                if item_pk is not None:
+                    base = _m2m_committed(instance_dict, prop.key)
+                    _m2m_committed_set(instance_dict, prop.key, (base or frozenset()) | {item_pk})
         if sibling is not None and not sibling.uselist:
             item.__dict__[sibling.key] = owner
     else:
         instance_dict[prop.key] = item
+        if prop.direction == _MANYTOMANY:
+            uow = _state_of(owner)
+            item_pk = None if item is None or uow is None else _pk_value(uow, item)
+            _m2m_committed_set(
+                instance_dict,
+                prop.key,
+                frozenset() if item_pk is None else frozenset({item_pk}),
+            )
         if item is not None and sibling is not None:
             if sibling.uselist:
                 collection = _collection_for(item, sibling)
@@ -1268,6 +1581,9 @@ def _expire_instance(instance: object) -> None:
         instance.__dict__.pop(attr, None)
     for key in mapper.relationship_attrs:
         instance.__dict__.pop(key, None)
+    # The m2m committed-membership baseline is only valid while the
+    # in-memory state reflects the database; expiry invalidates both.
+    instance.__dict__.pop(_M2M_BASE, None)
 
 
 class _StateSet(Set[object]):
@@ -1482,7 +1798,27 @@ class Session:
         for prop in mapper.relationships.values():
             orphan = "delete-orphan" in prop.cascade or "delete" in prop.cascade
             for item in self._related_items(instance, prop):
-                if orphan:
+                if prop.direction == _MANYTOMANY:
+                    # Removing the member emits the association-row DELETE at
+                    # flush; delete-orphan additionally removes the child row.
+                    if orphan:
+                        item_uow = _state_of(item)
+                        if item_uow is not None and item_uow is self._uow:
+                            status = item_uow.status(item)
+                            if status == _STATUS_PERSISTENT:
+                                self._apply_delete_cascade(item)
+                                if not prop.uselist:
+                                    item_uow.mark_deleted(item)
+                            elif status == _STATUS_PENDING:
+                                item_uow.detach(item)
+                    if prop.uselist:
+                        collection = instance.__dict__.get(prop.key)
+                        if isinstance(collection, list) and item in collection:
+                            list[object].remove(cast("list[object]", collection), item)
+                        _collection_remove(instance, prop, item)
+                    else:
+                        prop.descriptor.__set__(instance, None)
+                elif orphan:
                     item_uow = _state_of(item)
                     if item_uow is not None and item_uow is self._uow:
                         status = item_uow.status(item)
@@ -1726,7 +2062,9 @@ class Session:
         # FK assignments resolved after the batch from an earlier op's rowid.
         deferred_fk: list[tuple[object, str, int]] = []
         insert_index: dict[int, int] = {}
-        for obj in self._dependency_order(uow.new_objects()):
+        new_order = self._dependency_order(uow.new_objects())
+        deleted_order = self._dependent_first_order(uow.deleted_objects())
+        for obj in new_order:
             mapper = _mapper_of(obj)
             pk_attr = mapper.pk_attr
             pk_value = obj.__dict__.get(pk_attr) if pk_attr is not None else None
@@ -1813,7 +2151,124 @@ class Session:
                 ordered[compiled._bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
             ops.append((compiled.string, ordered, compiled._bind_types, False))
             cleaned.append(obj)
-        for obj in self._dependent_first_order(uow.deleted_objects()):
+        # Many-to-many association writes: deduped deletes then inserts,
+        # all ahead of object deletes so delete-orphan ordering holds and
+        # no association row outlives a member.
+        assoc_adds: list[tuple[RelationshipProperty, object, object]] = []
+        assoc_dels: list[tuple[RelationshipProperty, object, object]] = []
+        seen_pairs: set[tuple[object, frozenset[object]]] = set()
+        base_refresh: list[tuple[dict[str, object], str, list[object]]] = []
+        persisted_pk: dict[int, object] = {id(obj): pk_value for obj, pk_value in persisted}
+        scan: list[tuple[object, int]] = (
+            [(obj, _STATUS_PENDING) for obj in new_order]
+            + [(obj, _STATUS_PERSISTENT) for obj in uow.dirty_objects()]
+            + [(obj, _STATUS_DELETED) for obj in deleted_order]
+        )
+        for obj, status in scan:
+            mapper = _mapper_of(obj)
+            for prop in mapper.relationships.values():
+                if prop.direction != _MANYTOMANY or prop.viewonly:
+                    continue
+                assoc = cast(Table, prop.secondary)
+                local_fk = cast(Column, prop.secondary_local)
+                remote_fk = cast(Column, prop.secondary_remote)
+                instance_dict = obj.__dict__
+                owner_key: object
+                if status == _STATUS_PENDING:
+                    pk = persisted_pk.get(id(obj))
+                    owner_key = (
+                        pk if pk is not None else ("__catalyst_rowid__", insert_index[id(obj)])
+                    )
+                else:
+                    owner_key = _pk_value(uow, obj)
+                if owner_key is None:
+                    continue
+                committed = _m2m_committed(instance_dict, prop.key)
+                base: frozenset[object]
+                if committed is None:
+                    if status == _STATUS_PENDING:
+                        # A new object has no committed association rows —
+                        # and its owner key may still be a deferred marker.
+                        base = frozenset()
+                    elif status == _STATUS_PERSISTENT and prop.key not in uow.dirty_attrs_of(obj):
+                        continue
+                    else:
+                        base = self._m2m_base_rows(prop, owner_key)
+                else:
+                    base = committed
+                value = instance_dict.get(prop.key)
+                if prop.uselist:
+                    members = list(cast("list[object]", value)) if isinstance(value, list) else []
+                else:
+                    members = [value] if value is not None else []
+                member_keys: list[tuple[object, object]] = []
+                for item in members:
+                    dep = insert_index.get(id(item))
+                    if dep is not None:
+                        pk = persisted_pk.get(id(item))
+                        member_keys.append(
+                            (item, pk if pk is not None else ("__catalyst_rowid__", dep))
+                        )
+                    else:
+                        member_keys.append((item, self._related_pk(item)))
+                member_key_set = {key for _item, key in member_keys}
+                if status == _STATUS_DELETED:
+                    remote_dels = set(base) | {
+                        key for _item, key in member_keys if not _is_deferred_bind(key)
+                    }
+                    remote_adds: list[object] = []
+                else:
+                    remote_dels = {key for key in base if key not in member_key_set}
+                    remote_adds = [key for _item, key in member_keys if key not in base]
+                for remote in remote_adds:
+                    if remote is None:
+                        continue
+                    pair = (
+                        assoc.name,
+                        frozenset({(local_fk.name, owner_key), (remote_fk.name, remote)}),
+                    )
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        assoc_adds.append((prop, owner_key, remote))
+                for remote in remote_dels:
+                    pair = (
+                        assoc.name,
+                        frozenset({(local_fk.name, owner_key), (remote_fk.name, remote)}),
+                    )
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        assoc_dels.append((prop, owner_key, remote))
+                if status != _STATUS_DELETED:
+                    base_refresh.append((instance_dict, prop.key, members))
+        for prop, owner_key, remote in assoc_dels:
+            assoc = cast(Table, prop.secondary)
+            compiled = (
+                Delete(assoc)
+                .where(
+                    cast(Column, prop.secondary_local) == owner_key,
+                    cast(Column, prop.secondary_remote) == remote,
+                )
+                .compile()
+            )
+            self._raise_bind_error(compiled)
+            ops.append((compiled.string, list(compiled._ordered), compiled._bind_types, False))
+        insert_compiled: dict[int, Compiled] = {}
+        for prop, owner_key, remote in assoc_adds:
+            assoc = cast(Table, prop.secondary)
+            local_fk = cast(Column, prop.secondary_local)
+            remote_fk = cast(Column, prop.secondary_remote)
+            compiled = insert_compiled.get(id(prop))
+            if compiled is None:
+                compiled = (
+                    Insert(assoc).values({local_fk.name: None, remote_fk.name: None}).compile()
+                )
+                self._raise_bind_error(compiled)
+                insert_compiled[id(prop)] = compiled
+            ordered = list(compiled._ordered)
+            ordered[compiled._bind_names.index(local_fk.name)] = owner_key
+            ordered[compiled._bind_names.index(remote_fk.name)] = remote
+            ops.append((compiled.string, ordered, compiled._bind_types, False))
+        for obj in deleted_order:
             mapper = _mapper_of(obj)
             pk = uow.pk_of(obj)
             compiled = Delete(mapper.local_table).where(mapper.pk_column == pk).compile()
@@ -1838,6 +2293,16 @@ class Session:
             _dep_obj, dep_pk = persisted[dep]
             obj.__dict__[attr] = dep_pk if dep_pk is not None else assigned[dep]
         uow.flush_transition(final, cleaned, dropped)
+        # Association diffs succeeded: current membership is the new
+        # committed baseline for every scanned relationship.
+        for instance_dict, key, members in base_refresh:
+            _m2m_committed_set(
+                instance_dict,
+                key,
+                frozenset(
+                    pk for pk in (_pk_value(uow, member) for member in members) if pk is not None
+                ),
+            )
 
     def _dependency_order(self, objects: list[object]) -> list[object]:
         """Order objects so many-to-one FK dependencies come first.
@@ -1886,12 +2351,16 @@ class Session:
 
     def _related_pk(self, related: object) -> object:
         """Primary key of a related object (uow-stored, else attribute)."""
-        pk = self._uow.pk_of(related)
-        if pk is None:
-            pk_attr = _mapper_of(related).pk_attr
-            if pk_attr is not None:
-                pk = related.__dict__.get(pk_attr)
-        return pk
+        return _pk_value(self._uow, related)
+
+    def _m2m_base_rows(self, prop: RelationshipProperty, owner_pk: object) -> frozenset[object]:
+        """Committed association membership: remote PKs joined to ``owner_pk``."""
+        assoc = cast(Table, prop.secondary)
+        statement = Select((cast(Column, prop.secondary_remote),), assoc).where(
+            cast(Column, prop.secondary_local) == owner_pk
+        )
+        rows = self._conn().execute(statement).fetchall()
+        return frozenset(row[0] for row in rows)
 
     # -- relationship loading -----------------------------------------------
 
@@ -1918,6 +2387,38 @@ class Session:
         pk = uow.pk_of(instance)
         if pk is None and prop.mapper.pk_attr is not None:
             pk = instance_dict.get(prop.mapper.pk_attr)
+        if prop.direction == _MANYTOMANY:
+            if prop.uselist:
+                collection = InstrumentedList()
+                collection.bind(instance, prop)
+                member_pks: set[object] = set()
+                if pk is not None:
+                    for item in self._m2m_children(prop, pk):
+                        list[object].append(collection, item)
+                        item_pk = _pk_value(uow, item)
+                        if item_pk is not None:
+                            member_pks.add(item_pk)
+                instance_dict[prop.key] = collection
+                _m2m_committed_set(instance_dict, prop.key, frozenset(member_pks))
+                uow.attr_loaded(instance, prop.key)
+                return collection
+            target = None
+            member_pk: object = None
+            if pk is not None:
+                items = self._m2m_children(prop, pk)
+                target = items[0] if items else None
+                if target is not None:
+                    member_pk = _pk_value(uow, target)
+            instance_dict[prop.key] = target
+            _m2m_committed_set(
+                instance_dict,
+                prop.key,
+                frozenset() if member_pk is None else frozenset({member_pk}),
+            )
+            uow.attr_loaded(instance, prop.key)
+            if target is not None and prop.sibling is not None and not prop.sibling.uselist:
+                target.__dict__[prop.sibling.key] = instance
+            return target
         if prop.uselist:
             collection = InstrumentedList()
             collection.bind(instance, prop)
@@ -1954,6 +2455,56 @@ class Session:
         )
         statement = Select(
             tuple(target_mapper.local_table.columns), target_mapper.local_table, predicate
+        )
+        result = self._conn().execute(statement)
+        instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
+        return self._uow.reconcile(
+            prop.entity,
+            cast(str, target_mapper.pk_attr),
+            list(target_mapper.attrs),
+            instances,
+        )
+
+    def _m2m_children(self, prop: RelationshipProperty, owner_pk: object) -> list[object]:
+        """Lazy m2m SELECT: implicit comma join through the association table.
+
+        Renders SQLAlchemy's bind-first shape —
+        ``FROM <target>, <assoc> WHERE ? = <assoc>.<local_fk> AND
+        <target>.<pk> = <assoc>.<remote_fk>``.
+        """
+        assoc = cast(Table, prop.secondary)
+        local_fk = cast(Column, prop.secondary_local)
+        remote_fk = cast(Column, prop.secondary_remote)
+        target_mapper = prop.target_mapper
+        target_pk = cast(Column, target_mapper.pk_column)
+        predicate = Expression(
+            (
+                "and",
+                (
+                    (
+                        "binary",
+                        (
+                            "literal",
+                            owner_pk,
+                            local_fk.name,
+                            _column_type_tag(local_fk.type),
+                        ),
+                        "=",
+                        local_fk.serialize(),
+                    ),
+                    ("binary", target_pk.serialize(), "=", remote_fk.serialize()),
+                ),
+            )
+        )
+        statement = Select(
+            tuple(target_mapper.local_table.columns),
+            target_mapper.local_table,
+            predicate,
+            (),
+            None,
+            None,
+            None,
+            (("implicit_from", assoc.name),),
         )
         result = self._conn().execute(statement)
         instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
@@ -2008,7 +2559,7 @@ class Session:
         """Single LEFT OUTER JOIN query hydrating parent and related slices."""
         specs: list[tuple[type[object], list[str]]] = [(entity, list(mapper.attrs))]
         columns: list[Column | Expression] = list(mapper.local_table.columns)
-        joins: list[tuple[str, str, tuple[object, ...]]] = []
+        joins: list[tuple[object, ...]] = []
         joined_props: list[RelationshipProperty] = []
         for index, prop in enumerate(joined):
             target_mapper = prop.target_mapper
@@ -2025,7 +2576,60 @@ class Session:
                 prop.remote_col.name,
                 _column_type_tag(prop.remote_col.type),
             )
-            joins.append((target_mapper.local_table.name, alias, ("binary", left, "=", right)))
+            if prop.direction == _MANYTOMANY:
+                # ``LEFT OUTER JOIN (assoc AS a_1 JOIN t AS t_1 ON
+                # t_1.pk = a_1.remote) ON local.pk = a_1.local``.
+                assoc = cast(Table, prop.secondary)
+                local_fk = cast(Column, prop.secondary_local)
+                remote_fk = cast(Column, prop.secondary_remote)
+                assoc_alias = f"{assoc.name}_{index + 1}"
+                inner_on = (
+                    "binary",
+                    (
+                        "column",
+                        alias,
+                        prop.remote_col.name,
+                        _column_type_tag(prop.remote_col.type),
+                    ),
+                    "=",
+                    (
+                        "column",
+                        assoc_alias,
+                        remote_fk.name,
+                        _column_type_tag(remote_fk.type),
+                    ),
+                )
+                outer_on = (
+                    "binary",
+                    left,
+                    "=",
+                    (
+                        "column",
+                        assoc_alias,
+                        local_fk.name,
+                        _column_type_tag(local_fk.type),
+                    ),
+                )
+                joins.append(
+                    (
+                        "left_outer_join_nested",
+                        assoc.name,
+                        assoc_alias,
+                        target_mapper.local_table.name,
+                        alias,
+                        inner_on,
+                        outer_on,
+                    )
+                )
+            else:
+                joins.append(
+                    (
+                        "left_outer_join",
+                        target_mapper.local_table.name,
+                        alias,
+                        ("binary", left, "=", right),
+                    )
+                )
             for column in target_mapper.local_table.columns:
                 columns.append(
                     Expression(("column", alias, column.name, _column_type_tag(column.type)))
@@ -2077,6 +2681,71 @@ class Session:
         if not entity_rows:
             return
         target_mapper = prop.target_mapper
+        if prop.direction == _MANYTOMANY:
+            # ``SELECT assoc.local_fk, t.* FROM assoc JOIN t ON t.pk =
+            # assoc.remote_fk WHERE assoc.local_fk IN (...)`` — the
+            # association table leads the FROM and its grouping column leads
+            # the SELECT list, matching SQLAlchemy's selectin shape.
+            assoc = cast(Table, prop.secondary)
+            local_fk = cast(Column, prop.secondary_local)
+            remote_fk = cast(Column, prop.secondary_remote)
+            parents: dict[object, object] = {}
+            seen_parents: set[int] = set()
+            for (parent,) in entity_rows:
+                if id(parent) in seen_parents:
+                    continue
+                seen_parents.add(id(parent))
+                pk = self._uow.pk_of(parent)
+                if pk is None and prop.mapper.pk_attr is not None:
+                    pk = parent.__dict__.get(prop.mapper.pk_attr)
+                if pk is not None:
+                    parents[pk] = parent
+            if not parents:
+                return
+            target_pk = cast(Column, target_mapper.pk_column)
+            statement = Select(
+                (Expression(local_fk.serialize()), *target_mapper.local_table.columns),
+                assoc,
+                local_fk.in_(list(parents)),
+                (),
+                None,
+                None,
+                None,
+                (
+                    (
+                        "join",
+                        target_mapper.local_table.name,
+                        None,
+                        ("binary", target_pk.serialize(), "=", remote_fk.serialize()),
+                    ),
+                ),
+            )
+            result = self._conn().execute(statement)
+            # ``hydrate_entities`` slices rows positionally: a throwaway spec
+            # consumes the grouping FK column so the real spec hydrates only
+            # target columns (one FFI crossing for the whole batch).
+            pk_attr = cast(str, target_mapper.pk_attr)
+            rows = result.native_result.hydrate_entities(
+                [(prop.entity, [pk_attr]), (prop.entity, list(target_mapper.attrs))]
+            )
+            owners: list[object] = []
+            raw_items: list[object] = []
+            for row in rows:
+                stub, item = row[0], row[1]
+                if item is None:
+                    continue
+                owners.append(getattr(stub, pk_attr) if stub is not None else None)
+                raw_items.append(item)
+            items = self._uow.reconcile(prop.entity, pk_attr, list(target_mapper.attrs), raw_items)
+            for owner_key, item in zip(owners, items, strict=True):
+                parent = parents.get(owner_key)
+                if parent is not None:
+                    _stitch_loaded(parent, prop, item)
+            # Parents with no association rows still hold committed state —
+            # an empty collection — like SQLAlchemy's selectin load.
+            for parent in parents.values():
+                _stitch_loaded(parent, prop, None)
+            return
         if prop.direction == _ONETOMANY:
             parents: dict[object, object] = {}
             seen: set[int] = set()

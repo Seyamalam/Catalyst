@@ -19,6 +19,7 @@ from .expression import (
     Column,
     Compiled,
     Delete,
+    Expression,
     ForeignKey,
     Insert,
     MetaData,
@@ -125,6 +126,11 @@ class RelationshipProperty:
     local_col: Column
     remote_attr: str
     remote_col: Column
+    secondary: Table | None
+    secondary_local: Column | None
+    secondary_remote: Column | None
+    single_parent: bool
+    viewonly: bool
 
 class Relationship(Generic[_T]):
     """Declarative relationship marker installed as a class attribute.
@@ -144,6 +150,11 @@ class Relationship(Generic[_T]):
     container: str | None
     target_hint: object
     configured: RelationshipProperty | None
+    secondary: Table | str | None
+    primaryjoin: Column | Expression | None
+    secondaryjoin: Column | Expression | None
+    single_parent: bool
+    viewonly: bool
     def __init__(
         self,
         argument: object = ...,
@@ -153,6 +164,11 @@ class Relationship(Generic[_T]):
         lazy: str = ...,
         uselist: bool | None = ...,
         cascade: object = ...,
+        secondary: Table | str | None = ...,
+        primaryjoin: Column | Expression | None = ...,
+        secondaryjoin: Column | Expression | None = ...,
+        single_parent: bool = ...,
+        viewonly: bool = ...,
     ) -> None: ...
     def __get__(self, instance: object, owner: object = ...) -> object: ...
     def __set__(self, instance: object, value: object) -> None: ...
@@ -169,6 +185,11 @@ def relationship(
     lazy: str = ...,
     uselist: bool | None = ...,
     cascade: object = ...,
+    secondary: Table | str | None = ...,
+    primaryjoin: Column | Expression | None = ...,
+    secondaryjoin: Column | Expression | None = ...,
+    single_parent: bool = ...,
+    viewonly: bool = ...,
     **kw: object,
 ) -> Relationship[Any]: ...
 

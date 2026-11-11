@@ -139,6 +139,13 @@ create_exception!(
     "Raised when an unloaded attribute is accessed on a detached object."
 );
 
+create_exception!(
+    _catalyst,
+    AmbiguousForeignKeysError,
+    ArgumentError,
+    "Raised when more than one foreign key path could satisfy a relationship join."
+);
+
 /// A native SQLite engine owning a bounded connection pool.
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeEngine {
@@ -1718,6 +1725,10 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "DetachedInstanceError",
         module.py().get_type::<DetachedInstanceError>(),
     )?;
+    module.add(
+        "AmbiguousForeignKeysError",
+        module.py().get_type::<AmbiguousForeignKeysError>(),
+    )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
     module.add_class::<postgres::NativePgEngine>()?;
@@ -1749,6 +1760,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "StaleDataError",
             "ObjectDeletedError",
             "DetachedInstanceError",
+            "AmbiguousForeignKeysError",
             "sqlite_text",
             "compile_expression",
             "NativeEngine",

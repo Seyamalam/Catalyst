@@ -1190,6 +1190,7 @@ def test_self_referential_m2m_requires_joins() -> None:
     catalyst_engine = create_engine(":memory:")
     CPerson.metadata.create_all(catalyst_engine)
     sa_engine = sa_create_engine("sqlite://")
+    SABase.metadata.create_all(sa_engine)
     try:
         with Session(catalyst_engine) as session, SASession(sa_engine) as sa_session:
             cp1, cp2 = CPerson(name="p1"), CPerson(name="p2")

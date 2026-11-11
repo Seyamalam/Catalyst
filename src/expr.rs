@@ -69,13 +69,39 @@ enum Expr {
     Neg(Box<Expr>),
 }
 
-/// A LEFT OUTER JOIN clause serialized from the ORM eager-loading path:
-/// target table name, render alias, and the ON expression.
+/// A join clause serialized from the ORM loader paths. The first element of
+/// each serialized node picks the kind:
+/// - ``("left_outer_join", table, alias, on)`` — joinedload target join.
+/// - ``("join", table, alias_or_none, on)`` — inner join used by the
+///   selectinload association query (no alias on the target side).
+/// - ``("implicit_from", table)`` — SQLAlchemy's lazy many-to-many implicit
+///   comma join: ``FROM child, assoc``.
+/// - ``("left_outer_join_nested", assoc, assoc_alias, table, alias,
+///   inner_on, outer_on)`` — joinedload through an association table:
+///   ``LEFT OUTER JOIN (assoc AS a_1 JOIN t AS t_1 ON inner) ON outer``.
 #[derive(Clone)]
-struct JoinSpec {
-    table: String,
-    alias: String,
-    on: Expr,
+enum JoinSpec {
+    LeftOuter {
+        table: String,
+        alias: String,
+        on: Expr,
+    },
+    Inner {
+        table: String,
+        alias: Option<String>,
+        on: Expr,
+    },
+    ImplicitFrom {
+        table: String,
+    },
+    LeftOuterNested {
+        assoc_table: String,
+        assoc_alias: String,
+        table: String,
+        alias: String,
+        inner_on: Expr,
+        outer_on: Expr,
+    },
 }
 
 #[derive(Clone)]
@@ -658,14 +684,58 @@ impl Compiler {
                     self.ident(table);
                 }
                 for join in joins {
-                    // SQLAlchemy renders eager LEFT OUTER JOINs with an alias:
-                    // ``LEFT OUTER JOIN rel_child AS rel_child_1 ON ...``.
-                    self.sql.push_str(" LEFT OUTER JOIN ");
-                    self.ident(&join.table);
-                    self.sql.push_str(" AS ");
-                    self.ident(&join.alias);
-                    self.sql.push_str(" ON ");
-                    self.expr(&join.on, None);
+                    match join {
+                        JoinSpec::ImplicitFrom { table } => {
+                            // Lazy many-to-many loads list the association
+                            // table in an implicit comma join.
+                            self.sql.push_str(", ");
+                            self.ident(table);
+                        }
+                        JoinSpec::Inner { table, alias, on } => {
+                            self.sql.push_str(" JOIN ");
+                            self.ident(table);
+                            if let Some(alias) = alias {
+                                self.sql.push_str(" AS ");
+                                self.ident(alias);
+                            }
+                            self.sql.push_str(" ON ");
+                            self.expr(on, None);
+                        }
+                        JoinSpec::LeftOuter { table, alias, on } => {
+                            // SQLAlchemy renders eager LEFT OUTER JOINs with an alias:
+                            // ``LEFT OUTER JOIN rel_child AS rel_child_1 ON ...``.
+                            self.sql.push_str(" LEFT OUTER JOIN ");
+                            self.ident(table);
+                            self.sql.push_str(" AS ");
+                            self.ident(alias);
+                            self.sql.push_str(" ON ");
+                            self.expr(on, None);
+                        }
+                        JoinSpec::LeftOuterNested {
+                            assoc_table,
+                            assoc_alias,
+                            table,
+                            alias,
+                            inner_on,
+                            outer_on,
+                        } => {
+                            // Many-to-many joinedload nests the association
+                            // join: ``LEFT OUTER JOIN (assoc AS a_1 JOIN t
+                            // AS t_1 ON inner) ON outer``.
+                            self.sql.push_str(" LEFT OUTER JOIN (");
+                            self.ident(assoc_table);
+                            self.sql.push_str(" AS ");
+                            self.ident(assoc_alias);
+                            self.sql.push_str(" JOIN ");
+                            self.ident(table);
+                            self.sql.push_str(" AS ");
+                            self.ident(alias);
+                            self.sql.push_str(" ON ");
+                            self.expr(inner_on, None);
+                            self.sql.push_str(") ON ");
+                            self.expr(outer_on, None);
+                        }
+                    }
                 }
                 if let Some(predicate) = predicate
                     && !renders_empty(predicate)
@@ -1802,16 +1872,32 @@ fn parse_statement(value: &Bound<'_, PyAny>, dialect: Dialect) -> PyResult<State
                     .iter()
                     .map(|join| {
                         let kind = tag(join)?;
-                        if kind != "left_outer_join" {
-                            return Err(ArgumentError::new_err(format!(
+                        match kind.as_str() {
+                            "left_outer_join" => Ok(JoinSpec::LeftOuter {
+                                table: string_at(join, 1)?,
+                                alias: string_at(join, 2)?,
+                                on: parse_expr(&item(join, 3)?, dialect)?,
+                            }),
+                            "join" => Ok(JoinSpec::Inner {
+                                table: string_at(join, 1)?,
+                                alias: optional_string_at(join, 2)?,
+                                on: parse_expr(&item(join, 3)?, dialect)?,
+                            }),
+                            "implicit_from" => Ok(JoinSpec::ImplicitFrom {
+                                table: string_at(join, 1)?,
+                            }),
+                            "left_outer_join_nested" => Ok(JoinSpec::LeftOuterNested {
+                                assoc_table: string_at(join, 1)?,
+                                assoc_alias: string_at(join, 2)?,
+                                table: string_at(join, 3)?,
+                                alias: string_at(join, 4)?,
+                                inner_on: parse_expr(&item(join, 5)?, dialect)?,
+                                outer_on: parse_expr(&item(join, 6)?, dialect)?,
+                            }),
+                            _ => Err(ArgumentError::new_err(format!(
                                 "Unsupported join kind '{kind}'"
-                            )));
+                            ))),
                         }
-                        Ok(JoinSpec {
-                            table: string_at(join, 1)?,
-                            alias: string_at(join, 2)?,
-                            on: parse_expr(&item(join, 3)?, dialect)?,
-                        })
                     })
                     .collect::<PyResult<Vec<_>>>()?,
                 _ => Vec::new(),

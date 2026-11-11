@@ -16,6 +16,7 @@ Examples:
 """
 
 from ._catalyst import (
+    AmbiguousForeignKeysError,
     ArgumentError,
     CatalystError,
     DatabaseError,
@@ -100,6 +101,7 @@ from .orm import (
 __all__ = [
     "CatalystError",
     "ArgumentError",
+    "AmbiguousForeignKeysError",
     "NoSuchModuleError",
     "DBAPIError",
     "DatabaseError",

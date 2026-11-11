@@ -176,7 +176,7 @@ class Select:
     row_limit: int | None
     row_offset: int | None
     entity: type[object] | None
-    joins: tuple[tuple[str, str, tuple[object, ...]], ...]
+    joins: tuple[tuple[object, ...], ...]
     loader_options: tuple[object, ...]
     def __init__(
         self,
@@ -187,7 +187,7 @@ class Select:
         row_limit: int | None = ...,
         row_offset: int | None = ...,
         entity: type[object] | None = ...,
-        joins: tuple[tuple[str, str, tuple[object, ...]], ...] = ...,
+        joins: tuple[tuple[object, ...], ...] = ...,
         loader_options: tuple[object, ...] = ...,
     ) -> None: ...
     def where(self, *clauses: Column | Expression | bool) -> Select: ...

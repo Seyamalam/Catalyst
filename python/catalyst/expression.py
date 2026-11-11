@@ -863,8 +863,11 @@ class Select:
     row_limit: int | None = None
     row_offset: int | None = None
     entity: type[object] | None = None
-    # ORM-side LEFT OUTER JOIN specs: (table name, alias, serialized ON node).
-    joins: tuple[tuple[str, str, tuple[object, ...]], ...] = ()
+    # ORM-side join specs, already serialized: ("left_outer_join", table,
+    # alias, on) | ("join", table, alias|None, on) | ("implicit_from", table)
+    # | ("left_outer_join_nested", assoc, assoc_alias, table, alias,
+    # inner_on, outer_on).
+    joins: tuple[tuple[object, ...], ...] = ()
     # Loader options (joinedload/selectinload) applied by Session.execute.
     loader_options: tuple[object, ...] = ()
 
@@ -1011,10 +1014,7 @@ class Select:
                 if has_pagination
                 else None
             )
-        joins = tuple(
-            ("left_outer_join", join_table, alias, on_node)
-            for join_table, alias, on_node in self.joins
-        )
+        joins = tuple(self.joins)
         return (
             "select",
             nodes,

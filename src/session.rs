@@ -9,7 +9,7 @@
 //! call can transition or reconcile whole batches.
 
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) const PENDING: u8 = 1;
@@ -492,7 +492,42 @@ impl NativeUow {
                 found
             };
             match existing {
-                Some(existing) => out.push(existing),
+                Some(existing) => {
+                    // A row load populates expired attributes on the
+                    // already-mapped instance — SQLAlchemy refreshes expired
+                    // state from the row; unexpired (possibly dirty) values
+                    // are left untouched. ``__dict__`` is written directly so
+                    // mapped-class ``__setattr__`` dirty tracking doesn't fire
+                    // (a refresh isn't a user mutation) and no re-borrow is
+                    // needed mid-write.
+                    let names: Vec<String> = {
+                        let uow = slf.borrow(py);
+                        uow.states
+                            .get(&(existing.as_ptr() as usize))
+                            .map(|state| state.expired_attrs.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
+                    if !names.is_empty() {
+                        let dict = existing.bind(py).getattr("__dict__")?;
+                        let dict = dict.cast::<PyDict>()?;
+                        let mut refreshed: Vec<String> = Vec::new();
+                        for name in names {
+                            if let Ok(value) = instance.getattr(name.as_str()) {
+                                dict.set_item(name.as_str(), value)?;
+                                refreshed.push(name);
+                            }
+                        }
+                        if !refreshed.is_empty() {
+                            let mut uow = slf.borrow_mut(py);
+                            if let Some(state) = uow.states.get_mut(&(existing.as_ptr() as usize)) {
+                                for name in refreshed {
+                                    state.expired_attrs.remove(&name);
+                                }
+                            }
+                        }
+                    }
+                    out.push(existing)
+                }
                 None => {
                     {
                         let mut uow = slf.borrow_mut(py);
