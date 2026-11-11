@@ -87,6 +87,9 @@ def mapped_column(
     kw_only: bool = ...,
 ) -> MappedColumn[Any]: ...
 
+class SAWarning(Warning):
+    """SQLAlchemy-parity warning category (e.g. missing polymorphic_identity)."""
+
 class Mapper(Generic[_T]):
     class_: type[_T]
     local_table: Table
@@ -100,12 +103,20 @@ class Mapper(Generic[_T]):
     pending_relationships: list[Relationship[Any]]
     relationship_attrs: tuple[str, ...]
     class_registry: dict[str, type[object]]
+    inherits: Mapper[Any] | None
+    base_mapper: Mapper[Any]
+    polymorphic_on: Column | None
+    polymorphic_on_attr: str | None
+    polymorphic_identity: object
+    polymorphic_map: dict[object, type[object]]
+    self_and_descendants: list[Mapper[Any]]
     def __init__(
         self,
         class_: type[_T],
         table: Table,
         attrs: tuple[str, ...],
         specs: dict[str, MappedColumn[Any] | None],
+        attr_columns: dict[str, Column] | None = ...,
     ) -> None: ...
 
 class RelationshipProperty:

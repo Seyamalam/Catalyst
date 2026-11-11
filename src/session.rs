@@ -473,10 +473,13 @@ impl NativeUow {
         attrs: Vec<String>,
         instances: &Bound<'_, PyList>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let class_ptr = cls.as_ptr() as usize;
+        let _ = cls; // identity keys derive from each instance's own class
         let mut out = Vec::with_capacity(instances.len());
         for instance in instances.iter() {
             let pk = instance.getattr(pk_attr)?;
+            // Key the identity map by the *resolved* class — polymorphic
+            // hydration can return subclasses of the queried entity (STI).
+            let class_ptr = instance.get_type().as_ptr() as usize;
             let key = (class_ptr, pk.hash()?);
             let existing = {
                 let uow = slf.borrow(py);

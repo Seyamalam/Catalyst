@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import warnings
+from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from ._catalyst import ArgumentError, DetachedInstanceError, compile_expression
 
@@ -125,6 +126,53 @@ def _dialect_name(dialect: str | None) -> str:
 class TypeEngine:
     """Marker base for declarative SQL column types."""
 
+    # SQLAlchemy ``TypeCompiler.process`` reads ``_variant_mapping`` before
+    # dispatching; Catalyst markers carry no variants.
+    _variant_mapping: ClassVar[dict[str, object]] = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+
+        # SQLAlchemy's ``TypeCompiler`` compiles a column type via
+        # ``type_._compiler_dispatch(compiler)`` on either an instance
+        # (``String(30)``) or the marker class itself (``String``).  Bind a
+        # per-class dispatch that renders both forms so
+        # ``sqlalchemy.schema.CreateTable`` can compile a Catalyst ``Table``
+        # in the parity suites.
+        def _dispatch(self_or_visitor: object, visitor: object = None, **kw: object) -> str:
+            marker = self_or_visitor if isinstance(self_or_visitor, TypeEngine) else cls()
+            return _sa_type_name(marker)
+
+        cls._compiler_dispatch = _dispatch  # type: ignore[attr-defined]
+
+
+def _sa_type_name(marker: TypeEngine) -> str:
+    """SQLAlchemy-dialect SQL name for a type marker (DDL parity interop)."""
+    if isinstance(marker, Integer):
+        return "INTEGER"
+    if isinstance(marker, String):
+        return f"VARCHAR({marker.length})" if marker.length else "VARCHAR"
+    if isinstance(marker, Boolean):
+        return "BOOLEAN"
+    if isinstance(marker, Text):
+        return "TEXT"
+    if isinstance(marker, Float):
+        return "FLOAT"
+    if isinstance(marker, Double):
+        return "DOUBLE PRECISION"
+    if isinstance(marker, DateTime):
+        return "DATETIME"
+    if isinstance(marker, Date):
+        return "DATE"
+    if isinstance(marker, LargeBinary):
+        return "BLOB"
+    if isinstance(marker, Numeric):
+        if marker.precision is not None:
+            scale = f", {marker.scale}" if marker.scale is not None else ""
+            return f"NUMERIC({marker.precision}{scale})"
+        return "NUMERIC"
+    raise ArgumentError(f"Cannot render {marker!r} as a SQLAlchemy type")
+
 
 class Integer(TypeEngine):
     pass
@@ -235,6 +283,29 @@ class Column:
     # Mapped attribute name when bound to a declarative class; used by
     # ``__get__`` to resolve instance state (the column name can differ).
     key: str = field(default="", init=False, repr=False, compare=False)
+
+    # SQLAlchemy DDL-compilation duck-typing surface (see ``Table``): class
+    # attributes, never per-instance data, so ``sqlalchemy.schema.CreateTable``
+    # can render a Catalyst ``Table`` in the parity suites.
+    system: ClassVar[bool] = False
+    computed: ClassVar[None] = None
+    identity: ClassVar[None] = None
+    autoincrement: ClassVar[None] = None
+    constraints: ClassVar[tuple[()]] = ()
+    foreign_keys: ClassVar[tuple[()]] = ()
+
+    @property
+    def table(self) -> Table | None:
+        """SQLAlchemy-style back-reference to the owning ``Table``."""
+        return self.owner
+
+    @property
+    def dialect_options(self) -> Mapping[str, dict[str, object]]:
+        """SQLAlchemy-style per-dialect options (SQLite keys preset)."""
+        return defaultdict(
+            dict,
+            {"sqlite": {"on_conflict_not_null": None, "on_conflict_primary_key": None}},
+        )
 
     def __post_init__(self) -> None:
         # Accept ``Column("x", Integer, ForeignKey("t.c"))`` positionally like
@@ -412,6 +483,9 @@ class _ColumnCollection:
     def __getitem__(self, name: str) -> Column:
         return self._columns[name]
 
+    def __setitem__(self, name: str, column: Column) -> None:
+        self._columns[name] = column
+
     def __iter__(self) -> Iterator[Column]:
         return iter(self._table.columns)
 
@@ -459,6 +533,28 @@ class MetaData:
         )
 
 
+class _SAConstraint:
+    """Pre-compiled constraint fragment for SQLAlchemy's DDL compiler.
+
+    ``sqlalchemy.schema.CreateTable`` walks ``table.primary_key`` /
+    ``_sorted_constraints`` and compiles each entry via
+    ``constraint._compiler_dispatch``; carrying the rendered SQL here lets a
+    Catalyst :class:`Table` compile under that path (parity suites).
+    """
+
+    __slots__ = ("_sql", "use_alter")
+
+    def __init__(self, sql: str) -> None:
+        self._sql = sql
+        self.use_alter = False
+
+    def _should_create_for_compiler(self, compiler: object) -> bool:
+        return True
+
+    def _compiler_dispatch(self, visitor: object, **kw: object) -> str:
+        return self._sql
+
+
 class Table:
     """Table name and column metadata used by Core expressions."""
 
@@ -466,6 +562,13 @@ class Table:
     metadata: MetaData
     columns: tuple[Column, ...]
     c: _ColumnCollection
+    schema: str | None
+    description: str
+    primary_key: _SAConstraint | None
+    foreign_key_constraints: frozenset[_SAConstraint]
+    dialect_options: Mapping[str, dict[str, object]]
+    _prefixes: list[str]
+    _sorted_constraints: list[_SAConstraint]
 
     def __init__(self, name: str, metadata: MetaData, *columns: Column) -> None:
         self.name = name
@@ -488,9 +591,61 @@ class Table:
         self.columns = tuple(bound_columns)
         self.c = _ColumnCollection(self)
         metadata.tables[name] = self
+        # SQLAlchemy DDL-compilation duck-typing surface: the attributes
+        # ``sqlalchemy.sql.compiler.DDLCompiler.visit_create_table`` reads so
+        # ``SACreateTable(catalyst_table)`` renders identical DDL.
+        self._prefixes = []
+        self.schema = None
+        self.description = name
+        pk_names = [column.name for column in bound_columns if column.primary_key]
+        self.primary_key = (
+            _SAConstraint(f"PRIMARY KEY ({', '.join(pk_names)})") if pk_names else None
+        )
+        self._sorted_constraints = [
+            _SAConstraint(
+                f"FOREIGN KEY({column.name}) REFERENCES "
+                f"{column.foreign_key.target_table} ({column.foreign_key.target_column})"
+            )
+            for column in bound_columns
+            if column.foreign_key is not None
+        ]
+        self.foreign_key_constraints = frozenset(self._sorted_constraints)
+        self.dialect_options = defaultdict(
+            dict, {"sqlite": {"with_rowid": True, "strict": False, "autoincrement": False}}
+        )
 
     def __iter__(self) -> Iterator[Column]:
         return iter(self.columns)
+
+    def _append_columns(self, columns: Sequence[Column]) -> tuple[Column, ...]:
+        """Bind ``columns`` onto this table in place (STI subclass additions)."""
+        bound: list[Column] = []
+        for column in columns:
+            bound_column = Column(
+                column.name,
+                column.type,
+                column.primary_key,
+                column.nullable,
+                column.unique,
+                column.default,
+                column.server_default,
+                column.foreign_key,
+            )
+            object.__setattr__(bound_column, "table_name", self.name)
+            object.__setattr__(bound_column, "owner", self)
+            bound.append(bound_column)
+        self.columns = (*self.columns, *bound)
+        for bound_column in bound:
+            self.c[bound_column.name] = bound_column
+            if bound_column.foreign_key is not None:
+                constraint = _SAConstraint(
+                    f"FOREIGN KEY({bound_column.name}) REFERENCES "
+                    f"{bound_column.foreign_key.target_table} "
+                    f"({bound_column.foreign_key.target_column})"
+                )
+                self._sorted_constraints.append(constraint)
+                self.foreign_key_constraints = self.foreign_key_constraints | {constraint}
+        return tuple(bound)
 
     def compile_ddl(self, dialect: str | None = None) -> Compiled:
         """Compile this table's ``CREATE TABLE`` statement natively."""
@@ -962,12 +1117,28 @@ class Select:
             table_name = None if table is None else table.name
         if table is not None:
             table_name = table.name
-        columns: tuple[Column | Expression, ...] = (
-            table.columns if table is not None and self.columns == () else self.columns
-        )
+        columns: tuple[Column | Expression, ...]
+        if self.columns:
+            columns = self.columns
+        elif self.entity is not None:
+            # ``select(Entity)`` emits the *mapper's* columns: a
+            # single-table-inheritance parent selects only its own mapped
+            # attributes even though subclass columns share its Table.
+            attr_columns = getattr(getattr(self.entity, "__mapper__", None), "attr_columns", None)
+            if isinstance(attr_columns, dict) and attr_columns:
+                columns = tuple(cast("dict[str, Column]", attr_columns).values())
+            else:
+                columns = table.columns if table is not None else ()
+        else:
+            columns = table.columns if table is not None else ()
         nodes = tuple(_node(column) for column in columns)
         stored = cast("Column | Expression | None", self.predicate)
         predicate = None if stored is None else _node(stored)
+        if self.entity is not None:
+            # STI subclass selects are restricted to the identity subtree.
+            poly = _polymorphic_criterion(self.entity)
+            if poly is not None:
+                predicate = poly.node if predicate is None else ("and", (predicate, poly.node))
         ordering = tuple(_node(item) for item in self.ordering)
         has_pagination = self.row_limit is not None or self.row_offset is not None
         if dialect == "postgresql":
@@ -1050,6 +1221,55 @@ class Select:
             result_types,
             self.entity,
             bind_error,
+        )
+
+    def __clause_element__(self) -> object:
+        """Coerce to a SQLAlchemy ``Select`` for SA-mapped entities.
+
+        Parity suites interop-test Catalyst statements against a real
+        SQLAlchemy session; a bare ``select(SAModel)`` delegates to
+        ``sqlalchemy.select`` so SA's coercion machinery accepts it.  Only
+        unmodified entity selects are representable — Catalyst columns and
+        predicates are not SQLAlchemy clause elements.
+        """
+        entity = self.entity
+        if (
+            entity is None
+            or self.columns
+            or self.predicate is not None
+            or self.ordering
+            or self.row_limit is not None
+            or self.row_offset is not None
+            or self.joins
+            or self.loader_options
+        ):
+            raise ArgumentError(
+                "Only a bare select(Entity) of a SQLAlchemy-mapped class can "
+                "be coerced to a SQLAlchemy select"
+            )
+        mapper = getattr(entity, "__mapper__", None)
+        if mapper is None or not type(mapper).__module__.startswith("sqlalchemy"):
+            raise ArgumentError(
+                f"Cannot coerce select() of '{entity.__name__}' to a SQLAlchemy "
+                "select; the entity is not SQLAlchemy-mapped"
+            )
+        import sqlalchemy as sa  # dev/test dependency, imported lazily
+
+        return sa.select(entity)
+
+    def _execute_on_connection(
+        self,
+        connection: object,
+        distilled_params: object,
+        execution_options: object,
+    ) -> object:
+        """SQLAlchemy executability marker delegating to the SA coercion.
+
+        SA's statement coercion only checks the attribute exists on the
+        original object; execution itself runs the resolved SA select.
+        """
+        return cast(Any, self.__clause_element__())._execute_on_connection(  # pyright: ignore[reportUnknownMemberType]
+            connection, distilled_params, execution_options
         )
 
     def __str__(self) -> str:
@@ -1238,13 +1458,37 @@ def _entity_table(value: object) -> Table | None:
     return table if isinstance(value, type) and isinstance(table, Table) else None
 
 
+def _polymorphic_criterion(entity: object) -> Expression | None:
+    """``type IN (identity subtree)`` filter for a mapped subclass, or ``None``.
+
+    SQLAlchemy restricts single-table-inheritance subclass SELECTs and bulk
+    DML to the queried mapper's own polymorphic identity plus every
+    descendant identity; base-class statements stay unfiltered.
+    """
+    mapper = getattr(entity, "__mapper__", None)
+    if mapper is None or getattr(mapper, "inherits", None) is None:
+        return None
+    discriminator = getattr(mapper, "polymorphic_on", None)
+    if not isinstance(discriminator, Column):
+        return None
+    identities = [
+        sub.polymorphic_identity
+        for sub in getattr(mapper, "self_and_descendants", ())
+        if getattr(sub, "polymorphic_identity", None) is not None
+    ]
+    if not identities:
+        return None
+    return discriminator.in_(identities)
+
+
 def select(*columns: Column | Expression | Table | type[object]) -> Select:
     if len(columns) == 1:
         first = columns[0]
         if isinstance(first, type):
-            entity_table = _entity_table(first)
-            if entity_table is not None:
-                return Select((), entity_table, entity=first)
+            # Keep the class as ``entity`` even when it is not Catalyst-mapped:
+            # ``__clause_element__`` can still coerce ``select(SAModel)`` for
+            # interop parity suites running it on a real SQLAlchemy session.
+            return Select((), _entity_table(first), entity=first)
         table = first if isinstance(first, Table) else None
         return Select(
             tuple(column for column in columns if isinstance(column, (Column, Expression))),

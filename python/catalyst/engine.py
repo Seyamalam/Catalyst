@@ -100,6 +100,27 @@ def _merge_compiled_batch(
     return merged
 
 
+def _hydrate_polymorphic(
+    mapper: object, attrs: Sequence[str] | None = None
+) -> tuple[int, dict[object, type[object]]] | None:
+    """``(discriminator index, identity map)`` for batched hydration, or None.
+
+    ``NativeResult.hydrate`` resolves each row's concrete class through the
+    STI discriminator column at ``index`` within its attribute slice;
+    ``attrs`` is the slice's attribute list (defaults to the mapper's).
+    """
+    attr = getattr(mapper, "polymorphic_on_attr", None)
+    if not isinstance(attr, str):
+        return None
+    polymorphic_map = getattr(mapper, "polymorphic_map", None)
+    if not polymorphic_map:
+        return None
+    names = attrs if attrs is not None else getattr(mapper, "attrs", ())
+    if attr not in names:
+        return None
+    return (list(names).index(attr), cast("dict[object, type[object]]", polymorphic_map))
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class TextClause:
     """A SQL text statement suitable for execution with named parameters."""
@@ -141,10 +162,25 @@ class CursorResult:
         self._seen: set[object] = set()
         if self.entity_rows is None and entity is not None:
             mapper = cast(Any, entity).__mapper__
-            instances = native_result.hydrate(entity, list(mapper.attrs))
+            instances = native_result.hydrate(
+                entity, list(mapper.attrs), _hydrate_polymorphic(mapper)
+            )
             pk_attr = getattr(mapper, "pk_attr", None)
             if uow is not None and pk_attr is not None:
                 instances = uow.reconcile(entity, pk_attr, list(mapper.attrs), instances)
+                if getattr(mapper, "polymorphic_map", None):
+                    # Rows resolved to concrete subclasses carry only the
+                    # queried columns; subclass-only attributes load lazily
+                    # on first access (SA's deferred subclass-column load).
+                    for instance in instances:
+                        inst_mapper = getattr(type(instance), "__mapper__", None)
+                        if inst_mapper is None or inst_mapper is mapper:
+                            continue
+                        missing = [
+                            attr for attr in inst_mapper.attrs if attr not in instance.__dict__
+                        ]
+                        if missing:
+                            uow.expire_attrs(instance, missing)
             self.entity_rows = [(instance,) for instance in instances]
 
     @property

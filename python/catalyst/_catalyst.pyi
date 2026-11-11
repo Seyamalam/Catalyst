@@ -203,9 +203,17 @@ class NativeResult:
     def rowcount(self) -> int: ...
     def fetchall(self) -> list[tuple[object, ...]]: ...
     def fetchone(self) -> tuple[object, ...] | None: ...
-    def hydrate(self, cls: object, attrs: list[str]) -> list[object]: ...
+    def hydrate(
+        self,
+        cls: object,
+        attrs: list[str],
+        polymorphic: tuple[int, dict[object, type[object]]] | None = ...,
+    ) -> list[object]: ...
     def hydrate_entities(
-        self, specs: Sequence[tuple[type[object], list[str]]]
+        self,
+        specs: Sequence[
+            tuple[type[object], list[str], tuple[int, dict[object, type[object]]] | None]
+        ],
     ) -> list[tuple[object, ...]]: ...
 
 class ArgumentError(CatalystError):

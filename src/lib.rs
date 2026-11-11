@@ -13,6 +13,8 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple};
 use rusqlite::{Connection, params_from_iter, types::Value};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -942,6 +944,14 @@ impl NativeConnection {
     }
 }
 
+/// Per-entity hydration spec for [`NativeResult::hydrate_entities`]:
+/// `(class, attribute names, optional (discriminator index, identity map))`.
+type HydrateEntitySpec<'py> = (
+    Bound<'py, PyAny>,
+    Vec<String>,
+    Option<(usize, Bound<'py, PyDict>)>,
+);
+
 #[pymethods]
 impl NativeResult {
     #[getter]
@@ -983,16 +993,35 @@ impl NativeResult {
     /// matching SQLAlchemy's instrumentation) and every attribute in `attrs`
     /// receives the row value at the same column position. Consumes the
     /// remaining rows like `fetchall`.
+    ///
+    /// `polymorphic` is an optional `(discriminator_index, identity_map)`
+    /// pair: the row value at that column position selects the concrete
+    /// class from the identity map, falling back to `cls` — SQLAlchemy's
+    /// single-table-inheritance discriminator resolution.
+    #[pyo3(signature = (cls, attrs, polymorphic=None))]
     fn hydrate(
         &mut self,
         py: Python<'_>,
         cls: &Bound<'_, PyAny>,
         attrs: Vec<String>,
+        polymorphic: Option<(usize, Bound<'_, PyDict>)>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let allocator = cls.getattr("__new__")?;
+        let mut allocators: HashMap<usize, Bound<'_, PyAny>> = HashMap::new();
         let mut instances = Vec::with_capacity(self.rows.len().saturating_sub(self.next_row));
         for row in &self.rows[self.next_row..] {
-            let instance = allocator.call1((cls,))?;
+            let resolved = match &polymorphic {
+                Some((index, map)) => match row.get(*index) {
+                    Some(value) => map.get_item(value.bind(py))?.unwrap_or_else(|| cls.clone()),
+                    None => cls.clone(),
+                },
+                None => cls.clone(),
+            };
+            let key = resolved.as_ptr() as usize;
+            let new_fn = match allocators.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(resolved.getattr("__new__")?),
+            };
+            let instance = new_fn.call1((&resolved,))?;
             for (attr, value) in attrs.iter().zip(row.iter()) {
                 instance.setattr(attr.as_str(), value.clone_ref(py))?;
             }
@@ -1004,24 +1033,26 @@ impl NativeResult {
 
     /// Hydrate a joined (eager-load) result set in one crossing.
     ///
-    /// `specs` is a list of `(cls, attrs)` pairs; each row is partitioned
-    /// left-to-right across the specs' attribute lists. Returns one tuple per
-    /// row holding an instance per spec — `None` where that spec's whole
-    /// column slice is NULL (outer-join misses). Consumes remaining rows.
+    /// `specs` is a list of `(cls, attrs, polymorphic)` triples where
+    /// `polymorphic` is the optional `(discriminator_index, identity_map)`
+    /// pair described on [`hydrate`](Self::hydrate) (the index is relative to
+    /// the spec's own column slice). Each row is partitioned left-to-right
+    /// across the specs' attribute lists. Returns one tuple per row holding
+    /// an instance per spec — `None` where that spec's whole column slice is
+    /// NULL (outer-join misses). Consumes remaining rows.
     fn hydrate_entities(
         &mut self,
         py: Python<'_>,
-        specs: Vec<(Bound<'_, PyAny>, Vec<String>)>,
+        specs: Vec<HydrateEntitySpec<'_>>,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let allocators = specs
-            .iter()
-            .map(|(cls, _)| cls.getattr("__new__"))
-            .collect::<PyResult<Vec<_>>>()?;
+        let mut allocators = (0..specs.len())
+            .map(|_| HashMap::new())
+            .collect::<Vec<HashMap<usize, Bound<'_, PyAny>>>>();
         let mut out = Vec::with_capacity(self.rows.len().saturating_sub(self.next_row));
         for row in &self.rows[self.next_row..] {
             let mut offset = 0usize;
             let mut items: Vec<Py<PyAny>> = Vec::with_capacity(specs.len());
-            for ((cls, attrs), allocator) in specs.iter().zip(allocators.iter()) {
+            for (spec_index, (cls, attrs, polymorphic)) in specs.iter().enumerate() {
                 let end = offset + attrs.len();
                 let slice = &row[offset.min(row.len())..end.min(row.len())];
                 let all_null =
@@ -1029,7 +1060,21 @@ impl NativeResult {
                 if all_null {
                     items.push(py.None());
                 } else {
-                    let instance = allocator.call1((cls,))?;
+                    let resolved = match polymorphic {
+                        Some((index, map)) => match slice.get(*index) {
+                            Some(value) => {
+                                map.get_item(value.bind(py))?.unwrap_or_else(|| cls.clone())
+                            }
+                            None => cls.clone(),
+                        },
+                        None => cls.clone(),
+                    };
+                    let key = resolved.as_ptr() as usize;
+                    let new_fn = match allocators[spec_index].entry(key) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => entry.insert(resolved.getattr("__new__")?),
+                    };
+                    let instance = new_fn.call1((&resolved,))?;
                     for (attr, value) in attrs.iter().zip(slice.iter()) {
                         instance.setattr(attr.as_str(), value.clone_ref(py))?;
                     }

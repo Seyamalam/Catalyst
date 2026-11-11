@@ -422,12 +422,16 @@ def _sa_statements(engine: Any) -> list[tuple[str, Any]]:
 
 
 def _sa_selects(statements: list[tuple[str, Any]]) -> list[str]:
-    return [" ".join(s.split()) for s, _ in statements if s.lstrip().upper().startswith("SELECT")]
+    return [
+        " ".join(s.split()).upper()
+        for s, _ in statements
+        if s.lstrip().upper().startswith("SELECT")
+    ]
 
 
 def _catalyst_selects(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
-        " ".join(record.getMessage().split())
+        " ".join(record.getMessage().split()).upper()
         for record in caplog.records
         if record.name == "catalyst.engine"
         and record.getMessage().lstrip().upper().startswith("SELECT")
@@ -598,7 +602,7 @@ def test_sti_get_and_select_polymorphic_resolution(
             assert [type(o).__name__ for o in sa_managers] == ["STIManager"]
             sa_selects = _sa_selects(statements)
             manager_select = next(s for s in sa_selects if "TYPE IN" in s)
-            assert "WHERE STI_PERSON.TYPE IN (?)" in manager_select
+            assert "WHERE STI_PERSON.TYPE IN (?, ?)" in manager_select
             parent_select = next(s for s in sa_selects if "TYPE IN" not in s)
             assert parent_select.endswith("FROM STI_PERSON")
 
@@ -634,8 +638,8 @@ def test_sti_multilevel_identity_includes_descendants() -> None:
             statements.clear()
             sa_got = list(sa_session.scalars(select(STIManager)))
             assert sorted(type(o).__name__ for o in sa_got) == [
-                "STISeniorManager",
                 "STIManager",
+                "STISeniorManager",
             ]
             sa_selects = _sa_selects(statements)
             assert any("TYPE IN (?, ?)" in s for s in sa_selects)
@@ -685,7 +689,7 @@ def test_sti_update_and_delete_filters() -> None:
             sa_delete = next(
                 _norm(s) for s, _ in statements if s.lstrip().upper().startswith("DELETE")
             )
-            assert sa_delete == "DELETE FROM STI_PERSON WHERE STI_PERSON.TYPE IN (?)"
+            assert sa_delete == "DELETE FROM STI_PERSON WHERE STI_PERSON.TYPE IN (?, ?)"
             assert session.execute(sa_text("SELECT count(*) FROM sti_person")).scalar_one() == 0
     finally:
         catalyst_engine.dispose()

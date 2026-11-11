@@ -19,6 +19,7 @@ import re
 import sys
 import types
 import typing
+import warnings
 import weakref
 from collections.abc import (
     Callable,
@@ -62,6 +63,7 @@ from .engine import (
     Engine,
     SavepointTransaction,
     ScalarResult,
+    _hydrate_polymorphic,  # pyright: ignore[reportPrivateUsage]
     _statement_error,  # pyright: ignore[reportPrivateUsage]
 )
 from .expression import (
@@ -84,7 +86,7 @@ from .expression import (
     Table,
     Update,
     _column_type_tag,  # pyright: ignore[reportPrivateUsage]
-    select,
+    _polymorphic_criterion,  # pyright: ignore[reportPrivateUsage]
 )
 
 if TYPE_CHECKING:
@@ -106,6 +108,10 @@ _DETACHED = "_catalyst_detached"
 
 # Sentinel for "no client-side column default" during bulk inserts.
 _MISSING = object()
+
+
+class SAWarning(Warning):
+    """SQLAlchemy-parity warning category (e.g. missing polymorphic_identity)."""
 
 
 class Mapped(Generic[_T]):
@@ -218,14 +224,18 @@ class Mapper(Generic[_T]):
         table: Table,
         attrs: tuple[str, ...],
         specs: dict[str, MappedColumn[Any] | None],
+        attr_columns: dict[str, Column] | None = None,
     ) -> None:
         self.class_ = class_
         self.local_table = table
         self.attrs = attrs
-        self.columns = table.columns
         self.specs = specs
         # Attribute-name -> bound Column lookup for unit-of-work SQL building.
-        self.attr_columns = dict(zip(attrs, table.columns, strict=True))
+        if attr_columns is not None:
+            self.attr_columns = dict(attr_columns)
+        else:
+            self.attr_columns = dict(zip(attrs, table.columns, strict=True))
+        self.columns = tuple(self.attr_columns.values())
         self.pk_column = next((column for column in table.columns if column.primary_key), None)
         self.pk_attr = next(
             (attr for attr, column in self.attr_columns.items() if column.primary_key), None
@@ -239,6 +249,23 @@ class Mapper(Generic[_T]):
         self.relationship_attrs: tuple[str, ...] = ()
         # Name -> mapped class registry shared across one declarative base.
         self.class_registry: dict[str, type[object]] = {}
+        # Inheritance bookkeeping. ``inherits`` links a mapper to the parent
+        # mapper it was derived from (single-table inheritance shares the
+        # parent's Table); ``base_mapper`` is the hierarchy root.
+        self.inherits: Mapper[Any] | None = None
+        self.base_mapper: Mapper[Any] = self
+        # Discriminator column + attribute for polymorphic hierarchies.
+        self.polymorphic_on: Column | None = None
+        self.polymorphic_on_attr: str | None = None
+        # This class's ``polymorphic_identity`` (``None`` when omitted —
+        # SQLAlchemy 2.x has no class-name default).
+        self.polymorphic_identity: object = None
+        # identity -> concrete class; shared across the whole hierarchy so
+        # root queries resolve any descendant.
+        self.polymorphic_map: dict[object, type[object]] = {}
+        # This mapper plus every descendant, in registration order — the
+        # identity subtree used by subclass SELECT/bulk-DML filters.
+        self.self_and_descendants: list[Mapper[Any]] = [self]
 
 
 # -- relationships ---------------------------------------------------------
@@ -1393,46 +1420,113 @@ def _eval_annotation(cls: type[object], raw: object) -> object:
         return raw
 
 
-def _map_declarative_class(cls: type[object]) -> None:
-    """Build a ``Table`` and ``Mapper`` for a ``DeclarativeBase`` subclass."""
-    cls_any = cast(Any, cls)
-    tablename = cls.__dict__.get("__tablename__")
-    if tablename is None:
-        # Intermediate base: give it fresh metadata unless one is inherited.
-        if not isinstance(getattr(cls, "metadata", None), MetaData):
-            cls_any.metadata = MetaData()
-        return
-    metadata = getattr(cls, "metadata", None)
-    if not isinstance(metadata, MetaData):
-        metadata = MetaData()
-        cls_any.metadata = metadata
-    try:
-        hints = get_type_hints(cls)
-    except Exception:
-        # Forward references such as Mapped[list["Child"]] cannot resolve
-        # eagerly; annotations are parsed per attribute and relationship
-        # targets resolve at configuration time instead.
-        hints = {}
-    registry = _registry_for(metadata)
-    attrs: list[str] = []
+def _first_mapped_ancestor(cls: type[object]) -> Mapper[Any] | None:
+    """Nearest base class carrying its own ``__mapper__``, if any."""
+    for base in cls.__mro__[1:]:
+        mapper = base.__dict__.get("__mapper__")
+        if isinstance(mapper, Mapper):
+            return cast("Mapper[Any]", mapper)
+    return None
+
+
+def _inheritance_parent(cls: type[object], mapper_args: object) -> Mapper[Any] | None:
+    """Resolve the inheritance parent: ``__mapper_args__['inherits']`` or MRO."""
+    if isinstance(mapper_args, dict) and "inherits" in mapper_args:
+        candidate: object = cast("dict[object, object]", mapper_args)["inherits"]
+        resolved: object = cast(
+            "object",
+            candidate if isinstance(candidate, Mapper) else getattr(candidate, "__mapper__", None),
+        )
+        if not isinstance(resolved, Mapper):
+            raise ArgumentError(
+                f"__mapper_args__['inherits'] on {cls.__name__} does not resolve to a mapped class"
+            )
+        return cast("Mapper[Any]", resolved)
+    return _first_mapped_ancestor(cls)
+
+
+def _mapped_annotations(
+    cls: type[object], stop_at_mapped: bool
+) -> list[tuple[str, object, type[object]]]:
+    """``(name, raw annotation, declaring class)`` triples along the MRO.
+
+    The concrete class's own declarations come first, then each unmapped
+    ancestor's in MRO order (SQLAlchemy's mixin/abstract column layout); the
+    first declaration wins on collisions.  ``stop_at_mapped`` ends the walk
+    at a base carrying its own ``__mapper__`` — its attributes are already
+    mapped on the inheritance parent.
+    """
+    triples: list[tuple[str, object, type[object]]] = []
+    seen: set[str] = set()
+    for klass in cls.__mro__:
+        if klass is object or klass is DeclarativeBase:
+            continue
+        if (
+            klass is not cls
+            and stop_at_mapped
+            and isinstance(klass.__dict__.get("__mapper__"), Mapper)
+        ):
+            break
+        annotations = cast("dict[str, object]", klass.__dict__.get("__annotations__", {}))
+        for name, raw in annotations.items():
+            if name in seen or name.startswith("_") or name == "metadata":
+                continue
+            seen.add(name)
+            triples.append((name, raw, klass))
+    return triples
+
+
+def _bare_declared_members(
+    cls: type[object], stop_at_mapped: bool
+) -> list[tuple[str, object, type[object]]]:
+    """``(name, value, declaring class)`` bare mapped members along the MRO."""
+    triples: list[tuple[str, object, type[object]]] = []
+    for klass in cls.__mro__:
+        if klass is object or klass is DeclarativeBase:
+            continue
+        if (
+            klass is not cls
+            and stop_at_mapped
+            and isinstance(klass.__dict__.get("__mapper__"), Mapper)
+        ):
+            break
+        for name, value in cast("dict[str, object]", klass.__dict__).items():
+            if not name.startswith("_") and isinstance(value, (MappedColumn, Relationship)):
+                triples.append((name, cast("object", value), klass))
+    return triples
+
+
+def _collect_mapped_members(
+    cls: type[object], hints: dict[str, object], stop_at_mapped: bool
+) -> tuple[
+    list[tuple[str, Column]],
+    dict[str, MappedColumn[Any] | None],
+    list[str],
+    list[Relationship[Any]],
+]:
+    """Collect ``(attr, unbound Column)`` pairs, specs, and relationship decls.
+
+    Annotations and bare ``mapped_column()``/``relationship()`` assignments
+    are gathered from the class and its unmapped ancestors (abstract bases
+    and mixins); ``stop_at_mapped`` stops the ancestor walk at a mapped
+    base for single-table-inheritance subclasses.
+    """
+    attr_columns: list[tuple[str, Column]] = []
     specs: dict[str, MappedColumn[Any] | None] = {}
-    columns: list[Column] = []
     rel_attrs: list[str] = []
     rel_decls: list[Relationship[Any]] = []
-    raw_annotations = cast("dict[str, object]", cls.__dict__.get("__annotations__", {}))
-    for name in raw_annotations:
-        if name.startswith("_") or name in {"metadata"}:
-            continue
-        raw = raw_annotations[name]
-        spec_value = cls.__dict__.get(name)
+    for name, raw, declaring in _mapped_annotations(cls, stop_at_mapped):
+        spec_value = declaring.__dict__.get(name)
+        if name in cls.__dict__:
+            spec_value = cls.__dict__[name]
         hint = hints.get(name)
         if get_origin(hint) is ClassVar:
             continue
         if isinstance(spec_value, Relationship):
             decl = cast("Relationship[Any]", spec_value)
             decl.key = name
-            decl.declaring_cls = cls
-            decl.container, decl.target_hint = _rel_annotation_for(cls, hint, raw)
+            decl.declaring_cls = declaring
+            decl.container, decl.target_hint = _rel_annotation_for(declaring, hint, raw)
             rel_attrs.append(name)
             rel_decls.append(decl)
             continue
@@ -1440,13 +1534,16 @@ def _map_declarative_class(cls: type[object]) -> None:
             "MappedColumn[Any] | None",
             spec_value if isinstance(spec_value, MappedColumn) else None,
         )
-        resolved = hint if hint is not None else _eval_annotation(cls, raw)
+        resolved = hint if hint is not None else _eval_annotation(declaring, raw)
         if resolved is not None and get_origin(resolved) is Mapped:
             args = get_args(resolved)
             optional: bool | None
             optional, inner = _unwrap_optional(args[0] if args else None)
         elif spec is None:
-            if resolved is None:
+            if resolved is None or declaring is not cls:
+                # Non-Mapped annotations on ancestors are ignored (SQLAlchemy
+                # only maps Mapped[...] attributes); the class's own still
+                # raise.
                 continue
             raise ArgumentError(
                 f"Attribute '{name}' on {cls.__name__} uses a non-Mapped annotation; "
@@ -1454,30 +1551,190 @@ def _map_declarative_class(cls: type[object]) -> None:
             )
         else:
             optional, inner = None, None
-        columns.append(_column_for_attr(cls, name, spec, inner, optional))
-        attrs.append(name)
+        attr_columns.append((name, _column_for_attr(cls, name, spec, inner, optional)))
         specs[name] = spec
-    # Bare mapped_column()/relationship() assignments carry no annotation.
-    for name, value in cls.__dict__.items():
-        if name.startswith("_"):
-            continue
-        if isinstance(value, MappedColumn) and name not in specs:
-            columns.append(
-                _column_for_attr(cls, name, cast("MappedColumn[Any]", value), None, None)
+    declared_names = {name for name, _column in attr_columns}
+    for name, value, declaring in _bare_declared_members(cls, stop_at_mapped):
+        if isinstance(value, MappedColumn):
+            if name in declared_names:
+                continue
+            attr_columns.append(
+                (
+                    name,
+                    _column_for_attr(cls, name, cast("MappedColumn[Any]", value), None, None),
+                )
             )
-            attrs.append(name)
+            declared_names.add(name)
             specs[name] = value
         elif isinstance(value, Relationship) and name not in rel_attrs:
             decl_value = cast("Relationship[Any]", value)
             decl_value.key = name
-            decl_value.declaring_cls = cls
+            decl_value.declaring_cls = declaring
             rel_attrs.append(name)
             rel_decls.append(decl_value)
-    if not columns:
-        raise ArgumentError(f"{cls.__name__} declares __tablename__ but no mapped attributes")
-    table = Table(str(tablename), metadata, *columns)
+    return attr_columns, specs, rel_attrs, rel_decls
+
+
+def _type_hints(cls: type[object]) -> dict[str, object]:
+    try:
+        return get_type_hints(cls)
+    except Exception:
+        # Forward references such as Mapped[list["Child"]] cannot resolve
+        # eagerly; annotations are parsed per attribute and relationship
+        # targets resolve at configuration time instead.
+        return {}
+
+
+def _polymorphic_on_column(mapper: Mapper[Any], spec: object) -> Column:
+    """Resolve a ``polymorphic_on`` argument to a mapped ``Column``."""
+    if isinstance(spec, Column):
+        return spec
+    if isinstance(spec, str):
+        column = mapper.attr_columns.get(spec)
+        if column is None:
+            column = next((c for c in mapper.local_table.columns if c.name == spec), None)
+        if column is not None:
+            return column
+    raise ArgumentError(
+        f"Can't determine polymorphic_on value '{spec}' - no attribute is mapped to this name."
+    )
+
+
+def _configure_inheritance(mapper: Mapper[Any], mapper_args: dict[object, object]) -> None:
+    """Apply ``__mapper_args__`` inheritance keys to a mapper.
+
+    ``polymorphic_on`` names a mapped attribute holding the discriminator;
+    ``polymorphic_identity`` registers this class in the hierarchy's
+    identity map.  Like SQLAlchemy 2.x there is no default identity — a
+    polymorphic mapper without one warns and stores ``None`` (INSERTs write
+    NULL).
+    """
+    polymorphic_on = mapper_args.get("polymorphic_on")
+    if polymorphic_on is not None:
+        column = _polymorphic_on_column(mapper, polymorphic_on)
+        mapper.polymorphic_on = column
+        mapper.polymorphic_on_attr = _attr_for_column(mapper, column)
+    if "polymorphic_identity" in mapper_args:
+        mapper.polymorphic_identity = mapper_args["polymorphic_identity"]
+    if mapper.polymorphic_on is None:
+        return
+    if mapper.polymorphic_identity is not None:
+        mapper.polymorphic_map[mapper.polymorphic_identity] = mapper.class_
+    elif "polymorphic_identity" not in mapper_args:
+        warnings.warn(
+            f"Mapper {mapper.class_.__name__} does not indicate a "
+            "'polymorphic_identity', yet is part of an inheritance "
+            "hierarchy that has a 'polymorphic_on' column. INSERTed rows "
+            "will store NULL in the discriminator column.",
+            SAWarning,
+            stacklevel=2,
+        )
+
+
+def _map_sti_subclass(cls: type[object], parent_mapper: Mapper[Any], mapper_args: object) -> None:
+    """Map ``cls`` into ``parent_mapper``'s table (single-table inheritance).
+
+    The subclass shares the parent's ``Table``: its own mapped columns are
+    appended (nullable for sibling rows) and its mapper inherits the
+    parent's attributes plus its new ones — SQLAlchemy's STI layout.
+    """
+    cls_any = cast(Any, cls)
+    table = parent_mapper.local_table
+    cls_any.metadata = table.metadata
     cls_any.__table__ = table
-    mapper = Mapper(cls, table, tuple(attrs), specs)
+    attr_columns, specs, rel_attrs, rel_decls = _collect_mapped_members(
+        cls, _type_hints(cls), stop_at_mapped=True
+    )
+    # Subclass columns append to the shared table; re-declared names map
+    # back onto the existing column.
+    merged: dict[str, Column] = dict(parent_mapper.attr_columns)
+    append_pairs: list[tuple[str, Column]] = []
+    for name, column in attr_columns:
+        existing = next((c for c in table.columns if c.name == column.name), None)
+        if existing is not None:
+            merged[name] = existing
+        else:
+            append_pairs.append((name, column))
+    appended = table._append_columns(  # pyright: ignore[reportPrivateUsage]
+        [column for _name, column in append_pairs]
+    )
+    for (name, _unbound), column in zip(append_pairs, appended, strict=True):
+        merged[name] = column
+    attrs = [
+        *parent_mapper.attrs,
+        *(name for name, _column in attr_columns if name not in parent_mapper.attr_columns),
+    ]
+    mapper = Mapper(cls, table, tuple(attrs), {**parent_mapper.specs, **specs}, merged)
+    mapper.relationship_attrs = tuple(
+        dict.fromkeys([*parent_mapper.relationship_attrs, *rel_attrs])
+    )
+    mapper.relationships = dict(parent_mapper.relationships)
+    mapper.pending_relationships = list(rel_decls)
+    mapper.class_registry = parent_mapper.class_registry
+    mapper.inherits = parent_mapper
+    mapper.base_mapper = parent_mapper.base_mapper
+    mapper.polymorphic_on = parent_mapper.polymorphic_on
+    mapper.polymorphic_on_attr = parent_mapper.polymorphic_on_attr
+    # Every mapper in the hierarchy shares the root's identity map.
+    mapper.polymorphic_map = parent_mapper.base_mapper.polymorphic_map
+    mapper.self_and_descendants = [mapper]
+    ancestor: Mapper[Any] | None = parent_mapper
+    while ancestor is not None:
+        ancestor.self_and_descendants.append(mapper)
+        ancestor = ancestor.inherits
+    cls_any.__mapper__ = mapper
+    registry = parent_mapper.class_registry
+    registry[cls.__name__] = cls
+    registry.setdefault(f"{cls.__module__}.{cls.__qualname__}", cls)
+    _MAPPERS.append(mapper)
+    for name, column in merged.items():
+        if name in parent_mapper.attr_columns:
+            continue
+        object.__setattr__(column, "key", name)
+        setattr(cls, name, column)
+    _configure_inheritance(
+        mapper,
+        cast("dict[object, object]", mapper_args) if isinstance(mapper_args, dict) else {},
+    )
+    configure_mappers()
+
+
+def _map_declarative_class(cls: type[object]) -> None:
+    """Build a ``Table`` and ``Mapper`` for a ``DeclarativeBase`` subclass."""
+    cls_any = cast(Any, cls)
+    tablename = cls.__dict__.get("__tablename__")
+    mapper_args = cls.__dict__.get("__mapper_args__")
+    abstract = bool(cls.__dict__.get("__abstract__", False))
+    parent_mapper = _inheritance_parent(cls, mapper_args)
+    if abstract or tablename is None:
+        if not abstract and parent_mapper is not None:
+            # A subclass without ``__tablename__`` under a mapped parent
+            # joins the parent's single-table-inheritance hierarchy.
+            _map_sti_subclass(cls, parent_mapper, mapper_args)
+            return
+        # Intermediate/abstract base: fresh metadata unless one is inherited.
+        if not isinstance(getattr(cls, "metadata", None), MetaData):
+            cls_any.metadata = MetaData()
+        return
+    if parent_mapper is not None:
+        raise ArgumentError(
+            f"Cannot map class '{cls.__name__}': joined-table inheritance "
+            "(a subclass declaring __tablename__ under a mapped parent) is "
+            "not implemented"
+        )
+    metadata = getattr(cls, "metadata", None)
+    if not isinstance(metadata, MetaData):
+        metadata = MetaData()
+        cls_any.metadata = metadata
+    registry = _registry_for(metadata)
+    attr_columns, specs, rel_attrs, rel_decls = _collect_mapped_members(
+        cls, _type_hints(cls), stop_at_mapped=False
+    )
+    if not attr_columns:
+        raise ArgumentError(f"{cls.__name__} declares __tablename__ but no mapped attributes")
+    table = Table(str(tablename), metadata, *(column for _name, column in attr_columns))
+    cls_any.__table__ = table
+    mapper = Mapper(cls, table, tuple(name for name, _column in attr_columns), specs)
     mapper.relationship_attrs = tuple(rel_attrs)
     mapper.pending_relationships = list(rel_decls)
     mapper.class_registry = registry
@@ -1485,12 +1742,14 @@ def _map_declarative_class(cls: type[object]) -> None:
     registry[cls.__name__] = cls
     registry.setdefault(f"{cls.__module__}.{cls.__qualname__}", cls)
     _MAPPERS.append(mapper)
-    for attr, column in zip(attrs, table.columns, strict=True):
+    for (attr, _unbound), column in zip(attr_columns, table.columns, strict=True):
         # Bind the mapped attribute name onto the class-level Column so its
         # ``__get__`` resolves the correct ``__dict__`` key on instances (a
         # column name can differ from the attribute name).
         object.__setattr__(column, "key", attr)
         setattr(cls, attr, column)
+    if isinstance(mapper_args, dict):
+        _configure_inheritance(mapper, cast("dict[object, object]", mapper_args))
     configure_mappers()
 
 
@@ -2090,6 +2349,25 @@ class Session:
                             obj.__dict__[attr] = values[column.name]
                 else:
                     values[column.name] = obj.__dict__.get(attr)
+            discriminator = mapper.polymorphic_on
+            if discriminator is not None:
+                # Auto-write the mapper's polymorphic identity (SQLAlchemy
+                # stamps the discriminator at INSERT; an explicitly set
+                # value wins, like SA's flush).
+                identity = mapper.polymorphic_identity
+                current = values.get(discriminator.name)
+                if current is None:
+                    values[discriminator.name] = identity
+                    if mapper.polymorphic_on_attr is not None:
+                        obj.__dict__[mapper.polymorphic_on_attr] = identity
+                elif identity is not None and current != identity:
+                    warnings.warn(
+                        f"Flushing object {obj!r} with incompatible "
+                        f"polymorphic identity {current!r}; the row may not "
+                        "load correctly",
+                        SAWarning,
+                        stacklevel=2,
+                    )
             compiled = Insert(mapper.local_table).values(values).compile()
             self._raise_bind_error(compiled)
             ordered = list(compiled._ordered)
@@ -2454,10 +2732,12 @@ class Session:
             )
         )
         statement = Select(
-            tuple(target_mapper.local_table.columns), target_mapper.local_table, predicate
+            tuple(target_mapper.attr_columns.values()), target_mapper.local_table, predicate
         )
         result = self._conn().execute(statement)
-        instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
+        instances = result.native_result.hydrate(
+            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+        )
         return self._uow.reconcile(
             prop.entity,
             cast(str, target_mapper.pk_attr),
@@ -2497,7 +2777,7 @@ class Session:
             )
         )
         statement = Select(
-            tuple(target_mapper.local_table.columns),
+            tuple(target_mapper.attr_columns.values()),
             target_mapper.local_table,
             predicate,
             (),
@@ -2507,7 +2787,9 @@ class Session:
             (("implicit_from", assoc.name),),
         )
         result = self._conn().execute(statement)
-        instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
+        instances = result.native_result.hydrate(
+            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+        )
         return self._uow.reconcile(
             prop.entity,
             cast(str, target_mapper.pk_attr),
@@ -2557,8 +2839,10 @@ class Session:
         joined: list[RelationshipProperty],
     ) -> CursorResult:
         """Single LEFT OUTER JOIN query hydrating parent and related slices."""
-        specs: list[tuple[type[object], list[str]]] = [(entity, list(mapper.attrs))]
-        columns: list[Column | Expression] = list(mapper.local_table.columns)
+        specs: list[
+            tuple[type[object], list[str], tuple[int, dict[object, type[object]]] | None]
+        ] = [(entity, list(mapper.attrs), _hydrate_polymorphic(mapper))]
+        columns: list[Column | Expression] = list(mapper.attr_columns.values())
         joins: list[tuple[object, ...]] = []
         joined_props: list[RelationshipProperty] = []
         for index, prop in enumerate(joined):
@@ -2630,11 +2914,13 @@ class Session:
                         ("binary", left, "=", right),
                     )
                 )
-            for column in target_mapper.local_table.columns:
+            for column in target_mapper.attr_columns.values():
                 columns.append(
                     Expression(("column", alias, column.name, _column_type_tag(column.type)))
                 )
-            specs.append((prop.entity, list(target_mapper.attrs)))
+            specs.append(
+                (prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper))
+            )
             joined_props.append(prop)
         joined_stmt = Select(
             tuple(columns),
@@ -2652,7 +2938,7 @@ class Session:
         # Reconcile every hydrated slice through the identity map so related
         # rows yield the same instance session.get() would return.
         canon: list[dict[int, object]] = []
-        for spec_index, (cls, _attrs) in enumerate(specs):
+        for spec_index, (cls, _attrs, _poly) in enumerate(specs):
             raw_items = [row[spec_index] for row in rows if row[spec_index] is not None]
             cls_mapper = _mapper_of(cls)
             reconciled = self._uow.reconcile(
@@ -2704,7 +2990,7 @@ class Session:
                 return
             target_pk = cast(Column, target_mapper.pk_column)
             statement = Select(
-                (Expression(local_fk.serialize()), *target_mapper.local_table.columns),
+                (Expression(local_fk.serialize()), *target_mapper.attr_columns.values()),
                 assoc,
                 local_fk.in_(list(parents)),
                 (),
@@ -2726,7 +3012,14 @@ class Session:
             # target columns (one FFI crossing for the whole batch).
             pk_attr = cast(str, target_mapper.pk_attr)
             rows = result.native_result.hydrate_entities(
-                [(prop.entity, [pk_attr]), (prop.entity, list(target_mapper.attrs))]
+                [
+                    (prop.entity, [pk_attr], None),
+                    (
+                        prop.entity,
+                        list(target_mapper.attrs),
+                        _hydrate_polymorphic(target_mapper),
+                    ),
+                ]
             )
             owners: list[object] = []
             raw_items: list[object] = []
@@ -2764,14 +3057,16 @@ class Session:
             fk_attr = prop.remote_attr
             # SA selects the foreign key first in the batch query.
             cols = [fk_col] + [
-                column for column in target_mapper.local_table.columns if column is not fk_col
+                column for column in target_mapper.attr_columns.values() if column is not fk_col
             ]
             attrs = [fk_attr] + [attr for attr in target_mapper.attrs if attr != fk_attr]
             statement = Select(tuple(cols), target_mapper.local_table).where(
                 fk_col.in_(list(parents))
             )
             result = self._conn().execute(statement)
-            instances = result.native_result.hydrate(prop.entity, attrs)
+            instances = result.native_result.hydrate(
+                prop.entity, attrs, _hydrate_polymorphic(target_mapper, attrs)
+            )
             instances = self._uow.reconcile(
                 prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
             )
@@ -2795,10 +3090,12 @@ class Session:
                 child.__dict__[prop.key] = None
             return
         statement = Select(
-            tuple(target_mapper.local_table.columns), target_mapper.local_table
+            tuple(target_mapper.attr_columns.values()), target_mapper.local_table
         ).where(prop.remote_col.in_(fks))
         result = self._conn().execute(statement)
-        instances = result.native_result.hydrate(prop.entity, list(target_mapper.attrs))
+        instances = result.native_result.hydrate(
+            prop.entity, list(target_mapper.attrs), _hydrate_polymorphic(target_mapper)
+        )
         instances = self._uow.reconcile(
             prop.entity, cast(str, target_mapper.pk_attr), list(target_mapper.attrs), instances
         )
@@ -2899,26 +3196,68 @@ class Session:
                 f"Class '{entity.__module__}.{entity.__qualname__}' is not mapped"
             )
         mapper = cast("Mapper[Any]", mapper)
-        compiled = select(mapper.local_table).where(mapper.pk_column == ident).compile()
+        # Select only the queried mapper's columns: on a shared STI table a
+        # sibling's columns would otherwise shift positional hydration.
+        statement = Select(tuple(mapper.attr_columns.values()), mapper.local_table).where(
+            mapper.pk_column == ident
+        )
+        criterion = _polymorphic_criterion(entity)
+        if criterion is not None:
+            statement = statement.where(criterion)
+        compiled = statement.compile()
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
         if row is None:
             return None
-        cached = self._uow.identity_get(entity, ident)
+        # The discriminator resolves the concrete class before identity-map
+        # keying (STI: get(Parent, id) can return a subclass instance).
+        resolved = self._polymorphic_class(entity, mapper, row)
+        resolved_mapper = _mapper_of(resolved)
+        cached = self._uow.identity_get(resolved, ident)
         if cached is not None:
             # populate_existing: refresh the mapped instance, keep identity.
-            for attr, value in zip(mapper.attrs, row, strict=True):
+            for attr, value in zip(resolved_mapper.attrs, row, strict=False):
                 object.__setattr__(cached, attr, value)
             self._uow.mark_clean(cached)
-            for key in mapper.relationship_attrs:
+            self._expire_unloaded(cached, resolved_mapper, mapper)
+            for key in resolved_mapper.relationship_attrs:
                 cached.__dict__.pop(key, None)
             return cast(_T, cached)
-        instance = entity.__new__(entity)
-        for attr, value in zip(mapper.attrs, row, strict=True):
+        instance = resolved.__new__(resolved)
+        for attr, value in zip(resolved_mapper.attrs, row, strict=False):
             object.__setattr__(instance, attr, value)
-        self._uow.attach_persistent(instance, entity, list(mapper.attrs), ident)
+        self._uow.attach_persistent(instance, resolved, list(resolved_mapper.attrs), ident)
         instance._catalyst_state = self._uow  # type: ignore[attr-defined]
+        self._expire_unloaded(instance, resolved_mapper, mapper)
         return instance
+
+    @staticmethod
+    def _polymorphic_class(
+        entity: type[_T], mapper: Mapper[Any], row: Sequence[object]
+    ) -> type[_T]:
+        """Resolve a mapper-column row's discriminator to the concrete class."""
+        attr = mapper.polymorphic_on_attr
+        if attr is None or not mapper.polymorphic_map:
+            return entity
+        index = mapper.attrs.index(attr) if attr in mapper.attrs else -1
+        if index < 0 or index >= len(row):
+            return entity
+        return cast("type[_T]", mapper.polymorphic_map.get(row[index], entity))
+
+    def _expire_unloaded(
+        self, instance: object, resolved: Mapper[Any], queried: Mapper[Any]
+    ) -> None:
+        """Mark concrete-subclass attributes the parent SELECT didn't fetch.
+
+        A parent query hydrates a subclass instance with only the parent's
+        columns; the subclass-only attributes load on first access, like
+        SQLAlchemy's deferred subclass-column load.
+        """
+        if resolved is queried:
+            return
+        missing = [attr for attr in resolved.attrs if attr not in instance.__dict__]
+        if missing:
+            self._uow.expire_attrs(instance, missing)
 
     def refresh(self, instance: object) -> None:
         """Reload all mapped attributes of ``instance`` by primary key."""
@@ -2934,7 +3273,11 @@ class Session:
         self._mark_active()
         mapper = _mapper_of(instance)
         pk = uow.pk_of(instance)
-        compiled = select(mapper.local_table).where(mapper.pk_column == pk).compile()
+        compiled = (
+            Select(tuple(mapper.attr_columns.values()), mapper.local_table)
+            .where(mapper.pk_column == pk)
+            .compile()
+        )
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
         if row is None:
@@ -2971,7 +3314,11 @@ class Session:
             return
         if self.autoflush:
             self.flush()
-        compiled = select(mapper.local_table).where(mapper.pk_column == pk).compile()
+        compiled = (
+            Select(tuple(mapper.attr_columns.values()), mapper.local_table)
+            .where(mapper.pk_column == pk)
+            .compile()
+        )
         self._raise_bind_error(compiled)
         row = self._conn().execute(compiled).fetchone()
         self._mark_active()
@@ -3027,6 +3374,11 @@ class Session:
         """
         entity = cast("type[object]", statement.entity)
         mapper = _mapper_of(entity)
+        # STI subclass bulk DML is restricted to the identity subtree
+        # (``type IN (...)``); the base class stays unfiltered.
+        criterion = _polymorphic_criterion(entity)
+        if criterion is not None:
+            statement = statement.where(criterion)
         mode = statement.exec_options.get("synchronize_session", "auto")
         if mode is True:
             mode = "evaluate"
@@ -3080,7 +3432,13 @@ class Session:
     ) -> None:
         """Apply an ORM DML statement to matching in-session instances."""
         col_to_attr = {column.name: attr for attr, column in mapper.attr_columns.items()}
-        for inst in self._uow.persistent_objects(mapper.class_):
+        # Base-class DML affects subclass rows too: walk the identity subtree.
+        candidates = [
+            inst
+            for sub_mapper in mapper.self_and_descendants
+            for inst in self._uow.persistent_objects(sub_mapper.class_)
+        ]
+        for inst in candidates:
             if not matches(inst):
                 continue
             if isinstance(statement, Delete):
