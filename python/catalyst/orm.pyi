@@ -11,7 +11,6 @@ from .engine import (
     Connection,
     CursorResult,
     Engine,
-    SavepointTransaction,
     ScalarResult,
     TextClause,
 )
@@ -56,6 +55,7 @@ class MappedColumn(Mapped[_T]):
     name: str | None
     init: bool
     kw_only: bool
+    repr: bool
     foreign_key: ForeignKey | None
     def __init__(
         self,
@@ -69,6 +69,7 @@ class MappedColumn(Mapped[_T]):
         name: str | None = ...,
         init: bool = ...,
         kw_only: bool = ...,
+        repr: bool = ...,
         foreign_key: ForeignKey | None = ...,
     ) -> None: ...
 
@@ -85,6 +86,7 @@ def mapped_column(
     name: str | None = ...,
     init: bool = ...,
     kw_only: bool = ...,
+    repr: bool = ...,
 ) -> MappedColumn[Any]: ...
 
 class SAWarning(Warning):
@@ -180,6 +182,11 @@ class Relationship(Generic[_T]):
     secondaryjoin: Column | Expression | None
     single_parent: bool
     viewonly: bool
+    init: bool | None
+    repr: bool | None
+    kw_only: bool | None
+    default: object
+    default_factory: Callable[[], object] | None
     def __init__(
         self,
         argument: object = ...,
@@ -194,6 +201,11 @@ class Relationship(Generic[_T]):
         secondaryjoin: Column | Expression | None = ...,
         single_parent: bool = ...,
         viewonly: bool = ...,
+        init: bool | None = ...,
+        repr: bool | None = ...,
+        kw_only: bool | None = ...,
+        default: object = ...,
+        default_factory: Callable[[], object] | None = ...,
     ) -> None: ...
     def __get__(self, instance: object, owner: object = ...) -> object: ...
     def __set__(self, instance: object, value: object) -> None: ...
@@ -215,6 +227,11 @@ def relationship(
     secondaryjoin: Column | Expression | None = ...,
     single_parent: bool = ...,
     viewonly: bool = ...,
+    init: bool | None = ...,
+    repr: bool | None = ...,
+    kw_only: bool | None = ...,
+    default: object = ...,
+    default_factory: Callable[[], object] | None = ...,
     **kw: object,
 ) -> Relationship[Any]: ...
 
@@ -248,6 +265,18 @@ def configure_mappers() -> None: ...
     kw_only_default=True,
     field_specifiers=(MappedColumn, mapped_column, relationship),
 )
+class MappedAsDataclass:
+    """Mixin that applies stdlib dataclass synthesis to a declarative class.
+
+    Must precede the declarative base in the bases list.
+    """
+
+    __dataclass_transform__: ClassVar[dict[str, object]]
+
+@dataclass_transform(
+    kw_only_default=True,
+    field_specifiers=(MappedColumn, mapped_column, relationship),
+)
 class DeclarativeBase:
     metadata: ClassVar[MetaData]
     __table__: ClassVar[Table]
@@ -258,6 +287,30 @@ class DeclarativeBase:
     def __init_subclass__(cls, **kwargs: Any) -> None: ...
 
 def declarative_base() -> type[DeclarativeBase]: ...
+
+class SessionTransaction:
+    """A session-scoped transaction: root, nested savepoint, or flush subtxn.
+
+    ``commit()`` releases a savepoint / COMMITs the root; ``rollback()``
+    runs ``ROLLBACK TO SAVEPOINT`` restoring the unit-of-work snapshot, or
+    full ``ROLLBACK`` at the root. ``close()`` deactivates without SQL.
+    """
+
+    session: Session
+    parent: SessionTransaction | None
+    nested: bool
+    def __init__(
+        self,
+        session: Session,
+        parent: SessionTransaction | None,
+        nested: bool = False,
+        subtxn: bool = False,
+    ) -> None: ...
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> SessionTransaction: ...
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None: ...
 
 class Session:
     autoflush: bool
@@ -279,8 +332,9 @@ class Session:
     def add_all(self, instances: Iterable[object]) -> None: ...
     def delete(self, instance: object) -> None: ...
     def flush(self) -> None: ...
-    def begin(self) -> None: ...
-    def begin_nested(self) -> SavepointTransaction: ...
+    def begin(self, nested: bool = ...) -> SessionTransaction: ...
+    def begin_nested(self) -> SessionTransaction: ...
+    def get_transaction(self) -> SessionTransaction | None: ...
     def in_transaction(self) -> bool: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...

@@ -281,13 +281,16 @@ def test_positional_name_and_kw_only_enforcement() -> None:
     """The first field accepts positional args; ``kw_only`` fields reject
     positional passing (dataclass-generated ``TypeError``)."""
     assert SAUser("a").name == "a"
+    # Positional capacity is name/age/nick/descr (``score`` is keyword-only);
+    # one argument past it must raise. (Verified: SA 2.1.8 accepts four
+    # positional arguments — descr is positional-or-keyword.)
     with pytest.raises(TypeError):
-        SAUser("a", 1, "x", 2.0)  # type: ignore[misc]
+        SAUser("a", 1, "x", "d", 2.0)  # type: ignore[misc]
 
     CUser, _ = _catalyst_models()
     assert CUser("a").name == "a"
     with pytest.raises(TypeError):
-        CUser("a", 1, "x", 2.0)  # type: ignore[misc]
+        CUser("a", 1, "x", "d", 2.0)  # type: ignore[misc]
 
 
 def test_eq_compares_all_fields_and_unhashable() -> None:
@@ -438,7 +441,13 @@ def test_flush_commit_roundtrip_and_loaded_eq() -> None:
             session.add(SAUser(name="ada", age=36, score=9.0))
             session.commit()
             row = session.execute(sa.select(SAUser).where(SAUser.name == "ada")).scalar_one()
-            assert row == SAUser(name="ada", age=36, score=9.0)
+            # ``id`` participates in dataclass ``__eq__`` (compare=True), so
+            # the expected instance needs the flushed primary key.
+            # (Verified: SA 2.1.8 — a bare ``SAUser(...)`` has ``id=None``
+            # and does NOT equal the loaded row.)
+            sa_expected = SAUser(name="ada", age=36, score=9.0)
+            sa_expected.id = row.id
+            assert row == sa_expected
             assert row.id == 1
     finally:
         sa_engine.dispose()
@@ -451,7 +460,9 @@ def test_flush_commit_roundtrip_and_loaded_eq() -> None:
             session.add(CUser(name="ada", age=36, score=9.0))
             session.commit()
             row = session.execute(select(CUser).where(CUser.name == "ada")).scalar_one()
-            assert row == CUser(name="ada", age=36, score=9.0)
+            c_expected = CUser(name="ada", age=36, score=9.0)
+            c_expected.id = row.id
+            assert row == c_expected
             assert row.id == 1
     finally:
         catalyst_engine.dispose()

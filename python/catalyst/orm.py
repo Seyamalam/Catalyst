@@ -13,6 +13,7 @@ declarative class registry once the target exists.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import decimal
 import re
@@ -62,7 +63,6 @@ from .engine import (
     Connection,
     CursorResult,
     Engine,
-    SavepointTransaction,
     ScalarResult,
     _hydrate_polymorphic,  # pyright: ignore[reportPrivateUsage]
     _statement_error,  # pyright: ignore[reportPrivateUsage]
@@ -95,12 +95,24 @@ if TYPE_CHECKING:
 
     from .engine import TextClause
 
+# ``Session`` and ``SessionTransaction`` are friend classes within this
+# module (SQLAlchemy structures them the same way), so in-module private
+# access is intentional rather than a leak.
+# pyright: reportPrivateUsage=false
+
 _T = TypeVar("_T")
 
 # ``NativeUow.status`` values kept in sync with ``src/session.rs``.
 _STATUS_PENDING = 1
 _STATUS_PERSISTENT = 2
 _STATUS_DELETED = 3
+
+# SessionEvents fired when a managed object leaves the session by status.
+_DETACH_EVENTS = {
+    _STATUS_PENDING: "pending_to_transient",
+    _STATUS_PERSISTENT: "persistent_to_detached",
+    _STATUS_DELETED: "deleted_to_detached",
+}
 
 # ``__dict__`` marker stamped on detached objects: ``(pk, dirty, expired)`` —
 # the equivalent of SQLAlchemy's surviving ``InstanceState.key``/``.modified``
@@ -142,12 +154,15 @@ class MappedColumn(Mapped[_T]):
     primary_key: bool = False
     nullable: bool | None = None
     unique: bool = False
-    default: object = None
+    # ``_MISSING`` distinguishes "no default given" (required dataclass field)
+    # from an explicit ``default=None`` (optional field), like SA's NO_ARG.
+    default: object = _MISSING
     default_factory: Callable[[], object] | None = None
     server_default: str | None = None
     name: str | None = None
     init: bool = True
     kw_only: bool = False
+    repr: bool = True
     foreign_key: ForeignKey | None = None
 
 
@@ -158,12 +173,13 @@ def mapped_column(
     primary_key: bool = False,
     nullable: bool | None = None,
     unique: bool = False,
-    default: object = None,
+    default: object = _MISSING,
     default_factory: Callable[[], object] | None = None,
     server_default: str | None = None,
     name: str | None = None,
     init: bool = True,
     kw_only: bool = False,
+    repr: bool = True,
 ) -> MappedColumn[Any]:
     """Describe a declarative column, mirroring ``sqlalchemy.orm.mapped_column``.
 
@@ -200,6 +216,7 @@ def mapped_column(
         name=resolved_name,
         init=init,
         kw_only=kw_only,
+        repr=repr,
         foreign_key=foreign_key,
     )
 
@@ -404,6 +421,11 @@ class Relationship(Generic[_T]):
         "secondaryjoin",
         "single_parent",
         "viewonly",
+        "init",
+        "repr",
+        "kw_only",
+        "default",
+        "default_factory",
     )
 
     def __init__(
@@ -420,6 +442,11 @@ class Relationship(Generic[_T]):
         secondaryjoin: Column | Expression | None = None,
         single_parent: bool = False,
         viewonly: bool = False,
+        init: bool | None = None,
+        repr: bool | None = None,
+        kw_only: bool | None = None,
+        default: object = _MISSING,
+        default_factory: Callable[[], object] | None = None,
     ) -> None:
         self.argument = argument
         self.back_populates = back_populates
@@ -437,6 +464,13 @@ class Relationship(Generic[_T]):
         self.secondaryjoin = secondaryjoin
         self.single_parent = single_parent
         self.viewonly = viewonly
+        # Dataclass-only options (``None``/``_MISSING`` = not given): used by
+        # MappedAsDataclass field synthesis; flagged ArgumentError elsewhere.
+        self.init = init
+        self.repr = repr
+        self.kw_only = kw_only
+        self.default = default
+        self.default_factory = default_factory
 
     def __get__(self, instance: object, owner: object = None) -> object:
         if instance is None:
@@ -497,6 +531,11 @@ def relationship(
     secondaryjoin: Column | Expression | None = None,
     single_parent: bool = False,
     viewonly: bool = False,
+    init: bool | None = None,
+    repr: bool | None = None,
+    kw_only: bool | None = None,
+    default: object = _MISSING,
+    default_factory: Callable[[], object] | None = None,
     **kw: object,
 ) -> Relationship[Any]:
     """Declare a relationship between mapped classes, mirroring SQLAlchemy's.
@@ -509,6 +548,9 @@ def relationship(
     (required for self-referential mappings); ``single_parent`` permits the
     ``delete-orphan`` cascade on a many-to-many; ``viewonly`` loads through
     the association without ever writing rows.
+
+    ``init``/``repr``/``kw_only``/``default``/``default_factory`` are
+    dataclass field options honored only under :class:`MappedAsDataclass`.
     """
     if kw:
         raise ArgumentError(f"relationship() got unexpected keyword argument(s): {sorted(kw)}")
@@ -524,6 +566,11 @@ def relationship(
         secondaryjoin=secondaryjoin,
         single_parent=single_parent,
         viewonly=viewonly,
+        init=init,
+        repr=repr,
+        kw_only=kw_only,
+        default=default,
+        default_factory=default_factory,
     )
 
 
@@ -1074,6 +1121,7 @@ def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> N
     uow = _state_of(obj)
     if uow is not None and not (prop.direction == _MANYTOMANY and prop.viewonly):
         uow.attr_set(obj, prop.key)
+        _autobegin_uow(uow)
     sibling = prop.sibling
     if sibling is not None:
         if old is not None and old is not value:
@@ -1104,6 +1152,7 @@ def _collection_append(owner: object, prop: RelationshipProperty, item: object) 
         uow = _state_of(owner)
         if uow is not None and uow.is_managed(owner):
             uow.attr_set(owner, prop.key)
+            _autobegin_uow(uow)
     sibling = prop.sibling
     if sibling is not None:
         if sibling.uselist:
@@ -1131,6 +1180,7 @@ def _collection_remove(owner: object, prop: RelationshipProperty, item: object) 
         uow = _state_of(owner)
         if uow is not None and uow.is_managed(owner):
             uow.attr_set(owner, prop.key)
+            _autobegin_uow(uow)
     sibling = prop.sibling
     if sibling is not None:
         if sibling.uselist:
@@ -1149,6 +1199,7 @@ def _collection_remove(owner: object, prop: RelationshipProperty, item: object) 
             status = item_uow.status(item)
             if status == _STATUS_PERSISTENT:
                 item_uow.mark_deleted(item)
+                _autobegin_uow(item_uow)
             elif status == _STATUS_PENDING:
                 item_uow.detach(item)
 
@@ -1249,6 +1300,27 @@ def _stitch_loaded(owner: object, prop: RelationshipProperty, item: object) -> N
     kw_only_default=True,
     field_specifiers=(MappedColumn, mapped_column),
 )
+class MappedAsDataclass:
+    """Mixin that applies stdlib dataclass synthesis to a declarative class.
+
+    Must precede the declarative base in the bases list, e.g.
+    ``class User(MappedAsDataclass, Base)``.  A class that inherits the mixin
+    *after* a declarative base can still use ``mapped_column``/``relationship``
+    but may not pass dataclass-only arguments (``init``/``kw_only``/``repr``,
+    relationship ``default``/``default_factory``); doing so raises
+    :class:`ArgumentError`, mirroring SQLAlchemy's "does not specify
+    SQLAlchemy native dataclass configuration" error.
+    """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        cls._catalyst_dc_transforms = True  # type: ignore[attr-defined]
+        super().__init_subclass__(**kwargs)
+
+
+@dataclass_transform(
+    kw_only_default=True,
+    field_specifiers=(MappedColumn, mapped_column),
+)
 class DeclarativeBase:
     """Base class for declarative table mappings.
 
@@ -1262,8 +1334,11 @@ class DeclarativeBase:
     __mapper__: ClassVar[Mapper[Any]]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
+        # Map *before* delegating further down the MRO so that a
+        # ``MappedAsDataclass`` mixin sitting after the declarative base can
+        # never mark the class dataclass-transformed before mapping sees it.
         _map_declarative_class(cls)
+        super().__init_subclass__(**kwargs)
 
     def __init__(self, **kwargs: Any) -> None:
         mapper = type(self).__mapper__
@@ -1272,7 +1347,7 @@ class DeclarativeBase:
                 value = kwargs.pop(attr)
             elif spec is not None and spec.default_factory is not None:
                 value = spec.default_factory()
-            elif spec is not None and spec.default is not None:
+            elif spec is not None and spec.default is not _MISSING:
                 value = spec.default
             else:
                 value = None
@@ -1288,12 +1363,23 @@ class DeclarativeBase:
 
     def __setattr__(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
+        mapper = getattr(type(self), "__mapper__", None)
+        # Polymorphic identity is stamped on first mapped-attribute write so
+        # dataclass constructors (which never touch the discriminator field)
+        # still persist it, matching SQLAlchemy's declarative scan.
+        if (
+            mapper is not None
+            and mapper.polymorphic_on_attr is not None
+            and mapper.polymorphic_identity is not None
+            and name in mapper.attrs
+        ):
+            self.__dict__.setdefault(mapper.polymorphic_on_attr, mapper.polymorphic_identity)
         # Set-on-write dirty tracking: notify the owning unit of work after
         # the value lands (like SQLAlchemy's ``_sa_instance_state`` hook).
         uow = self.__dict__.get("_catalyst_state")
-        mapper = getattr(type(self), "__mapper__", None)
         if uow is not None and mapper is not None and name in mapper.attrs:
             uow.attr_set(self, name)
+            _autobegin_uow(uow)
 
 
 def declarative_base() -> type[DeclarativeBase]:
@@ -1533,6 +1619,48 @@ def _bare_declared_members(
     return triples
 
 
+def _dc_transform_enabled(cls: type[object]) -> bool:
+    """Whether ``MappedAsDataclass`` precedes the declarative base for ``cls``."""
+    return bool(getattr(cls, "_catalyst_dc_transforms", False))
+
+
+def _dc_col_args(spec: MappedColumn[Any]) -> list[str]:
+    """Dataclass-only ``mapped_column`` arguments that were explicitly set."""
+    used: list[str] = []
+    if spec.init is not True:
+        used.append("init")
+    if spec.kw_only:
+        used.append("kw_only")
+    if spec.repr is not True:
+        used.append("repr")
+    return used
+
+
+def _dc_rel_args(decl: Relationship[Any]) -> list[str]:
+    """Dataclass-only ``relationship`` arguments that were explicitly set."""
+    used: list[str] = []
+    if decl.init is not None:
+        used.append("init")
+    if decl.repr is not None:
+        used.append("repr")
+    if decl.kw_only is not None:
+        used.append("kw_only")
+    if decl.default is not _MISSING:
+        used.append("default")
+    if decl.default_factory is not None:
+        used.append("default_factory")
+    return used
+
+
+def _assert_dc_args_allowed(cls: type[object], name: str, used: list[str]) -> None:
+    if used:
+        raise ArgumentError(
+            f"Attribute '{name}' on class {cls} includes dataclasses argument(s): "
+            f"{', '.join(repr(arg) for arg in used)} but class does not specify "
+            "SQLAlchemy native dataclass configuration"
+        )
+
+
 def _collect_mapped_members(
     cls: type[object], hints: dict[str, object], stop_at_mapped: bool
 ) -> tuple[
@@ -1548,6 +1676,7 @@ def _collect_mapped_members(
     and mixins); ``stop_at_mapped`` stops the ancestor walk at a mapped
     base for single-table-inheritance subclasses.
     """
+    dc_enabled = _dc_transform_enabled(cls)
     attr_columns: list[tuple[str, Column]] = []
     specs: dict[str, MappedColumn[Any] | None] = {}
     rel_attrs: list[str] = []
@@ -1561,6 +1690,8 @@ def _collect_mapped_members(
             continue
         if isinstance(spec_value, Relationship):
             decl = cast("Relationship[Any]", spec_value)
+            if not dc_enabled:
+                _assert_dc_args_allowed(cls, name, _dc_rel_args(decl))
             decl.key = name
             decl.declaring_cls = declaring
             decl.container, decl.target_hint = _rel_annotation_for(declaring, hint, raw)
@@ -1588,6 +1719,8 @@ def _collect_mapped_members(
             )
         else:
             optional, inner = None, None
+        if not dc_enabled and spec is not None:
+            _assert_dc_args_allowed(cls, name, _dc_col_args(spec))
         attr_columns.append((name, _column_for_attr(cls, name, spec, inner, optional)))
         specs[name] = spec
     declared_names = {name for name, _column in attr_columns}
@@ -1595,6 +1728,8 @@ def _collect_mapped_members(
         if isinstance(value, MappedColumn):
             if name in declared_names:
                 continue
+            if not dc_enabled:
+                _assert_dc_args_allowed(cls, name, _dc_col_args(cast("MappedColumn[Any]", value)))
             attr_columns.append(
                 (
                     name,
@@ -1605,11 +1740,179 @@ def _collect_mapped_members(
             specs[name] = value
         elif isinstance(value, Relationship) and name not in rel_attrs:
             decl_value = cast("Relationship[Any]", value)
+            if not dc_enabled:
+                _assert_dc_args_allowed(cls, name, _dc_rel_args(decl_value))
             decl_value.key = name
             decl_value.declaring_cls = declaring
             rel_attrs.append(name)
             rel_decls.append(decl_value)
     return attr_columns, specs, rel_attrs, rel_decls
+
+
+def _dc_field_for(spec: MappedColumn[Any] | None) -> dataclasses.Field[Any]:
+    """Synthesize the ``dataclasses.Field`` for a column attribute.
+
+    The generated ``__init__`` assigns through the mapped descriptors, so
+    real defaults land in the instance ``__dict__`` at construction (like
+    SQLAlchemy resolving its ``DONT_SET`` sentinel to the column default).
+    An ``init=False`` column with a plain default uses ``default_factory``
+    so the value materializes per instance instead of as a class attribute
+    — the same shape SQLAlchemy produces.
+    """
+    kwargs: dict[str, object] = {}
+    if spec is not None:
+        kwargs["init"] = spec.init
+        kwargs["repr"] = spec.repr
+        kwargs["kw_only"] = spec.kw_only
+        if spec.default_factory is not None:
+            kwargs["default_factory"] = spec.default_factory
+        elif spec.default is not _MISSING:
+            # ``default_factory`` for every non-None default: the generated
+            # ``__init__`` assigns through the descriptor so the value
+            # materializes per instance (and ``init=False`` fields cannot
+            # carry a plain default without it becoming a class attribute
+            # the descriptor restore would lose anyway).
+            if spec.default is None:
+                kwargs["default"] = None
+            else:
+                default = spec.default
+                kwargs["default_factory"] = lambda: default
+    return dataclasses.field(**kwargs)  # type: ignore[arg-type]
+
+
+def _rel_decl_for(mapper: Mapper[Any], name: str) -> Relationship[Any] | None:
+    """The ``Relationship`` declaration for ``name``, configured or pending."""
+    prop = mapper.relationships.get(name)
+    if prop is not None:
+        return prop.descriptor
+    for decl in mapper.pending_relationships:
+        if decl.key == name:
+            return decl
+    return None
+
+
+def _rel_uselist(mapper: Mapper[Any], attr: str, decl: Relationship[Any] | None) -> bool:
+    """Whether the relationship attribute resolves to a collection."""
+    prop = mapper.relationships.get(attr)
+    if prop is not None:
+        return prop.uselist
+    if decl is not None:
+        if decl.uselist is not None:
+            return decl.uselist
+        return decl.container == "collection"
+    return False
+
+
+def _dc_field_for_rel(mapper: Mapper[Any], attr: str) -> dataclasses.Field[Any]:
+    """Synthesize the ``dataclasses.Field`` for a relationship attribute.
+
+    A collection relationship without ``default``/``default_factory`` is a
+    REQUIRED constructor argument (SQLAlchemy behavior); scalar
+    relationships default to ``None``.  ``init=False`` relationships are
+    excluded from ``__init__`` and resolve lazily through the descriptor.
+    """
+    decl = _rel_decl_for(mapper, attr)
+    uselist = _rel_uselist(mapper, attr, decl)
+    kwargs: dict[str, object] = {}
+    init = True
+    if decl is not None:
+        if decl.init is not None:
+            kwargs["init"] = init = decl.init
+        if decl.repr is not None:
+            kwargs["repr"] = decl.repr
+        if decl.kw_only is not None:
+            kwargs["kw_only"] = decl.kw_only
+        if decl.default_factory is not None:
+            kwargs["default_factory"] = decl.default_factory
+        elif decl.default is not _MISSING:
+            default = decl.default
+            if uselist:
+                # Mutable defaults are rejected by dataclasses; wrap so the
+                # descriptor receives the value (``default=None`` on a
+                # collection becomes an empty list via the descriptor's own
+                # handling of unassigned attributes).
+                if default is None:
+                    kwargs["default_factory"] = list
+                else:
+                    kwargs["default_factory"] = lambda: default
+            else:
+                kwargs["default"] = default
+    if "default" not in kwargs and "default_factory" not in kwargs and init and not uselist:
+        kwargs["default"] = None
+    return dataclasses.field(**kwargs)  # type: ignore[arg-type]
+
+
+def _is_dc_field(
+    attr: str, mapper: Mapper[Any], field: dataclasses.Field[Any], relationship: bool = False
+) -> bool:
+    """Whether an inherited dataclass ``field`` already describes ``attr``."""
+    if relationship:
+        decl = _rel_decl_for(mapper, attr)
+        if decl is None:
+            return True
+        expected_init = decl.init if decl.init is not None else True
+        expected_kw = decl.kw_only if decl.kw_only is not None else False
+        return field.init == expected_init and field.kw_only == expected_kw
+    spec = mapper.specs.get(attr)
+    if spec is None:
+        return True
+    return field.init == spec.init and field.kw_only == spec.kw_only
+
+
+def _apply_dataclass_transform(cls: type[object], mapper: Mapper[Any]) -> None:
+    """Apply stdlib dataclass synthesis to a mapped declarative class.
+
+    Called at the end of declarative mapping for classes where
+    ``MappedAsDataclass`` precedes the declarative base.  Each mapped
+    attribute is temporarily replaced with a synthesized
+    :class:`dataclasses.Field` — which ``dataclasses.dataclass`` consumes as
+    the field specification — and the mapped descriptors are restored once
+    ``__init__``/``__eq__``/``__repr__`` are generated.  Field-ordering
+    ``TypeError`` exceptions surface as :class:`InvalidRequestError` like
+    SQLAlchemy.
+    """
+    inherited: dict[str, dataclasses.Field[Any]] = {}
+    for base in cls.__mro__[1:]:
+        if dataclasses.is_dataclass(base):
+            for base_field in dataclasses.fields(base):
+                if base_field.name not in inherited:
+                    inherited[base_field.name] = base_field
+    originals: dict[str, object] = {}
+    for attr in (*mapper.attrs, *mapper.relationship_attrs):
+        originals[attr] = cls.__dict__.get(attr, _MISSING)
+    # ``Field`` objects may only sit on attrs the class itself annotates —
+    # stdlib raises "field but has no type annotation" otherwise; inherited
+    # fields are picked up from the base's ``__dataclass_fields__`` anyway.
+    declared = {attr for attr, original in originals.items() if original is not _MISSING}
+    for attr in mapper.attrs:
+        if attr not in declared:
+            continue
+        field = inherited.get(attr)
+        if field is None or not _is_dc_field(attr, mapper, field):
+            field = _dc_field_for(mapper.specs.get(attr))
+        setattr(cls, attr, field)
+    for attr in mapper.relationship_attrs:
+        if attr not in declared:
+            continue
+        field = inherited.get(attr)
+        if field is None or not _is_dc_field(attr, mapper, field, relationship=True):
+            field = _dc_field_for_rel(mapper, attr)
+        setattr(cls, attr, field)
+    try:
+        dataclasses.dataclass(cls)
+    except TypeError as exc:
+        raise InvalidRequestError(str(exc)) from exc
+    finally:
+        for attr, original in originals.items():
+            if original is _MISSING:
+                # Inherited attribute: drop the synthesized field so the
+                # parent's mapped descriptor shows through again.
+                try:
+                    delattr(cls, attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(cls, attr, original)
 
 
 def _type_hints(cls: type[object]) -> dict[str, object]:
@@ -1736,6 +2039,8 @@ def _map_sti_subclass(cls: type[object], parent_mapper: Mapper[Any], mapper_args
         mapper,
         cast("dict[object, object]", mapper_args) if isinstance(mapper_args, dict) else {},
     )
+    if _dc_transform_enabled(cls):
+        _apply_dataclass_transform(cls, mapper)
     configure_mappers()
 
 
@@ -1939,6 +2244,8 @@ def _map_jti_subclass(
         mapper,
         cast("dict[object, object]", mapper_args) if isinstance(mapper_args, dict) else {},
     )
+    if _dc_transform_enabled(cls):
+        _apply_dataclass_transform(cls, mapper)
     configure_mappers()
 
 
@@ -1958,6 +2265,8 @@ def _map_declarative_class(cls: type[object]) -> None:
         # Intermediate/abstract base: fresh metadata unless one is inherited.
         if not isinstance(getattr(cls, "metadata", None), MetaData):
             cls_any.metadata = MetaData()
+        if _dc_transform_enabled(cls):
+            dataclasses.dataclass(cls)
         return
     if parent_mapper is not None:
         # A subclass declaring ``__tablename__`` under a mapped parent is
@@ -1994,6 +2303,8 @@ def _map_declarative_class(cls: type[object]) -> None:
         setattr(cls, attr, column)
     if isinstance(mapper_args, dict):
         _configure_inheritance(mapper, cast("dict[object, object]", mapper_args))
+    if _dc_transform_enabled(cls):
+        _apply_dataclass_transform(cls, mapper)
     configure_mappers()
 
 
@@ -2027,7 +2338,7 @@ def _column_for_attr(
         primary_key=spec.primary_key if spec is not None else False,
         nullable=nullable,
         unique=spec.unique if spec is not None else False,
-        default=spec.default if spec is not None else None,
+        default=spec.default if spec is not None and spec.default is not _MISSING else None,
         server_default=spec.server_default if spec is not None else None,
         foreign_key=spec.foreign_key if spec is not None else None,
     )
@@ -2077,6 +2388,19 @@ def _state_of(instance: object) -> NativeUow | None:
     return state if isinstance(state, NativeUow) else None
 
 
+def _autobegin_uow(uow: NativeUow) -> None:
+    """Autobegin the session owning ``uow`` after a dirty/delete registration.
+
+    SQLAlchemy's ``_register_dirty``/``_register_altered`` autobegin on
+    attribute writes, so a post-commit mutation opens a real session
+    transaction — letting ``rollback()`` restore state instead of being a
+    pass-through.  A no-op once a transaction is already begun.
+    """
+    session = uow.session
+    if session is not None:
+        cast("Session", session)._autobegin()
+
+
 def _expire_instance(instance: object) -> None:
     """Drop mapped attributes from ``__dict__`` so the next access reloads."""
     mapper = _mapper_of(instance)
@@ -2115,6 +2439,172 @@ class _StateSet(Set[object]):
         return f"{{{', '.join(repr(item) for item in self._items)}}}"
 
 
+class SessionTransaction:
+    """Session-scoped transaction handle — mirrors ``SessionTransaction``.
+
+    The session's transaction is a stack of these: a *root* (``parent`` is
+    ``None``) begun by :meth:`Session.begin`/autobegin, *nested* savepoint
+    transactions from :meth:`Session.begin_nested`, and internal
+    "subtransaction" markers the flush wraps around each flush batch like
+    SQLAlchemy.  ``commit()`` on a nested transaction issues
+    ``RELEASE SAVEPOINT``; ``rollback()`` issues ``ROLLBACK TO SAVEPOINT``
+    (no RELEASE — SQLite does not require one, matching SQLAlchemy's
+    session savepoint emission).  Savepoint names stay ``catalyst_sp_N``
+    from the Core connection — a documented difference from SQLAlchemy's
+    ``sa_savepoint_N``.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        parent: SessionTransaction | None,
+        nested: bool = False,
+        subtxn: bool = False,
+    ) -> None:
+        self.session = session
+        self.parent = parent
+        self.nested = nested
+        self._subtxn = subtxn
+        self._savepoint_name: str | None = None
+        self._connection_begun = False
+        self._closed = False
+
+    def _in_stack(self) -> bool:
+        trans = self.session._transaction
+        while trans is not None:
+            if trans is self:
+                return True
+            trans = trans.parent
+        return False
+
+    def commit(self, _to_root: bool = False) -> None:
+        """Commit this transaction, releasing savepoints or COMMITting."""
+        session = self.session
+        if self._closed or not self._in_stack():
+            raise InvalidRequestError("This transaction is inactive")
+        if self.parent is None or self.nested:
+            session._dispatch("before_commit", session)
+        # Transactions stacked above this one commit first.
+        while session._transaction is not self:
+            inner = session._transaction
+            assert inner is not None
+            inner.commit()
+        if not session._flushing:
+            for _ in range(100):
+                if not session._uow.has_changes():
+                    break
+                session.flush()
+            else:
+                raise InvalidRequestError(
+                    "This transaction could not be prepared due to "
+                    "session.flush() being called too many times"
+                )
+        deleted: list[tuple[object, object]] = []
+        if self.parent is None or self.nested:
+            if self.nested:
+                session._conn()._native.release_savepoint(cast(str, self._savepoint_name))
+                session._uow.snapshot_commit()
+            else:
+                connection = session._connection
+                if connection is not None:
+                    connection.commit()
+                deleted = session._uow.commit_transition()
+            session._dispatch("after_commit", session)
+            for obj, pk in deleted:
+                session._stamp_detached(obj, (pk, _STATUS_DELETED, [], []))
+                session._dispatch("deleted_to_detached", session, obj)
+            if self.parent is None and session.expire_on_commit:
+                session._expire_managed()
+        self._closed = True
+        if session._transaction is self:
+            session._transaction = self.parent
+        session._dispatch("after_transaction_end", session, self)
+        if _to_root and self.parent is not None:
+            self.parent.commit(_to_root=True)
+
+    def rollback(self, _to_root: bool = False) -> None:
+        """Roll back this transaction (``ROLLBACK TO SAVEPOINT`` if nested).
+
+        Transactions stacked above this one are silently closed out; when
+        this transaction is already inactive the call is a no-op like
+        SQLAlchemy.
+        """
+        session = self.session
+        if self._closed:
+            return
+        while session._transaction is not None and session._transaction is not self:
+            inner = session._transaction
+            inner._closed = True
+            session._transaction = inner.parent
+            session._dispatch("after_transaction_end", session, inner)
+        if not self._in_stack():
+            self._closed = True
+            return
+        session._pending_rollback = False
+        session._dispatch("after_rollback", session)
+        if self.nested:
+            session._conn()._native.rollback_to_savepoint(cast(str, self._savepoint_name))
+            expunged, resurrected, expired = session._uow.snapshot_rollback()
+        else:
+            connection = session._connection
+            if connection is not None:
+                connection.rollback()
+            expired, expunged, resurrected = session._uow.rollback()
+        session._fire_rollback_transitions(expunged, resurrected, expired)
+        self._closed = True
+        if session._transaction is self:
+            session._transaction = self.parent
+        session._dispatch("after_transaction_end", session, self)
+        session._dispatch("after_soft_rollback", session, self)
+        if _to_root and self.parent is not None:
+            self.parent.rollback(_to_root=True)
+
+    def __enter__(self) -> SessionTransaction:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        # Like SQLAlchemy: leaving a ``with session.begin_nested():`` block
+        # deactivates the savepoint — release on clean exit, rollback on
+        # exception — without touching outer transactions.
+        if self.session._transaction is not self:
+            return
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+
+    def close(self) -> None:
+        """Deactivate this transaction — pop the stack, emit no SQL."""
+        session = self.session
+        if self._closed:
+            return
+        while session._transaction is not None and session._transaction is not self:
+            inner = session._transaction
+            inner._closed = True
+            session._transaction = inner.parent
+            session._dispatch("after_transaction_end", session, inner)
+        if not self._in_stack():
+            self._closed = True
+            return
+        self._closed = True
+        session._transaction = self.parent
+        session._dispatch("after_transaction_end", session, self)
+
+
+class _FlushContext:
+    """Opaque ``flush_context`` argument for ``before_flush``/``after_flush``.
+
+    Mirrors SQLAlchemy's internal ``UOWTransaction``: listeners interact with
+    the live ``session.new``/``session.dirty``/``session.deleted``
+    collections, so this carries only the session reference.
+    """
+
+    __slots__ = ("session",)
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+
 class Session:
     """SQLAlchemy-style unit of work over a checked-out connection.
 
@@ -2138,9 +2628,12 @@ class Session:
         self.autoflush = autoflush
         self.expire_on_commit = expire_on_commit
         self._uow = NativeUow(self)
-        self._txn_active = False
+        # The session transaction stack: outermost (root) reachable through
+        # ``.parent`` links; ``None`` when no transaction has begun.
+        self._transaction: SessionTransaction | None = None
         self._pending_rollback = False
         self._flushing = False
+        self._event_listeners: dict[str, list[Callable[..., Any]]] = {}
         # Objects bulk-DML marked deleted: the DELETE already ran, so flush
         # drops their state without re-emitting a per-row DELETE.
         self._synced_deleted: set[int] = set()
@@ -2192,11 +2685,43 @@ class Session:
     def _conn(self) -> Connection:
         """The live connection, re-acquired when the session was closed."""
         self._ensure_connection()
+        self._enlist_connection()
         assert self._connection is not None  # noqa: S101
         return self._connection
 
+    def _autobegin(self) -> SessionTransaction:
+        """Begin the root session transaction if none exists (SA autobegin).
+
+        Pushes the root :class:`SessionTransaction` and the matching native
+        UOW snapshot frame, firing ``after_transaction_create``.
+        """
+        trans = self._transaction
+        if trans is None:
+            trans = SessionTransaction(self, None)
+            self._transaction = trans
+            self._uow.snapshot_begin()
+            self._dispatch("after_transaction_create", self, trans)
+        return trans
+
+    def _enlist_connection(self) -> None:
+        """Fire ``after_begin`` at the first SQL operation of a session txn."""
+        trans = self._transaction
+        if trans is None:
+            return
+        while trans.parent is not None:
+            trans = trans.parent
+        if not trans._connection_begun:
+            trans._connection_begun = True
+            self._dispatch("after_begin", self, trans, self._connection)
+
+    def _dispatch(self, name: str, *args: object) -> None:
+        """Invoke registered ``SessionEvents`` listeners for ``name``."""
+        from .event import _dispatch_for
+
+        _dispatch_for(self, name, *args)
+
     def _mark_active(self) -> None:
-        self._txn_active = True
+        self._autobegin()
 
     @staticmethod
     def _raise_bind_error(compiled: Compiled) -> None:
@@ -2214,6 +2739,7 @@ class Session:
         expunge so ``add`` resumes the same identity rather than inserting.
         """
         self._check_active()
+        self._autobegin()
         mapper = _require_mapper(instance)
         uow = _state_of(instance)
         if uow is not None and uow.is_managed(instance):
@@ -2223,12 +2749,14 @@ class Session:
                 if uow.status(instance) == _STATUS_DELETED:
                     uow.un_delete(instance)
                     self._synced_deleted.discard(id(instance))
+                    self._dispatch("deleted_to_persistent", self, instance)
                 return
             raise InvalidRequestError(
                 f"Object '{instance}' is already attached to session "
                 f"'{id(uow.session) & 0xFF}' (this is '{id(self) & 0xFF}')"
             )
         detached = _detached_marker(instance.__dict__)
+        self._dispatch("before_attach", self, instance)
         if detached is not None:
             pk, dirty, expired = detached
             del instance.__dict__[_DETACHED]
@@ -2239,12 +2767,14 @@ class Session:
                 self._uow.expire_attrs(instance, col_expired)
             for attr in dirty:
                 self._uow.attr_set(instance, attr)
-            self._mark_active()
+            self._dispatch("after_attach", self, instance)
+            self._dispatch("detached_to_persistent", self, instance)
             self._cascade_save_update(instance, {id(instance)})
             return
         self._uow.attach_pending(instance, type(instance), list(mapper.attrs))
         instance._catalyst_state = self._uow  # type: ignore[attr-defined]
-        self._mark_active()
+        self._dispatch("after_attach", self, instance)
+        self._dispatch("transient_to_pending", self, instance)
         self._cascade_save_update(instance, {id(instance)})
 
     def _cascade_save_update(self, instance: object, seen: set[int]) -> None:
@@ -2279,6 +2809,7 @@ class Session:
     def delete(self, instance: object) -> None:
         """Mark a persistent instance for deletion at the next flush."""
         self._check_active()
+        self._autobegin()
         _require_mapper(instance)
         uow = _state_of(instance)
         if uow is None:
@@ -2410,6 +2941,8 @@ class Session:
                     self._expunge_instance(item, seen)
         info = uow.detach(instance)
         if info is not None:
+            _pk, status, _dirty, _expired = info
+            self._dispatch(_DETACH_EVENTS[status], self, instance)
             self._stamp_detached(instance, info)
         self._synced_deleted.discard(id(instance))
 
@@ -2417,6 +2950,7 @@ class Session:
         """Detach every managed object; loaded values stay on the instances."""
         for info in self._uow.detach_all():
             obj, pk, status, dirty, expired = info
+            self._dispatch(_DETACH_EVENTS[status], self, obj)
             self._stamp_detached(obj, (pk, status, dirty, expired))
         self._synced_deleted.clear()
 
@@ -2431,6 +2965,7 @@ class Session:
         through ``"merge"`` relationship cascades recursively.
         """
         self._check_active()
+        self._autobegin()
         _require_mapper(instance)
         # SA: Session.merge calls _autoflush() — honored only when enabled.
         if self.autoflush:
@@ -2491,8 +3026,11 @@ class Session:
                 merged = self.get(cls, pk)
         if merged is None:
             merged = object.__new__(cls)
+            self._dispatch("before_attach", self, merged)
             self._uow.attach_pending(merged, cls, list(mapper.attrs))
             merged._catalyst_state = self._uow  # type: ignore[attr-defined]
+            self._dispatch("after_attach", self, merged)
+            self._dispatch("transient_to_pending", self, merged)
         cache[id(instance)] = merged
         if merged is instance:
             if not load:
@@ -2536,6 +3074,7 @@ class Session:
         merged = object.__new__(cls)
         self._uow.attach_persistent(merged, cls, list(mapper.attrs), pk)
         merged._catalyst_state = self._uow  # type: ignore[attr-defined]
+        self._dispatch("detached_to_persistent", self, merged)
         return merged
 
     def flush(self) -> None:
@@ -2546,23 +3085,48 @@ class Session:
         transaction; returned ``lastrowid`` values become primary keys.
         Relationship references resolve to foreign-key values here (SA's
         "synchronize FKs at flush"), and inserts are dependency-ordered so
-        parent rows exist before dependent children.
+        parent rows exist before dependent children.  The batch runs inside
+        a "subtransaction" marker like SQLAlchemy's flush, so event ordering
+        is ``before_flush`` → ``after_transaction_create`` → ``after_begin``
+        → ``after_flush`` → transitions → ``after_flush_postexec`` →
+        ``after_transaction_end``.
         """
         if self._flushing:
             return
         self._check_active()
-        self._mark_active()
-        uow = self._uow
-        if not uow.has_changes():
+        if not self._uow.has_changes():
             return
+        self._autobegin()
+        flush_context = _FlushContext(self)
+        self._dispatch("before_flush", self, flush_context, None)
         self._flushing = True
+        subtxn = SessionTransaction(self, self._transaction, subtxn=True)
+        self._transaction = subtxn
+        self._dispatch("after_transaction_create", self, subtxn)
         try:
-            self._flush_changes()
+            final, dropped = self._flush_changes()
+            self._dispatch("after_flush", self, flush_context)
+            for obj, _pk in final:
+                self._dispatch("pending_to_persistent", self, obj)
+            for obj in dropped:
+                self._dispatch("persistent_to_deleted", self, obj)
+            self._dispatch("after_flush_postexec", self, flush_context)
+        except Exception:
+            self._transaction = subtxn.parent
+            raise
         finally:
             self._flushing = False
+        subtxn._closed = True
+        self._transaction = subtxn.parent
+        self._dispatch("after_transaction_end", self, subtxn)
 
-    def _flush_changes(self) -> None:
-        """Gather and execute one flush batch; reconcile uow state after."""
+    def _flush_changes(self) -> tuple[list[tuple[object, object]], list[object]]:
+        """Gather and execute one flush batch; reconcile uow state after.
+
+        Returns ``(persisted_pairs, dropped)`` — newly persistent objects
+        with their primary keys plus objects whose DELETE flushed — so
+        ``flush()`` can dispatch the state-transition events.
+        """
         uow = self._uow
         ops: list[tuple[str, list[object], list[str | None], bool]] = []
         # ``persisted`` carries the op index whose rowid supplies each new
@@ -2875,6 +3439,7 @@ class Session:
                     pk for pk in (_pk_value(uow, member) for member in members) if pk is not None
                 ),
             )
+        return final, dropped
 
     def _dependency_order(self, objects: list[object]) -> list[object]:
         """Order objects so many-to-one FK dependencies come first.
@@ -3028,6 +3593,11 @@ class Session:
             list(target_mapper.attrs),
             instances,
         )
+        for instance, raw in zip(items, instances, strict=True):
+            if instance is raw:
+                # Newly registered in the identity map — identity-map hits
+                # return the existing object and fire nothing.
+                self._dispatch("loaded_as_persistent", self, instance)
         for instance in items:
             inst_mapper = getattr(type(instance), "__mapper__", None)
             if inst_mapper is None:
@@ -3469,38 +4039,59 @@ class Session:
 
     # -- transactions ------------------------------------------------------
 
-    def begin(self) -> None:
-        """Begin an explicit transaction on this session."""
-        self._check_active()
-        if self._txn_active:
-            raise InvalidRequestError("A transaction is already begun on this Session.")
-        self._txn_active = True
+    def begin(self, nested: bool = False) -> SessionTransaction:
+        """Begin an explicit transaction on this session.
 
-    def begin_nested(self) -> SavepointTransaction:
-        """Create a SAVEPOINT within the session's transaction."""
+        ``nested=True`` delegates to :meth:`begin_nested`, like SQLAlchemy.
+        The returned :class:`SessionTransaction` is the session's current
+        transaction — ``commit``/``rollback`` on it behave like the session
+        methods.
+        """
         self._check_active()
-        self._mark_active()
-        return self._conn().begin_nested()
+        if nested:
+            return self.begin_nested()
+        if self._transaction is not None:
+            raise InvalidRequestError("A transaction is already begun on this Session.")
+        return self._autobegin()
+
+    def begin_nested(self) -> SessionTransaction:
+        """Create a session-scoped SAVEPOINT transaction.
+
+        Autobegins the outer transaction when needed, flushes pending work
+        first (like SQLAlchemy's ``SessionTransaction(nested=True)``), then
+        pushes a :class:`SessionTransaction` with ``nested is True`` on top
+        of a Core ``SAVEPOINT``.  ``commit()`` releases it; ``rollback()``
+        restores the unit-of-work snapshot taken here.
+        """
+        self._check_active()
+        self._autobegin()
+        self.flush()
+        name = self._conn()._native.begin_savepoint()
+        self._uow.snapshot_begin()
+        trans = SessionTransaction(self, self._transaction, nested=True)
+        trans._savepoint_name = name
+        self._transaction = trans
+        self._dispatch("after_transaction_create", self, trans)
+        return trans
+
+    def get_transaction(self) -> SessionTransaction | None:
+        """The current session transaction, or ``None``."""
+        return self._transaction
 
     def in_transaction(self) -> bool:
         """Whether the session currently has an open transaction."""
-        return self._txn_active
+        return self._transaction is not None
 
     def commit(self) -> None:
         """Flush pending work then COMMIT the session's transaction."""
         self._check_active()
+        trans = self._autobegin()
         try:
-            self.flush()
-            connection = self._connection
-            if connection is not None:
-                connection.commit()
+            trans.commit(_to_root=True)
         except Exception:
             self._pending_rollback = True
             raise
-        self._txn_active = False
-        self._uow.commit_transition()
-        if self.expire_on_commit:
-            self._expire_managed()
+        self._synced_deleted.clear()
 
     def _expire_managed(self) -> None:
         for obj in self._uow.expire_all():
@@ -3509,12 +4100,32 @@ class Session:
     def rollback(self) -> None:
         """Roll back the open transaction and reset unit-of-work state."""
         self._pending_rollback = False
-        if self._connection is not None:
-            self._connection.rollback()
-        for obj in self._uow.rollback():
-            _expire_instance(obj)
+        trans = self._transaction
+        if trans is None:
+            connection = self._connection
+            if connection is not None:
+                connection.rollback()
+            return
+        trans.rollback(_to_root=True)
         self._synced_deleted.clear()
-        self._txn_active = False
+
+    def _fire_rollback_transitions(
+        self,
+        expunged: list[tuple[object, int]],
+        resurrected: list[object],
+        expired: list[object],
+    ) -> None:
+        """Dispatch state events + expiry for a categorized UOW rollback."""
+        for obj, status in expunged:
+            obj.__dict__.pop("_catalyst_state", None)
+            name = (
+                "pending_to_transient" if status == _STATUS_PENDING else "persistent_to_transient"
+            )
+            self._dispatch(name, self, obj)
+        for obj in resurrected:
+            self._dispatch("deleted_to_persistent", self, obj)
+        for obj in expired:
+            _expire_instance(obj)
 
     def expire(self, instance: object) -> None:
         """Expire all mapped attributes of ``instance``."""
@@ -3587,6 +4198,7 @@ class Session:
         self._uow.attach_persistent(instance, resolved, list(resolved_mapper.attrs), ident)
         instance._catalyst_state = self._uow  # type: ignore[attr-defined]
         self._expire_unloaded(instance, resolved_mapper, mapper)
+        self._dispatch("loaded_as_persistent", self, instance)
         return instance
 
     @staticmethod
@@ -3686,8 +4298,8 @@ class Session:
             Select((), mapper.select_from, entity=mapper.class_).where(pk_column == pk).compile()
         )
         self._raise_bind_error(compiled)
-        row = self._conn().execute(compiled).fetchone()
         self._mark_active()
+        row = self._conn().execute(compiled).fetchone()
         if row is None:
             raise ObjectDeletedError(self._deleted_message(instance))
         for expired in uow.expired_attrs_of(instance):
@@ -3733,8 +4345,8 @@ class Session:
             level.table,
             predicate,
         )
-        row = self._conn().execute(statement).fetchone()
         self._mark_active()
+        row = self._conn().execute(statement).fetchone()
         if row is None:
             # Orphaned parent row (e.g. after a bulk parent delete): SA's
             # deferred loader reports the missing child row as a KeyError.
@@ -4054,9 +4666,14 @@ class Session:
                 self._connection = None
         for info in self._uow.detach_all():
             obj, pk, status, dirty, expired = info
+            self._dispatch(_DETACH_EVENTS[status], self, obj)
             self._stamp_detached(obj, (pk, status, dirty, expired))
         self._synced_deleted.clear()
-        self._txn_active = False
+        trans = self._transaction
+        self._transaction = None
+        if trans is not None:
+            trans._closed = True
+            self._dispatch("after_transaction_end", self, trans)
 
     def __enter__(self) -> Session:
         return self
@@ -4204,7 +4821,7 @@ def _client_default(mapper: Mapper[Any], attr: str) -> object:
     if isinstance(spec, MappedColumn):
         if spec.default_factory is not None:
             return spec.default_factory()
-        if spec.default is not None:
+        if spec.default is not _MISSING:
             return spec.default
     default = mapper.attr_columns[attr].default
     if default is None:

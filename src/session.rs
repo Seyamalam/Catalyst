@@ -44,6 +44,26 @@ struct ObjectState {
     expired_attrs: HashSet<String>,
 }
 
+/// Session-transaction snapshot frame (SQLAlchemy `SessionTransaction._new`/
+/// `_dirty`/`_deleted` equivalents). One frame per boundary transaction —
+/// the session root transaction and every savepoint — pushed at creation
+/// and merged upward on `RELEASE` or restored on `ROLLBACK TO`.
+struct UowSnapshot {
+    /// Objects attached pending (or flushed persistent) inside the span —
+    /// `ROLLBACK TO` expunges them to transient rather than expiring.
+    new_ids: HashSet<usize>,
+    /// Persistent objects mutated inside the span — `ROLLBACK TO` expires
+    /// them so the next access reloads pre-savepoint values.
+    dirty_ids: HashSet<usize>,
+    /// Objects marked deleted inside the span (`id` -> instance) — restored
+    /// to persistent on rollback, and reported on commit so Python can fire
+    /// `deleted_to_detached`.
+    deleted: HashMap<usize, Py<PyAny>>,
+    /// States dropped by a flushed delete inside the span, kept so a
+    /// savepoint rollback can resurrect the object (status + identity).
+    dropped: HashMap<usize, ObjectState>,
+}
+
 /// The unit-of-work registry backing one Python `Session`.
 #[pyclass(module = "catalyst._catalyst")]
 pub(crate) struct NativeUow {
@@ -56,6 +76,8 @@ pub(crate) struct NativeUow {
     /// `(pk, instance)` pairs compared with `==`.
     identity: HashMap<IdentityKey, Vec<IdentityEntry>>,
     next_seq: usize,
+    /// Savepoint/session-transaction snapshot stack, innermost last.
+    snapshots: Vec<UowSnapshot>,
 }
 
 fn object_id(obj: &Bound<'_, PyAny>) -> usize {
@@ -76,6 +98,7 @@ impl NativeUow {
             states: HashMap::new(),
             identity: HashMap::new(),
             next_seq: 0,
+            snapshots: Vec::new(),
         })
     }
 
@@ -92,8 +115,9 @@ impl NativeUow {
         attrs: Vec<String>,
     ) {
         self.next_seq += 1;
+        let id = object_id(obj);
         self.states.insert(
-            object_id(obj),
+            id,
             ObjectState {
                 obj: obj.clone().unbind(),
                 class_ptr: cls.as_ptr() as usize,
@@ -106,6 +130,9 @@ impl NativeUow {
                 expired_attrs: HashSet::new(),
             },
         );
+        if let Some(frame) = self.snapshots.last_mut() {
+            frame.new_ids.insert(id);
+        }
     }
 
     /// Register a freshly loaded (persistent) instance and its identity entry.
@@ -155,9 +182,13 @@ impl NativeUow {
     /// the dirty set (even when the value reverts); any recorded expiry for
     /// that attribute is cleared because the write re-loads it.
     fn attr_set(&mut self, obj: &Bound<'_, PyAny>, name: &str) {
-        if let Some(state) = self.states.get_mut(&object_id(obj)) {
+        let id = object_id(obj);
+        if let Some(state) = self.states.get_mut(&id) {
             if state.status == PERSISTENT {
                 state.dirty_attrs.insert(name.to_owned());
+                if let Some(frame) = self.snapshots.last_mut() {
+                    frame.dirty_ids.insert(id);
+                }
             }
             state.expired_attrs.remove(name);
         }
@@ -301,51 +332,268 @@ impl NativeUow {
 
     /// Mark a persistent instance for deletion.
     fn mark_deleted(&mut self, obj: &Bound<'_, PyAny>) {
-        if let Some(state) = self.states.get_mut(&object_id(obj)) {
+        let id = object_id(obj);
+        if let Some(state) = self.states.get_mut(&id) {
             state.status = DELETED;
             state.dirty_attrs.clear();
+            if let Some(frame) = self.snapshots.last_mut() {
+                frame.deleted.insert(id, obj.clone().unbind());
+            }
         }
     }
 
     /// Re-`add` of an object marked deleted cancels the pending delete.
     fn un_delete(&mut self, obj: &Bound<'_, PyAny>) {
-        if let Some(state) = self.states.get_mut(&object_id(obj))
+        let id = object_id(obj);
+        if let Some(state) = self.states.get_mut(&id)
             && state.status == DELETED
         {
             state.status = PERSISTENT;
+            for frame in self.snapshots.iter_mut() {
+                frame.deleted.remove(&id);
+            }
         }
     }
 
     /// Successful commit: flushed inserts are no longer new-in-transaction.
-    fn commit_transition(&mut self) {
+    /// Committed deletes leave the registry (SQLAlchemy detaches them after
+    /// `after_commit`); returns `(obj, pk)` pairs so Python can stamp the
+    /// detached marker and fire `deleted_to_detached` for each.
+    #[allow(clippy::type_complexity)]
+    fn commit_transition(
+        &mut self,
+        py: Python<'_>,
+    ) -> PyResult<Vec<(Py<PyAny>, Option<Py<PyAny>>)>> {
         for state in self.states.values_mut() {
             state.new_in_txn = false;
         }
+        let mut deleted: HashMap<usize, (Py<PyAny>, Option<Py<PyAny>>)> = HashMap::new();
+        let frames: Vec<UowSnapshot> = self.snapshots.drain(..).collect();
+        for frame in frames {
+            for (id, obj) in frame.deleted {
+                if let Some(state) = self.states.remove(&id) {
+                    self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                    deleted.entry(id).or_insert((obj, state.pk));
+                }
+            }
+            for (id, state) in frame.dropped {
+                deleted.entry(id).or_insert((state.obj, state.pk));
+            }
+        }
+        Ok(deleted.into_values().collect())
     }
 
     /// Rollback semantics: objects inserted this transaction are detached
     /// entirely (keeping their Python-side attribute values like SQLAlchemy);
-    /// everything else is expired so the next access reloads committed state.
-    /// Returns the expired objects for `__dict__` clearing.
-    fn rollback(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        let mut detached = Vec::new();
+    /// flushed deletes are resurrected; everything else is expired so the
+    /// next access reloads committed state.
+    /// Returns `(expired, expunged, resurrected)` — expunged pairs each
+    /// object with its pre-detach status so Python can fire the correct
+    /// `pending_to_transient`/`persistent_to_transient` event, and
+    /// resurrected objects fire `deleted_to_persistent`.
+    #[allow(clippy::type_complexity)]
+    fn rollback(
+        &mut self,
+        py: Python<'_>,
+    ) -> PyResult<(Vec<Py<PyAny>>, Vec<(Py<PyAny>, u8)>, Vec<Py<PyAny>>)> {
+        // Savepoint-dropped states (flushed deletes) live in the frames;
+        // resurrecting them undoes the delete like SQLAlchemy.
+        let mut dropped: HashMap<usize, ObjectState> = HashMap::new();
+        let frames: Vec<UowSnapshot> = self.snapshots.drain(..).collect();
+        for frame in frames {
+            for (id, state) in frame.dropped {
+                dropped.entry(id).or_insert(state);
+            }
+        }
+        let mut detached: Vec<(usize, usize)> = Vec::new();
         let mut expired = Vec::new();
+        let mut resurrected = Vec::new();
         for (id, state) in self.states.iter_mut() {
             if state.status == PENDING || state.new_in_txn {
-                detached.push(*id);
+                detached.push((state.seq, *id));
             } else {
+                if state.status == DELETED {
+                    resurrected.push(state.obj.clone_ref(py));
+                }
                 state.expired_attrs = state.attrs.iter().cloned().collect();
                 state.dirty_attrs.clear();
                 state.status = PERSISTENT;
                 expired.push(state.obj.clone_ref(py));
             }
         }
-        for id in detached {
+        detached.sort_unstable();
+        let mut expunged = Vec::with_capacity(detached.len());
+        for (_, id) in detached {
             if let Some(state) = self.states.remove(&id) {
                 self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                expunged.push((state.obj.clone_ref(py), state.status));
             }
         }
-        Ok(expired)
+        let mut resurrect_dropped: Vec<(usize, usize)> =
+            dropped.iter().map(|(id, state)| (state.seq, *id)).collect();
+        resurrect_dropped.sort_unstable();
+        for (_, id) in resurrect_dropped {
+            let Some(mut state) = dropped.remove(&id) else {
+                continue;
+            };
+            state.status = PERSISTENT;
+            state.dirty_attrs.clear();
+            if let Some(pk) = state.pk.as_ref() {
+                let key = (state.class_ptr, pk.bind(py).hash()?);
+                self.identity
+                    .entry(key)
+                    .or_default()
+                    .push((pk.clone_ref(py), state.obj.clone_ref(py)));
+            }
+            resurrected.push(state.obj.clone_ref(py));
+            expired.push(state.obj.clone_ref(py));
+            self.states.insert(id, state);
+        }
+        Ok((expired, expunged, resurrected))
+    }
+
+    /// Push a session-transaction snapshot frame (`Session.begin`,
+    /// `begin_nested`, autobegin). Recording is piggy-backed onto the
+    /// existing bookkeeping seams: `attach_pending`/`flush_transition`
+    /// fill `new_ids`, `attr_set` fills `dirty_ids`, `mark_deleted` fills
+    /// `deleted`, and flushed deletes preserve their state in `dropped`.
+    fn snapshot_begin(&mut self) {
+        self.snapshots.push(UowSnapshot {
+            new_ids: HashSet::new(),
+            dirty_ids: HashSet::new(),
+            deleted: HashMap::new(),
+            dropped: HashMap::new(),
+        });
+    }
+
+    /// `RELEASE SAVEPOINT`: fold the top frame into its parent so an outer
+    /// rollback still sees the inner span's mutations. Returns the deleted
+    /// objects only when the root frame was popped (transaction commit) so
+    /// Python can fire `deleted_to_detached`.
+    fn snapshot_commit(&mut self) -> Vec<Py<PyAny>> {
+        let Some(frame) = self.snapshots.pop() else {
+            return Vec::new();
+        };
+        if let Some(parent) = self.snapshots.last_mut() {
+            parent.new_ids.extend(frame.new_ids);
+            parent.dirty_ids.extend(frame.dirty_ids);
+            parent.deleted.extend(frame.deleted);
+            parent.dropped.extend(frame.dropped);
+            Vec::new()
+        } else {
+            frame.deleted.into_values().collect()
+        }
+    }
+
+    /// `ROLLBACK TO SAVEPOINT`: restore the top frame. Objects attached or
+    /// flushed inside the span are expunged to transient; flushed deletes
+    /// and marked deletes are resurrected to persistent; persistent objects
+    /// mutated inside the span are expired (reload restores pre-savepoint
+    /// values). Returns `(expunged, resurrected, expired)`; expunged pairs
+    /// each object with its pre-detach status for event dispatch.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_rollback(
+        &mut self,
+        py: Python<'_>,
+    ) -> PyResult<(Vec<(Py<PyAny>, u8)>, Vec<Py<PyAny>>, Vec<Py<PyAny>>)> {
+        let Some(mut frame) = self.snapshots.pop() else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        // `trans._new ∪ session._new`: attached/flushed inside the span, or
+        // still pending now.
+        let mut to_expunge = std::mem::take(&mut frame.new_ids);
+        for (id, state) in self.states.iter() {
+            if state.status == PENDING {
+                to_expunge.insert(*id);
+            }
+        }
+        let mut ordered: Vec<(usize, usize)> = to_expunge
+            .iter()
+            .map(|id| {
+                (
+                    self.states
+                        .get(id)
+                        .map(|state| state.seq)
+                        .unwrap_or(usize::MAX),
+                    *id,
+                )
+            })
+            .collect();
+        ordered.sort_unstable();
+        let mut expunged = Vec::new();
+        for (_, id) in ordered {
+            if let Some(state) = self.states.remove(&id) {
+                self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                expunged.push((state.obj.clone_ref(py), state.status));
+            }
+        }
+        // `trans._deleted ∪ session._deleted`: marked deletes revert in
+        // place; flushed deletes resurrect from the captured state.
+        let mut resurrect: Vec<(usize, usize)> = Vec::new();
+        for id in frame.deleted.keys() {
+            if let Some(state) = self.states.get(id)
+                && state.status == DELETED
+            {
+                resurrect.push((state.seq, *id));
+            }
+        }
+        for (id, state) in self.states.iter() {
+            if state.status == DELETED {
+                resurrect.push((state.seq, *id));
+            }
+        }
+        for (id, state) in frame.dropped.iter() {
+            resurrect.push((state.seq, *id));
+        }
+        resurrect.sort_unstable();
+        resurrect.dedup_by_key(|(_, id)| *id);
+        let mut resurrected = Vec::new();
+        for (_, id) in resurrect {
+            if let Some(state) = self.states.get_mut(&id) {
+                if state.status == DELETED {
+                    state.status = PERSISTENT;
+                    state.dirty_attrs.clear();
+                    resurrected.push(state.obj.clone_ref(py));
+                }
+            } else if let Some(mut state) = frame.dropped.remove(&id) {
+                state.status = PERSISTENT;
+                state.dirty_attrs.clear();
+                if let Some(pk) = state.pk.as_ref() {
+                    let key = (state.class_ptr, pk.bind(py).hash()?);
+                    self.identity
+                        .entry(key)
+                        .or_default()
+                        .push((pk.clone_ref(py), state.obj.clone_ref(py)));
+                }
+                resurrected.push(state.obj.clone_ref(py));
+                self.states.insert(id, state);
+            }
+        }
+        let mut ordered_dirty: Vec<(usize, usize)> = frame
+            .dirty_ids
+            .iter()
+            .map(|id| {
+                (
+                    self.states
+                        .get(id)
+                        .map(|state| state.seq)
+                        .unwrap_or(usize::MAX),
+                    *id,
+                )
+            })
+            .collect();
+        ordered_dirty.sort_unstable();
+        let mut expired = Vec::new();
+        for (_, id) in ordered_dirty {
+            if let Some(state) = self.states.get_mut(&id)
+                && state.status == PERSISTENT
+            {
+                state.expired_attrs = state.attrs.iter().cloned().collect();
+                state.dirty_attrs.clear();
+                expired.push(state.obj.clone_ref(py));
+            }
+        }
+        Ok((expunged, resurrected, expired))
     }
 
     /// Set the expired set to exactly `names` (used when re-attaching a
@@ -366,9 +614,16 @@ impl NativeUow {
         obj: &Bound<'_, PyAny>,
         py: Python<'_>,
     ) -> PyResult<Option<(Option<Py<PyAny>>, u8, Vec<String>, Vec<String>)>> {
-        match self.states.remove(&object_id(obj)) {
+        let id = object_id(obj);
+        match self.states.remove(&id) {
             Some(state) => {
                 self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                // An expunged marked-delete leaves the snapshot deleted set
+                // (SQLAlchemy pops it from `session._deleted`/`trans._deleted`
+                // too, so the commit event never sees it).
+                for frame in self.snapshots.iter_mut() {
+                    frame.deleted.remove(&id);
+                }
                 let dirty = state.dirty_attrs.iter().cloned().collect();
                 let expired = state.expired_attrs.iter().cloned().collect();
                 Ok(Some((state.pk, state.status, dirty, expired)))
@@ -388,6 +643,7 @@ impl NativeUow {
             .map(|(_, state)| state)
             .collect::<Vec<_>>();
         self.identity.clear();
+        self.snapshots.clear();
         states
             .into_iter()
             .map(|state| {
@@ -415,6 +671,7 @@ impl NativeUow {
     fn clear(&mut self) {
         self.states.clear();
         self.identity.clear();
+        self.snapshots.clear();
     }
 
     /// Apply post-flush transitions in one call: `(obj, pk)` pending inserts
@@ -428,12 +685,16 @@ impl NativeUow {
         py: Python<'_>,
     ) -> PyResult<()> {
         for (obj, pk) in &persisted {
-            let Some(state) = self.states.get_mut(&object_id(obj)) else {
+            let id = object_id(obj);
+            let Some(state) = self.states.get_mut(&id) else {
                 continue;
             };
             state.status = PERSISTENT;
             state.dirty_attrs.clear();
             state.expired_attrs.clear();
+            if let Some(frame) = self.snapshots.last_mut() {
+                frame.new_ids.insert(id);
+            }
             if pk.is_none() {
                 state.pk = None;
                 continue;
@@ -454,8 +715,12 @@ impl NativeUow {
             }
         }
         for obj in &dropped {
-            if let Some(state) = self.states.remove(&object_id(obj)) {
+            let id = object_id(obj);
+            if let Some(state) = self.states.remove(&id) {
                 self.identity_remove(py, state.class_ptr, state.pk.as_ref())?;
+                if let Some(frame) = self.snapshots.last_mut() {
+                    frame.dropped.insert(id, state);
+                }
             }
         }
         Ok(())

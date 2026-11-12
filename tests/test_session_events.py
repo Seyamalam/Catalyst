@@ -298,29 +298,44 @@ def test_firing_matrix_flush_only() -> None:
 def test_firing_matrix_rollback() -> None:
     """``session.rollback()`` on an active transaction fires
     ``after_rollback``, ``after_transaction_end``, then
-    ``after_soft_rollback`` — with pending-only AND flushed state alike.
+    ``after_soft_rollback`` — plus the state-transition event for every
+    object the rollback detaches: ``pending_to_transient`` for pending
+    work (``session._new`` holds it strongly) and ``persistent_to_transient``
+    for a flushed object still referenced; an UNREFERENCED flushed object is
+    collected from the weak identity map and detaches silently.
     A rollback on a session with NO transaction fires nothing."""
-    expected = ["after_rollback", "after_transaction_end", "after_soft_rollback"]
+    expected_pending = [
+        "after_rollback",
+        "pending_to_transient",
+        "after_transaction_end",
+        "after_soft_rollback",
+    ]
+    expected_flushed = ["after_rollback", "after_transaction_end", "after_soft_rollback"]
     sink: list[str] = []
     fns = _attach_sa(SASession, sink, ALL_SESSION_EVENTS)
     sa_engine = sa_create_engine("sqlite://")
     try:
         SABase.metadata.create_all(sa_engine)
         with SASession(sa_engine) as session:
-            session.add(SARow(name="c"))
+            pending = SARow(name="c")
+            session.add(pending)
             sink.clear()
             session.rollback()
-            assert sink == expected
+            # Verified SA 2.1.8: the pending object's detach event fires.
+            assert sink == expected_pending
 
             session.add(SARow(name="d"))
             session.flush()
             sink.clear()
             session.rollback()
-            assert sink == expected
+            # Unreferenced flushed object: collected from the weak identity
+            # map, so no persistent_to_transient fires.
+            assert sink == expected_flushed
 
             # fresh session, no transaction: rollback is silent
             s2 = SASession(sa_engine)
             try:
+                sink.clear()
                 s2.rollback()
                 assert sink == []
             finally:
@@ -487,7 +502,9 @@ def test_before_flush_sees_and_may_mutate_state_collections() -> None:
         SABase.metadata.create_all(sa_engine)
         with SASession(sa_engine) as session:
             session.add(SARow(name="f"))
-            session.flush()
+            # commit(), not flush(): the session closes at block exit and a
+            # still-open transaction would roll the insert back.
+            session.commit()
         assert seen["new"] == ["f"]
         assert seen["dirty"] == [] and seen["deleted"] == []
         assert seen["instances_is_new"] is False

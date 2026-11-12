@@ -285,7 +285,13 @@ impl NativeConnection {
         })
     }
 
-    fn finish_savepoint(&self, name: &str, rollback: bool, py: Python<'_>) -> PyResult<()> {
+    fn finish_savepoint(
+        &self,
+        name: &str,
+        rollback: bool,
+        release: bool,
+        py: Python<'_>,
+    ) -> PyResult<()> {
         validate_savepoint_name(name)?;
         let name = name.to_owned();
         self.with_transaction(py, move |connection, state| {
@@ -295,11 +301,17 @@ impl NativeConnection {
                 .position(|candidate| candidate == &name)
                 .ok_or_else(|| InvalidRequestError::new_err("Savepoint is no longer active"))?;
             if rollback {
-                connection
-                    .execute_batch(&format!(
-                        "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
-                    ))
-                    .map_err(map_sqlite_error)?;
+                // SQLAlchemy emits only `ROLLBACK TO` on savepoint rollback;
+                // SQLite releases savepoints nested inside implicitly. The
+                // `release` flag keeps the connection-level API's historical
+                // `ROLLBACK TO; RELEASE` shape while session savepoints
+                // mirror the SQLAlchemy statement list.
+                let sql = if release {
+                    format!("ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}")
+                } else {
+                    format!("ROLLBACK TO SAVEPOINT {name}")
+                };
+                connection.execute_batch(&sql).map_err(map_sqlite_error)?;
             } else {
                 connection
                     .execute_batch(&format!("RELEASE SAVEPOINT {name}"))
@@ -871,12 +883,18 @@ impl NativeConnection {
 
     /// Release a savepoint and any nested savepoints beneath it.
     fn release_savepoint(&self, name: &str, py: Python<'_>) -> PyResult<()> {
-        self.finish_savepoint(name, false, py)
+        self.finish_savepoint(name, false, false, py)
     }
 
     /// Roll back to and release a savepoint.
     fn rollback_savepoint(&self, name: &str, py: Python<'_>) -> PyResult<()> {
-        self.finish_savepoint(name, true, py)
+        self.finish_savepoint(name, true, true, py)
+    }
+
+    /// Roll back to a savepoint without a following `RELEASE`, matching
+    /// SQLAlchemy's `SessionTransaction.rollback()` statement shape.
+    fn rollback_to_savepoint(&self, name: &str, py: Python<'_>) -> PyResult<()> {
+        self.finish_savepoint(name, true, false, py)
     }
 
     /// Whether this holder has an open transaction (explicit or autobegin).

@@ -171,7 +171,19 @@ class CursorResult:
             )
             pk_attr = getattr(mapper, "pk_attr", None)
             if uow is not None and pk_attr is not None:
+                raw_instances = instances
                 instances = uow.reconcile(entity, pk_attr, list(mapper.attrs), instances)
+                session = uow.session
+                if session is not None:
+                    dispatch = getattr(session, "_dispatch", None)
+                    if dispatch is not None:
+                        # ``loaded_as_persistent`` fires only for instances the
+                        # identity map just registered — a hit returns the
+                        # previously-mapped object (``is not raw``) and stays
+                        # silent, matching SQLAlchemy.
+                        for instance, raw in zip(instances, raw_instances, strict=True):
+                            if instance is raw:
+                                dispatch("loaded_as_persistent", session, instance)
                 if getattr(mapper, "polymorphic_map", None):
                     # Rows resolved to concrete subclasses carry only the
                     # queried columns; subclass-only attributes load lazily

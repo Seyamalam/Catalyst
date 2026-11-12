@@ -57,6 +57,7 @@ from .engine import (
     create_engine,
     text,
 )
+from .event import SessionEvents
 from .expression import (
     Boolean,
     Column,
@@ -88,10 +89,12 @@ from .expression import (
 from .orm import (
     DeclarativeBase,
     Mapped,
+    MappedAsDataclass,
     MappedColumn,
     Mapper,
     SAWarning,
     Session,
+    SessionTransaction,
     declarative_base,
     joinedload,
     mapped_column,
@@ -164,10 +167,13 @@ __all__ = [
     "DeclarativeBase",
     "declarative_base",
     "Mapped",
+    "MappedAsDataclass",
     "MappedColumn",
     "Mapper",
     "SAWarning",
     "Session",
+    "SessionEvents",
+    "SessionTransaction",
     "mapped_column",
     "relationship",
     "joinedload",
