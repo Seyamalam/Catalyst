@@ -64,6 +64,7 @@ result is identical). Relationship cascade, lazy/eager loading, and
 
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import pytest
@@ -126,6 +127,18 @@ class SAUniqueRow(SABase):
     __tablename__ = "sess_unique"
     id: SAMapped[int] = sa_mapped_column(primary_key=True)
     code: SAMapped[str] = sa_mapped_column(unique=True)
+
+
+class Event(Base):
+    __tablename__ = "sess_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    stamp: Mapped[datetime.datetime]
+
+
+class SAEvent(SABase):
+    __tablename__ = "sess_events"
+    id: SAMapped[int] = sa_mapped_column(primary_key=True)
+    stamp: SAMapped[datetime.datetime]
 
 
 def _catalyst_engine() -> Any:
@@ -836,6 +849,35 @@ def test_get_missing_pk_returns_none() -> None:
         with Session(catalyst_engine) as session, SASession(sa_engine) as sa_session:
             assert session.get(User, 999) is None
             assert sa_session.get(SAUser, 999) is None
+    finally:
+        catalyst_engine.dispose()
+        sa_engine.dispose()
+
+
+def test_flush_datetime_column() -> None:
+    """Regression: ``DateTime`` binds through ``execute_flush`` must accept the
+    renderer's own ``YYYY-MM-DD HH:MM:SS.ffffff`` output (the validator once
+    forgot to skip the ``-`` separators and rejected it)."""
+    moment = datetime.datetime(2024, 1, 2, 3, 4, 5, 123456)
+    catalyst_engine = _catalyst_engine()
+    sa_engine = _sa_engine()
+    try:
+        with Session(catalyst_engine) as session:
+            event = Event(stamp=moment)
+            session.add(event)
+            session.commit()
+            session.expunge_all()
+            loaded = session.get(Event, 1)
+            assert loaded is not None
+            assert loaded.stamp == moment
+        with SASession(sa_engine) as sa_session:
+            sa_event = SAEvent(stamp=moment)
+            sa_session.add(sa_event)
+            sa_session.commit()
+            sa_session.expunge_all()
+            sa_loaded = sa_session.get(SAEvent, 1)
+            assert sa_loaded is not None
+            assert sa_loaded.stamp == moment
     finally:
         catalyst_engine.dispose()
         sa_engine.dispose()

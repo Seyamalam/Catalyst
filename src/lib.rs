@@ -1404,10 +1404,9 @@ fn is_formatted_datetime(text: &str) -> bool {
         && bytes[13] == b':'
         && bytes[16] == b':'
         && bytes[19] == b'.'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 10 | 13 | 16 | 19) || byte.is_ascii_digit())
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
 }
 
 fn parse_date(text: &str, datetime: &Bound<'_, PyModule>) -> PyResult<Py<PyAny>> {
