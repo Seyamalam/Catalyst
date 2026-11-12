@@ -21,6 +21,13 @@ nav:
       - Dialects: parity/dialects.md
       - Types: parity/types.md
       - Events: parity/events.md
+  - Ground truth:
+      - Session write path: session-write-ground-truth.md
+      - Relationship loading: relationship-loading-ground-truth.md
+      - Many-to-many: many-to-many-ground-truth.md
+      - Session merge/expunge/bulk: session-merge-expunge-ground-truth.md
+      - Inheritance: inheritance-ground-truth.md
+      - M4 tail (dataclass, savepoints, events): m4-tail-ground-truth.md
 
 markdown_extensions:
   - admonition
