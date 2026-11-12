@@ -28,7 +28,7 @@ type CompiledExpression = (
     Vec<Option<String>>,
     Option<Py<PyAny>>,
 );
-type CompiledStatement = (
+pub type CompiledStatement = (
     String,
     Vec<(String, Value, Option<String>, bool)>,
     &'static str,
@@ -38,16 +38,16 @@ type CompiledStatement = (
 /// A DDL column definition serialized from Python `Column` metadata. The
 /// SQL type name is rendered in Rust at parse time.
 #[derive(Clone)]
-struct ColumnDdl {
-    name: String,
-    type_name: String,
-    not_null: bool,
-    unique: bool,
-    default: Option<String>,
+pub struct ColumnDdl {
+    pub name: String,
+    pub type_name: String,
+    pub not_null: bool,
+    pub unique: bool,
+    pub default: Option<String>,
 }
 
 #[derive(Clone)]
-enum Expr {
+pub enum Expr {
     Column(String, String, Option<String>),
     /// Whole-entity select item (ORM/JTI entity loads): duplicates label
     /// ``id_1``-style while plain repeated columns label ``id__1``.
@@ -83,7 +83,7 @@ enum Expr {
 ///   inner_on, outer_on)`` — joinedload through an association table:
 ///   ``LEFT OUTER JOIN (assoc AS a_1 JOIN t AS t_1 ON inner) ON outer``.
 #[derive(Clone)]
-enum JoinSpec {
+pub enum JoinSpec {
     LeftOuter {
         table: String,
         alias: String,
@@ -108,7 +108,7 @@ enum JoinSpec {
 }
 
 #[derive(Clone)]
-enum Statement {
+pub enum Statement {
     Select {
         columns: Vec<Expr>,
         table: Option<String>,
@@ -193,7 +193,7 @@ fn is_string_operand(expr: &Expr) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Dialect {
+pub enum Dialect {
     Sqlite,
     Postgres,
     Mysql,
@@ -241,7 +241,7 @@ fn inferred_cast(value: &Value) -> Option<&'static str> {
     }
 }
 
-struct Compiler {
+pub struct Compiler {
     dialect: Dialect,
     sql: String,
     params: Vec<(String, Value, Option<String>, bool)>,
@@ -253,7 +253,7 @@ struct Compiler {
 }
 
 impl Compiler {
-    fn new(dialect: Dialect) -> Self {
+    pub fn new(dialect: Dialect) -> Self {
         Self {
             dialect,
             sql: String::new(),
@@ -686,7 +686,7 @@ impl Compiler {
         }
     }
 
-    fn statement(mut self, statement: &Statement) -> CompiledStatement {
+    pub fn statement(mut self, statement: &Statement) -> CompiledStatement {
         let kind = match statement {
             Statement::Select {
                 columns,

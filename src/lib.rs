@@ -6,6 +6,18 @@ mod pool;
 mod postgres;
 mod session;
 
+/// Internal surfaces re-exported for `benches/core.rs` so Criterion can time
+/// the pure-Rust compiler, bind scanners, and codecs without the GIL. Not part
+/// of the Python API; signatures may change without notice.
+#[doc(hidden)]
+pub mod bench {
+    pub use crate::expr::{ColumnDdl, Compiler, Dialect, Expr, JoinSpec, Statement};
+    pub use crate::mysql::{scan_named_binds as mysql_scan_named_binds, split_insert_values};
+    pub use crate::postgres::{
+        decode_numeric, encode_numeric, scan_named_binds as postgres_scan_named_binds,
+    };
+}
+
 use pyo3::PyTypeInfo;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;

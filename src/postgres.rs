@@ -842,7 +842,7 @@ fn python_to_pg_value(value: &Bound<'_, PyAny>) -> PyResult<PgValue> {
 }
 
 /// Replace named binds outside SQL strings/comments and return first-seen names.
-fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
+pub fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
     let bytes = sql.as_bytes();
     let mut output = String::with_capacity(sql.len());
     let mut names = Vec::<String>::new();
@@ -971,7 +971,7 @@ const NUMERIC_SIGN_NAN: u16 = 0xC000;
 const NUMERIC_SIGN_POSITIVE_INFINITY: u16 = 0xD000;
 const NUMERIC_SIGN_NEGATIVE_INFINITY: u16 = 0xF000;
 
-type CodecResult<T> = Result<T, Box<dyn std::error::Error + Sync + Send>>;
+pub type CodecResult<T> = Result<T, Box<dyn std::error::Error + Sync + Send>>;
 
 fn numeric_header(sign: u16) -> Vec<u8> {
     let mut output = Vec::with_capacity(8);
@@ -984,7 +984,7 @@ fn numeric_header(sign: u16) -> Vec<u8> {
 
 /// Encode decimal text (any `str(Decimal)` output, including `NaN`,
 /// `Infinity`, and `E`-notation) into PostgreSQL's binary NUMERIC format.
-fn encode_numeric(text: &str) -> CodecResult<Vec<u8>> {
+pub fn encode_numeric(text: &str) -> CodecResult<Vec<u8>> {
     let invalid = || -> Box<dyn std::error::Error + Sync + Send> {
         format!("invalid numeric bind value: {text:?}").into()
     };
@@ -1076,7 +1076,7 @@ fn encode_numeric(text: &str) -> CodecResult<Vec<u8>> {
 /// Decode PostgreSQL's binary NUMERIC format into canonical decimal text
 /// that Python `decimal.Decimal` reproduces exactly (`dscale` pads the
 /// fractional part like `numeric_out`).
-fn decode_numeric(raw: &[u8]) -> CodecResult<String> {
+pub fn decode_numeric(raw: &[u8]) -> CodecResult<String> {
     let invalid =
         || -> Box<dyn std::error::Error + Sync + Send> { "invalid NUMERIC result encoding".into() };
     if raw.len() < 8 {

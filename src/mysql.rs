@@ -1074,7 +1074,7 @@ fn insert_values_suffix_ok(suffix: &str) -> bool {
 /// `?` group) and candidates inside string/identifier literals or comments are
 /// ignored. `None` sends the batch down the per-group path — asyncmy's own
 /// fallback for non-collapsible statements.
-fn split_insert_values(sql: &str) -> Option<(String, String, String)> {
+pub fn split_insert_values(sql: &str) -> Option<(String, String, String)> {
     let bytes = sql.as_bytes();
     // `^\s*(?:INSERT|REPLACE)\b`
     let mut index = 0;
@@ -1196,7 +1196,7 @@ fn is_mysql_word_byte(byte: u8) -> bool {
 /// Replace named binds outside SQL strings/comments and return first-seen names.
 /// MySQL renders positional `?` parameters and additionally skips backtick
 /// quoted identifiers and `#` comments (dollar-quoting does not exist).
-fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
+pub fn scan_named_binds(sql: &str) -> PyResult<(String, Vec<String>)> {
     scan_named_binds_inner(sql, &mut |_| None)
 }
 

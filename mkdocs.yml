@@ -7,6 +7,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Development: development.md
+  - Benchmarks: benchmarks.md
   - Decisions:
       - Driver selection: decisions/0001-driver-selection.md
       - Documentation tooling: decisions/0002-documentation-tooling.md
