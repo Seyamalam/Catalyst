@@ -18,16 +18,16 @@ Catalyst targets SQLAlchemy 2.0 compatibility. These matrices are the source of 
 | Core engine, expressions, DDL, transactions, exceptions | [core.md](core.md) | 0 | 12 | 6 | 0 |
 | Dialects (SQLite/PostgreSQL/MySQL drivers and compilers) | [dialects.md](dialects.md) | 0 | 11 | 3 | 0 |
 | Session, unit of work, bulk operations | [session.md](session.md) | 5 | 2 | 2 | 0 |
-| ORM: declarative, relationships, inheritance, `MappedAsDataclass` | [orm.md](orm.md) | 5 | 3 | 12 | 0 |
+| ORM: declarative, relationships, inheritance, `MappedAsDataclass` | [orm.md](orm.md) | 7 | 2 | 11 | 0 |
 | Async engine/connections/savepoints | [async.md](async.md) | 0 | 5 | 3 | 0 |
 | Events (`SessionEvents`) | [events.md](events.md) | 1 | 0 | 3 | 0 |
 | Types and typing (`Numeric`, PEP 681, stubs) | [types.md](types.md) | 3 | 4 | 2 | 0 |
-| **Total** | | **14** | **37** | **31** | **0** |
+| **Total** | | **16** | **36** | **30** | **0** |
 
 ## Headline gaps
 
 - The entire ORM/Session surface is **SQLite-only** — no `AsyncSession`, no sync PostgreSQL/MySQL engines.
 - Core expressions compile single-table statements only: no public JOIN/alias/CTE/set-op/subquery surface (ORM loaders use internal join specs).
-- Relationships cover FK-inferred one-to-many/many-to-one/many-to-many with `lazy="select"`, `joinedload`, `selectinload`; custom joins, other lazy modes, other loader options, `order_by`/`collection_class`, and the association-object pattern are unimplemented.
+- Relationships cover FK-inferred one-to-many/many-to-one/many-to-many with `lazy="select"`/`"raise"`/`"noload"` (other strategies rejected), `joinedload`, `selectinload`; custom joins, eager lazy modes, other loader options, `order_by`/`collection_class`, and the association-object pattern are unimplemented.
 - Inheritance covers STI and JTI; concrete-table inheritance and `with_polymorphic` are not started.
 - Events cover the `SessionEvents` firing matrix only; `MapperEvents`/`InstanceEvents`/`ConnectionEvents` and the never-dispatched bulk/`do_orm_execute` hooks are gaps.
