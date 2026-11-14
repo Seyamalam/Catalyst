@@ -55,9 +55,11 @@ import catalyst.orm  # noqa: F401
 import pytest
 import sqlalchemy as sa
 from catalyst import (
+    ArgumentError,
     DeclarativeBase,
     IntegrityError,
     InvalidRequestError,
+    LoaderStrategyException,
     Mapped,
     Session,
     create_engine,
@@ -814,3 +816,340 @@ def test_one_to_one_scalar_relationship() -> None:
     finally:
         catalyst_engine.dispose()
         sa_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Gap-closure parity: lazy strategies, join-kwarg rejection, viewonly,
+# refresh-expire cascade (SQLAlchemy 2.1.8 ground truth, verified empirically)
+# ---------------------------------------------------------------------------
+
+relationship = _CATALYST_RELATIONSHIP
+ForeignKey = _CATALYST_FOREIGN_KEY
+
+
+def _raise_models() -> tuple[type[Any], type[Any], type[Any]]:
+    """Catalyst parent/child pair using ``lazy="raise"`` on the collection."""
+
+    class RBase(DeclarativeBase):
+        pass
+
+    class RP(RBase):
+        __tablename__ = "rel_raise_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[RC]] = relationship("RC", lazy="raise")
+
+    class RC(RBase):
+        __tablename__ = "rel_raise_child"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        pid: Mapped[int] = mapped_column(ForeignKey("rel_raise_parent.id"))
+
+    return RBase, RP, RC
+
+
+def test_lazy_raise_blocks_access_matches_sqlalchemy() -> None:
+    """``lazy="raise"`` raises ``InvalidRequestError`` on access with the same
+    ``'<Cls>.<key>' is not available due to lazy='raise'`` message SA emits."""
+
+    class SARBase(SADeclarativeBase):
+        pass
+
+    class SARP(SARBase):
+        __tablename__ = "rel_raise_parent"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        kids: SAMapped[list[SARC]] = sa_relationship("SARC", lazy="raise")
+
+    class SARC(SARBase):
+        __tablename__ = "rel_raise_child"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        pid: SAMapped[int] = sa_mapped_column(sa.ForeignKey("rel_raise_parent.id"))
+
+    RBase, RP, RC = _raise_models()
+    catalyst_engine = create_engine(":memory:")
+    RBase.metadata.create_all(catalyst_engine)
+    sa_engine = sa_create_engine("sqlite://")
+    SARBase.metadata.create_all(sa_engine)
+    try:
+        with Session(catalyst_engine) as session, SASession(sa_engine) as sa_session:
+            session.add(RP(id=1))
+            session.add(RC(id=1, pid=1))
+            session.commit()
+            sa_session.add(SARP(id=1))
+            sa_session.add(SARC(id=1, pid=1))
+            sa_session.commit()
+
+            p = session.get(RP, 1)
+            assert p is not None
+            with pytest.raises(
+                InvalidRequestError,
+                match=r"'RP\.kids' is not available due to lazy='raise'",
+            ):
+                _ = p.kids
+
+            sp = sa_session.get(SARP, 1)
+            assert sp is not None
+            with pytest.raises(sa.exc.InvalidRequestError) as sa_exc:
+                _ = sp.kids
+            assert "'SARP.kids' is not available due to lazy='raise'" in str(sa_exc.value)
+    finally:
+        catalyst_engine.dispose()
+        sa_engine.dispose()
+
+
+def test_lazy_noload_never_loads() -> None:
+    """``lazy="noload"`` returns an empty collection/None without emitting SQL;
+    SQLAlchemy supports it, so Catalyst keeps it in the accepted set."""
+
+    class NBase(DeclarativeBase):
+        pass
+
+    class NP(NBase):
+        __tablename__ = "rel_noload_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[NC]] = relationship("NC", lazy="noload")
+
+    class NC(NBase):
+        __tablename__ = "rel_noload_child"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        pid: Mapped[int] = mapped_column(ForeignKey("rel_noload_parent.id"))
+
+    engine = create_engine(":memory:")
+    NBase.metadata.create_all(engine)
+    try:
+        with Session(engine) as session:
+            session.add(NP(id=1))
+            session.add(NC(id=1, pid=1))
+            session.commit()
+            p = session.get(NP, 1)
+            assert p is not None
+            assert p.kids == []
+    finally:
+        engine.dispose()
+
+
+def test_unknown_lazy_strategy_rejected_at_configure() -> None:
+    """An unknown ``lazy=`` strategy raises ``LoaderStrategyException`` (an
+    ``InvalidRequestError`` subclass, same as ``sqlalchemy.orm.exc``) during
+    mapper configuration with SA's ``Can't find strategy`` message — never a
+    silent fallthrough to ``select``."""
+
+    class BBase(DeclarativeBase):
+        pass
+
+    class BP(BBase):
+        __tablename__ = "rel_bad_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[BC]] = relationship("BC", lazy="bogus")
+
+    with pytest.raises(
+        LoaderStrategyException,
+        match=r"Can't find strategy \(\('lazy', 'bogus'\),\) for BP\.kids",
+    ):
+
+        class BC(BBase):
+            __tablename__ = "rel_bad_child"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            pid: Mapped[int] = mapped_column(ForeignKey("rel_bad_parent.id"))
+
+    # SQLAlchemy raises the same class name, also at configure time.
+    class SABBase(SADeclarativeBase):
+        pass
+
+    class SABP(SABBase):
+        __tablename__ = "rel_bad_parent"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        kids: SAMapped[list[SABC]] = sa_relationship("SABC", lazy="bogus")
+
+    class SABC(SABBase):
+        __tablename__ = "rel_bad_child"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        pid: SAMapped[int] = sa_mapped_column(sa.ForeignKey("rel_bad_parent.id"))
+
+    with pytest.raises(sa.exc.InvalidRequestError) as sa_exc:
+        sa.orm.configure_mappers()
+    assert type(sa_exc.value).__name__ == "LoaderStrategyException"
+    assert "Can't find strategy (('lazy', 'bogus'),) for SABP.kids" in str(sa_exc.value)
+
+
+def test_join_kwargs_rejected_without_secondary() -> None:
+    """``primaryjoin``/``secondaryjoin`` on a non-secondary relationship are
+    rejected loudly at configure time instead of silently ignored (SQLAlchemy
+    honors them; Catalyst does not implement custom join conditions yet)."""
+
+    class JBase(DeclarativeBase):
+        pass
+
+    class JP(JBase):
+        __tablename__ = "rel_join_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[JC]] = relationship("JC", primaryjoin="JP.id == JC.pid")
+
+    with pytest.raises(ArgumentError, match="primaryjoin/secondaryjoin"):
+
+        class JC(JBase):
+            __tablename__ = "rel_join_child"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            pid: Mapped[int] = mapped_column(ForeignKey("rel_join_parent.id"))
+
+
+def test_viewonly_o2m_does_not_write_fk_matches_sqlalchemy() -> None:
+    """A ``viewonly`` one-to-many (with a viewonly m2o sibling) accepts the
+    in-memory append but neither back-populates the sibling nor emits a FK
+    UPDATE — the child row's FK stays NULL, exactly as SQLAlchemy's viewonly
+    unit-of-work suppression behaves."""
+
+    class SAVBase(SADeclarativeBase):
+        pass
+
+    class SAVP(SAVBase):
+        __tablename__ = "rel_vo_parent"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        kids: SAMapped[list[SAVC]] = sa_relationship("SAVC", viewonly=True, back_populates="parent")
+
+    class SAVC(SAVBase):
+        __tablename__ = "rel_vo_child"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        name: SAMapped[str]
+        pid: SAMapped[int | None] = sa_mapped_column(sa.ForeignKey("rel_vo_parent.id"))
+        parent: SAMapped[SAVP] = sa_relationship("SAVP", viewonly=True, back_populates="kids")
+
+    class VBase(DeclarativeBase):
+        pass
+
+    class VP(VBase):
+        __tablename__ = "rel_vo_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[VC]] = relationship("VC", viewonly=True, back_populates="parent")
+
+    class VC(VBase):
+        __tablename__ = "rel_vo_child"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str]
+        pid: Mapped[int | None] = mapped_column(ForeignKey("rel_vo_parent.id"))
+        parent: Mapped[VP] = relationship("VP", viewonly=True, back_populates="kids")
+
+    catalyst_engine = create_engine(":memory:")
+    VBase.metadata.create_all(catalyst_engine)
+    sa_engine = sa_create_engine("sqlite://")
+    SAVBase.metadata.create_all(sa_engine)
+    try:
+        with Session(catalyst_engine) as session, SASession(sa_engine) as sa_session:
+            session.add(VP(id=1))
+            session.add(VC(id=1, name="c"))
+            session.commit()
+            sa_session.add(SAVP(id=1))
+            sa_session.add(SAVC(id=1, name="c"))
+            sa_session.commit()
+
+            cp = session.get(VP, 1)
+            cc = session.get(VC, 1)
+            assert cp is not None and cc is not None
+            cp.kids.append(cc)  # lands in the collection...
+            assert cc in cp.kids
+            assert cc.parent is None  # ...but no back-population into viewonly
+            session.flush()
+            session.expire_all()
+            assert session.get(VC, 1).pid is None  # no FK write
+
+            sp = sa_session.get(SAVP, 1)
+            sc = sa_session.get(SAVC, 1)
+            assert sp is not None and sc is not None
+            sp.kids.append(sc)
+            assert sc in sp.kids
+            assert sc.parent is None
+            sa_session.flush()
+            sa_session.expire_all()
+            assert sa_session.get(SAVC, 1).pid is None
+    finally:
+        catalyst_engine.dispose()
+        sa_engine.dispose()
+
+
+def test_refresh_expire_cascade_expires_loaded_children() -> None:
+    """``cascade="refresh-expire"`` expires the loaded attributes of related
+    objects when the parent is refreshed — verified against SA 2.1.8 where the
+    child's expired attribute set becomes ``{'id', 'name', 'pid'}``."""
+
+    class SAREBase(SADeclarativeBase):
+        pass
+
+    class SAREP(SAREBase):
+        __tablename__ = "rel_re_parent"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        kids: SAMapped[list[SAREC]] = sa_relationship("SAREC", cascade="refresh-expire")
+
+    class SAREC(SAREBase):
+        __tablename__ = "rel_re_child"
+        id: SAMapped[int] = sa_mapped_column(primary_key=True)
+        name: SAMapped[str]
+        pid: SAMapped[int] = sa_mapped_column(sa.ForeignKey("rel_re_parent.id"))
+
+    class REBase(DeclarativeBase):
+        pass
+
+    class REP(REBase):
+        __tablename__ = "rel_re_parent"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        kids: Mapped[list[REC]] = relationship("REC", cascade="refresh-expire")
+
+    class REC(REBase):
+        __tablename__ = "rel_re_child"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str]
+        pid: Mapped[int] = mapped_column(ForeignKey("rel_re_parent.id"))
+
+    catalyst_engine = create_engine(":memory:")
+    REBase.metadata.create_all(catalyst_engine)
+    sa_engine = sa_create_engine("sqlite://")
+    SAREBase.metadata.create_all(sa_engine)
+    try:
+        with (
+            Session(catalyst_engine, expire_on_commit=False) as session,
+            SASession(sa_engine, expire_on_commit=False) as sa_session,
+        ):
+            session.add(REP(id=1))
+            session.add(REC(id=1, name="k", pid=1))
+            session.commit()
+            sa_session.add(SAREP(id=1))
+            sa_session.add(SAREC(id=1, name="k", pid=1))
+            sa_session.commit()
+
+            # SQLAlchemy: loaded child attrs become expired on parent refresh.
+            sp = sa_session.get(SAREP, 1)
+            assert sp is not None
+            skids = list(sp.kids)
+            sa_session.refresh(sp)
+            sa_expired = set(sa.inspect(skids[0]).expired_attributes)
+            assert sa_expired == {"id", "name", "pid"}
+
+            p = session.get(REP, 1)
+            assert p is not None
+            kids = list(p.kids)
+            assert "name" in kids[0].__dict__  # loaded before refresh
+            session.refresh(p)
+            assert set(session._uow.expired_attrs_of(kids[0])) == {"id", "name", "pid"}
+            assert "name" not in kids[0].__dict__  # expired attrs drop from __dict__
+            assert kids[0].name == "k"  # and transparently reload
+    finally:
+        catalyst_engine.dispose()
+        sa_engine.dispose()
+
+
+def test_refresh_without_cascade_leaves_children_loaded() -> None:
+    """The default cascade does NOT expire related objects on parent refresh —
+    the negative control proving ``refresh-expire`` is what triggers it."""
+
+    CParent, CChild = _catalyst_models()
+    catalyst_engine = create_engine(":memory:")
+    CParent.metadata.create_all(catalyst_engine)
+    try:
+        with Session(catalyst_engine, expire_on_commit=False) as session:
+            session.add(CParent(id=1, name="p"))
+            session.add(CChild(id=1, name="c", parent_id=1))
+            session.commit()
+            p = session.get(CParent, 1)
+            assert p is not None
+            kids = list(p.children)
+            session.refresh(p)
+            assert "name" in kids[0].__dict__  # still loaded, not expired
+    finally:
+        catalyst_engine.dispose()

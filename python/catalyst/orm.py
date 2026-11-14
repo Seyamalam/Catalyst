@@ -53,6 +53,7 @@ from ._catalyst import (
     ArgumentError,
     DetachedInstanceError,
     InvalidRequestError,
+    LoaderStrategyException,
     NativeUow,
     ObjectDeletedError,
     PendingRollbackError,
@@ -325,6 +326,13 @@ _M2M_BASE = "_catalyst_m2m_base"
 # SQLAlchemy's ``all`` cascade token expands to these operations; the separate
 # ``delete-orphan`` token opts into deleting removed children.
 _CASCADE_ALL_TOKENS = frozenset({"save-update", "merge", "refresh-expire", "expunge", "delete"})
+
+# Loader strategies Catalyst implements for ``relationship(lazy=...)``.
+# SQLAlchemy's ``lazy`` is an alias for ``select``; ``joined``, ``subquery``,
+# ``selectin``, ``dynamic``, ``immediate``, ``write``, ``merged`` and friends
+# are rejected with ``LoaderStrategyException`` rather than silently treated
+# as ``select`` — matching SQLAlchemy's behavior for unknown strategies.
+_SUPPORTED_LAZY = frozenset({"select", "lazy", "raise", "noload"})
 
 
 def _parse_cascade(text: object) -> frozenset[str]:
@@ -735,7 +743,16 @@ def configure_mappers() -> None:
 
 def _configure_mapper(mapper: Mapper[Any]) -> None:
     for decl in list(mapper.pending_relationships):
-        _configure_relationship(decl, mapper)
+        try:
+            _configure_relationship(decl, mapper)
+        except (ArgumentError, LoaderStrategyException):
+            # Validation errors are deterministic — retrying can never
+            # succeed. Drop the declaration from the pending set so one
+            # rejected relationship does not poison every later
+            # configure_mappers() call (SQLAlchemy re-raises forever;
+            # the one-shot behavior is a deliberate difference).
+            mapper.pending_relationships.remove(decl)
+            raise
     for prop in mapper.relationships.values():
         _pair_sibling(prop)
 
@@ -772,6 +789,13 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
     target_mapper = cast("Mapper[Any] | None", getattr(target, "__mapper__", None))
     if not isinstance(target_mapper, Mapper):
         return False
+    if decl.lazy == "lazy":
+        decl.lazy = "select"  # SQLAlchemy treats "lazy" as "select"
+    if decl.lazy not in _SUPPORTED_LAZY:
+        raise LoaderStrategyException(
+            f"Can't find strategy (('lazy', {decl.lazy!r}),) for "
+            f"{mapper.class_.__name__}.{decl.key}"
+        )
     # FK inference searches every inheritance-table level: relationships
     # conventionally reference the hierarchy root, but a joined-table child
     # can also carry the foreign key.
@@ -793,6 +817,13 @@ def _configure_relationship(decl: Relationship[Any], mapper: Mapper[Any]) -> boo
             if secondary is None:
                 return False
         return _configure_secondary(decl, mapper, target, target_mapper, secondary)
+    if decl.primaryjoin is not None or decl.secondaryjoin is not None:
+        raise ArgumentError(
+            "primaryjoin/secondaryjoin are only supported for many-to-many "
+            "relationships (with secondary=); custom join conditions on "
+            "non-secondary relationships are not yet implemented and must "
+            "not be silently ignored"
+        )
     a_fks = [
         column
         for level in mapper.table_levels
@@ -1123,7 +1154,9 @@ def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> N
         uow.attr_set(obj, prop.key)
         _autobegin_uow(uow)
     sibling = prop.sibling
-    if sibling is not None:
+    # A viewonly sibling is never populated into — SQLAlchemy suppresses
+    # both back-population and any write machinery on viewonly properties.
+    if sibling is not None and not sibling.viewonly:
         if old is not None and old is not value:
             if sibling.uselist:
                 other = getattr(old, "__dict__", {}).get(sibling.key)
@@ -1154,7 +1187,7 @@ def _collection_append(owner: object, prop: RelationshipProperty, item: object) 
             uow.attr_set(owner, prop.key)
             _autobegin_uow(uow)
     sibling = prop.sibling
-    if sibling is not None:
+    if sibling is not None and not sibling.viewonly:
         if sibling.uselist:
             if sibling.direction == _MANYTOMANY:
                 _ensure_loaded(item, sibling)
@@ -1182,7 +1215,7 @@ def _collection_remove(owner: object, prop: RelationshipProperty, item: object) 
             uow.attr_set(owner, prop.key)
             _autobegin_uow(uow)
     sibling = prop.sibling
-    if sibling is not None:
+    if sibling is not None and not sibling.viewonly:
         if sibling.uselist:
             if sibling.direction == _MANYTOMANY:
                 _ensure_loaded(item, sibling)
@@ -3226,9 +3259,10 @@ class Session:
             dirty = set(uow.dirty_attrs_of(obj))
             changes: dict[str, object] = {}
             deferred_cols: dict[str, tuple[str, int]] = {}
-            # Relationship assignment syncs the FK column value at flush.
+            # Relationship assignment syncs the FK column value at flush;
+            # viewonly relationships populate object references only.
             for prop in mapper.relationships.values():
-                if prop.direction != _MANYTOONE or prop.key not in dirty:
+                if prop.direction != _MANYTOONE or prop.key not in dirty or prop.viewonly:
                     continue
                 related = obj.__dict__.get(prop.key)
                 fk_attr = prop.local_attr
@@ -3480,7 +3514,7 @@ class Session:
         """FK attribute -> assigned related object for pending inserts."""
         refs: dict[str, object] = {}
         for prop in mapper.relationships.values():
-            if prop.direction != _MANYTOONE:
+            if prop.direction != _MANYTOONE or prop.viewonly:
                 continue
             if prop.key in obj.__dict__:
                 refs[prop.local_attr] = obj.__dict__.get(prop.key)
@@ -3509,6 +3543,15 @@ class Session:
                 f"'{_mapper_of(instance).class_.__name__}.{prop.key}' is not "
                 "available due to lazy='raise'"
             )
+        if prop.lazy == "noload":
+            instance_dict = instance.__dict__
+            if prop.uselist:
+                collection = InstrumentedList()
+                collection.bind(instance, prop)
+                instance_dict[prop.key] = collection
+                return collection
+            instance_dict[prop.key] = None
+            return None
         uow = self._uow
         instance_dict = instance.__dict__
         if self.autoflush and not self._flushing:
@@ -4256,6 +4299,20 @@ class Session:
         for attr, value in zip(mapper.select_attrs, row, strict=True):
             object.__setattr__(instance, attr, value)
         uow.mark_clean(instance)
+        # refresh-expire expires every loaded attribute of related objects
+        # reached through cascading relationships (verified against SA 2.1).
+        for prop in mapper.relationships.values():
+            if "refresh-expire" not in prop.cascade or prop.key not in instance.__dict__:
+                continue
+            loaded = instance.__dict__[prop.key]
+            items = cast("list[object]", loaded) if isinstance(loaded, list) else [loaded]
+            for item in items:
+                if item is None:
+                    continue
+                item_uow = _state_of(item)
+                if item_uow is not None and item_uow.status(item) == _STATUS_PERSISTENT:
+                    item_uow.expire(item)
+                    _expire_instance(item)
         for key in mapper.relationship_attrs:
             instance.__dict__.pop(key, None)
 

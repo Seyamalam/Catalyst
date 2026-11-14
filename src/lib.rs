@@ -160,6 +160,13 @@ create_exception!(
     "Raised when more than one foreign key path could satisfy a relationship join."
 );
 
+create_exception!(
+    _catalyst,
+    LoaderStrategyException,
+    InvalidRequestError,
+    "Raised when a relationship loader strategy name is unknown."
+);
+
 /// A native SQLite engine owning a bounded connection pool.
 #[pyclass(module = "catalyst._catalyst")]
 struct NativeEngine {
@@ -1803,6 +1810,10 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "AmbiguousForeignKeysError",
         module.py().get_type::<AmbiguousForeignKeysError>(),
     )?;
+    module.add(
+        "LoaderStrategyException",
+        module.py().get_type::<LoaderStrategyException>(),
+    )?;
     module.add_class::<NativeEngine>()?;
     module.add_class::<NativeConnection>()?;
     module.add_class::<postgres::NativePgEngine>()?;
@@ -1835,6 +1846,7 @@ fn _catalyst(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "ObjectDeletedError",
             "DetachedInstanceError",
             "AmbiguousForeignKeysError",
+            "LoaderStrategyException",
             "sqlite_text",
             "compile_expression",
             "NativeEngine",

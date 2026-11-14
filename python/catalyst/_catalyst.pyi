@@ -23,6 +23,7 @@ __all__ = [
     "StaleDataError",
     "ObjectDeletedError",
     "DetachedInstanceError",
+    "LoaderStrategyException",
     "sqlite_text",
     "compile_expression",
     "NativeEngine",
@@ -271,6 +272,9 @@ class ObjectDeletedError(InvalidRequestError):
 
 class DetachedInstanceError(CatalystError):
     """An unloaded attribute was accessed on a detached object."""
+
+class LoaderStrategyException(InvalidRequestError):
+    """A relationship ``lazy=`` loader strategy name is unknown."""
 
 @final
 class NativeUow:
