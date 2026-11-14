@@ -94,12 +94,16 @@ columns), same rows, same statements, sessions rebuilt per repetition.
 
 | benchmark | size | Catalyst | SQLAlchemy 2.1.8 | speedup |
 |---|---|---|---|---|
-| `insert_add_all_flush` | 1,000 rows | 37.4 ms | 7.5 ms | **0.20×** |
-| `insert_add_all_flush` | 10,000 rows | 372 ms | 83.6 ms | **0.22×** |
+| `insert_add_all_flush` | 1,000 rows | 15.3 ms | 8.0 ms | **0.52×** |
+| `insert_add_all_flush` | 10,000 rows | 153 ms | 133 ms | **0.87×** |
 | `select_hydrate` | 10,000 rows | 25.6 ms | 17.9 ms | 0.70× |
 | `executemany_insert` | 10,000 rows | 19.3 ms | 18.0 ms | 0.93× |
 | `selectinload` | 100 parents × 10 children | 2.47 ms | 2.32 ms | 0.94× |
 | `session_get_identity` | 2,000 calls / 100 ids | 308 µs | 63.5 ms | **206×** |
+
+The `insert_add_all_flush` rows were re-measured after the flush
+statement-template cache landed (see below); the other rows predate it and
+were unaffected by the change.
 
 ## Interpretation
 
@@ -108,16 +112,23 @@ columns), same rows, same statements, sessions rebuilt per repetition.
   (~0.15 µs/call). SQLAlchemy performs per-call Python bookkeeping
   (~32 µs/call) even on hits. This is where Rust ownership of the identity
   map pays off most clearly.
-- **`INSERT` via `add_all`+`flush` — real loss (≈0.2×), and measured.** The
-  batched `execute_flush` crossing works — all N INSERTs execute in one FFI
-  call inside one wire transaction — but the flush first compiles
-  `Insert(table).values(row).compile()` *per object*. Each compile pays the
+- **`INSERT` via `add_all`+`flush` — narrowed to ≈0.5–0.9× by the flush
+  statement-template cache.** The flush previously compiled
+  `Insert(table).values(row).compile()` *per object* — ~29 µs/op of
   Python→tuple serialization plus a `compile_expression` FFI call that
-  spawns a dedicated 64 MiB-stack thread (~29 µs/op measured). SQLAlchemy
-  reuses a cached per-table INSERT and only re-binds parameters. The
-  bottleneck is per-object compilation, not the FFI crossing: the fix is
-  statement-template caching in the flush path (compile once per table,
-  rebind per row), which is a known follow-up, not a benchmark artifact.
+  spawns a dedicated 64 MiB-stack thread, while SQLAlchemy rebinds a cached
+  template. `Session._flush_changes` now caches each compiled statement
+  under `(table, kind, value-shape)` (`_FLUSH_TEMPLATES` in `orm.py`) for
+  INSERT/UPDATE/DELETE and the association-table writes, then rebuilds only
+  the ordered parameter list per object — mirroring SQLAlchemy's own
+  per-mapper statement cache. A conservative `_flush_bind_safe` gate keeps
+  semantics exact: only values that provably convert identically through
+  `python_to_sqlite_typed` may skip `compile()`; anything unsure (odd
+  datetime forms, unbindable objects, oversized ints) takes the real
+  compile path so deferred `bind_error`s surface byte-for-byte. Measured
+  before/after on the 10k case: 1.32 s → 153 ms (~8.6×). The remaining
+  gap is per-object Python bookkeeping in the unit of work, not
+  compilation or the FFI crossing.
 - **`SELECT`+hydrate — modest loss (≈0.7×).** Batched Rust hydration
   (`__new__` + per-column setattr in one crossing) lands in the same
   ballpark as SQLAlchemy's mature hydration path but doesn't beat it;
@@ -134,12 +145,12 @@ columns), same rows, same statements, sessions rebuilt per repetition.
   worker under an 8-thread race on 5 slots — the condvar wake path keeps
   starvation bounded. The statement cache retains its ≈4.3× advantage.
 
-### Gap noticed while benchmarking
+### Gap noticed while benchmarking — since fixed
 
-`session.flush()` currently raises `StatementError` on `DateTime` columns:
+`session.flush()` used to raise `StatementError` on `DateTime` columns:
 flush ops carry compile-time-rendered datetime text, and the second bind
-pass inside `execute_flush` re-validates it via `is_formatted_datetime`,
-which rejects the `-` separators at positions 4/7 that its own renderer
-emits (the sibling `is_formatted_date` skips those positions correctly).
-The e2e model therefore uses a `Date` column. Reported for a follow-up
-fix; no flush-parity test previously exercised a `datetime` column.
+pass inside `execute_flush` re-validated it via `is_formatted_datetime`,
+which rejected the `-` separators at positions 4/7 that its own renderer
+emits (the sibling `is_formatted_date` skipped those positions correctly).
+Fixed in `b37e5ed`; `tests/test_session_write.py::test_flush_datetime_column`
+keeps it covered.

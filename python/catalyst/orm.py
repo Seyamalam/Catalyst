@@ -1139,6 +1139,71 @@ def _is_deferred_bind(value: object) -> bool:
     return len(pair) == 2 and pair[0] == "__catalyst_rowid__"
 
 
+# Statement-template cache for ``Session._flush_changes``: repeated
+# same-shape flush DML skips the per-object AST build plus ``compile()`` —
+# every ``compile_expression`` call pays a dedicated compiler thread, which
+# dominated the measured flush gap versus SQLAlchemy's cached templates.
+# Keys are ``(Table, kind, shape...)`` tuples; holding the Table object in
+# the key keeps it alive, so a garbage-collected table's id can never alias
+# a stale entry.  Values are ``(sql, bind_names, bind_types)`` triples;
+# per-object parameters are rebuilt from ``bind_names`` plus the object's
+# own values because ``Compiled._ordered`` embeds the first object's
+# concrete values and must not be reused.  The dict is intentionally
+# unbounded but tiny: one entry per distinct statement shape a mapper emits
+# (each dirty-column UPDATE subset is a distinct, correct entry).
+_FLUSH_TEMPLATES: dict[
+    tuple[object, ...],
+    tuple[str, list[str], list[str | None]],
+] = {}
+
+
+def _flush_bind_safe(value: object, type_tag: str | None) -> bool:
+    """Whether ``value`` binds through ``python_to_sqlite_typed`` cleanly.
+
+    Cached-template flush ops carry raw attribute values and let
+    ``execute_flush`` apply the same typed conversion the compiler would, so
+    only values that provably convert identically either way may skip
+    ``compile()``.  ``False`` means "unsure": the caller rebuilds this one
+    statement so the real compiler reproduces the deferred ``bind_error``
+    (or eagerly raises) exactly as an uncached flush does.
+    """
+    if value is None:
+        return True
+    if type_tag == "boolean":
+        # Rust accepts a Python bool or an i64-extractable 0/1 only.
+        return isinstance(value, int) and value in (0, 1)
+    if type_tag == "datetime" or type_tag == "date":
+        # datetime.date/.datetime always format; already-formatted strings
+        # and duck-typed year/month/day objects still take the compiler.
+        return isinstance(value, (datetime.date, datetime.datetime))
+    if type_tag is not None and (
+        type_tag == "float" or type_tag == "double" or type_tag.startswith("numeric")
+    ):
+        # Rust binds these through ``float(value)``; retrying the same call
+        # replicates success/failure before deferring to the real compiler.
+        try:
+            float(cast(Any, value))
+        except Exception:
+            return False
+        return True
+    # Untyped binds plus integer/string/text/binary tags all land in
+    # ``python_to_sqlite``: None, bool, bytes, str, float, i64-range int.
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (str, bytes, float)):
+        return True
+    return isinstance(value, int) and -(1 << 63) <= value < (1 << 63)
+
+
+def _flush_template_put(key: tuple[object, ...], compiled: Compiled) -> None:
+    """Store a compiled statement's reusable shape under ``key``."""
+    _FLUSH_TEMPLATES[key] = (
+        compiled.string,
+        list(compiled._bind_names),
+        list(compiled._bind_types),
+    )
+
+
 def _set_scalar_rel(obj: object, prop: RelationshipProperty, value: object) -> None:
     """Assign a scalar relationship attribute with back-population.
 
@@ -3230,22 +3295,39 @@ class Session:
                             SAWarning,
                             stacklevel=2,
                         )
-                compiled = Insert(level.table).values(values).compile()
-                self._raise_bind_error(compiled)
-                ordered = list(compiled._ordered)
+                template_key: tuple[object, ...] = (level.table, "insert", tuple(values))
+                template = _FLUSH_TEMPLATES.get(template_key)
+                ordered: list[object]
+                if template is not None and all(
+                    _flush_bind_safe(values[name], tag)
+                    for name, tag in zip(template[1], template[2], strict=True)
+                ):
+                    string, bind_names, bind_types = template
+                    ordered = [values[name] for name in bind_names]
+                else:
+                    compiled = Insert(level.table).values(values).compile()
+                    self._raise_bind_error(compiled)
+                    if template is None:
+                        _flush_template_put(template_key, compiled)
+                    string, bind_names, bind_types = (
+                        compiled.string,
+                        compiled._bind_names,
+                        compiled._bind_types,
+                    )
+                    ordered = list(compiled._ordered)
                 for col_name, attr, dep in deferred:
-                    ordered[compiled._bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
+                    ordered[bind_names.index(col_name)] = ("__catalyst_rowid__", dep)
                     deferred_fk.append((obj, attr, dep))
                 if level_index > 0 and pk_value is None and level_pk is not None:
-                    ordered[compiled._bind_names.index(level_pk.name)] = (
+                    ordered[bind_names.index(level_pk.name)] = (
                         "__catalyst_rowid__",
                         pk_op_index,
                     )
                 ops.append(
                     (
-                        compiled.string,
+                        string,
                         ordered,
-                        compiled._bind_types,
+                        bind_types,
                         level_index == 0 and pk_value is None and pk_attr is not None,
                     )
                 )
@@ -3300,16 +3382,44 @@ class Session:
                 }
                 if not level_values or level_pk is None:
                     continue
-                compiled = Update(level.table).values(level_values).where(level_pk == pk).compile()
-                self._raise_bind_error(compiled)
-                ordered = list(compiled._ordered)
+                n_set = len(level_values)
+                template_key = (level.table, "update", tuple(level_values))
+                template = _FLUSH_TEMPLATES.get(template_key)
+                if (
+                    template is not None
+                    and len(template[1]) == n_set + 1
+                    and all(
+                        _flush_bind_safe(level_values[name], tag)
+                        for name, tag in zip(template[1][:n_set], template[2][:n_set], strict=True)
+                    )
+                    and _flush_bind_safe(pk, template[2][-1])
+                ):
+                    string, bind_names, bind_types = template
+                    # SET binds precede the single WHERE pk bind; the
+                    # positional split keeps the old-pk WHERE value even
+                    # when the pk itself is being updated.
+                    ordered = [level_values[name] for name in bind_names[:n_set]]
+                    ordered.append(pk)
+                else:
+                    compiled = (
+                        Update(level.table).values(level_values).where(level_pk == pk).compile()
+                    )
+                    self._raise_bind_error(compiled)
+                    if template is None:
+                        _flush_template_put(template_key, compiled)
+                    string, bind_names, bind_types = (
+                        compiled.string,
+                        compiled._bind_names,
+                        compiled._bind_types,
+                    )
+                    ordered = list(compiled._ordered)
                 for _fk_attr, (col_name, dep) in deferred_cols.items():
-                    if col_name in compiled._bind_names:
-                        ordered[compiled._bind_names.index(col_name)] = (
+                    if col_name in bind_names:
+                        ordered[bind_names.index(col_name)] = (
                             "__catalyst_rowid__",
                             dep,
                         )
-                ops.append((compiled.string, ordered, compiled._bind_types, False))
+                ops.append((string, ordered, bind_types, False))
             cleaned.append(obj)
         # Many-to-many association writes: deduped deletes then inserts,
         # all ahead of object deletes so delete-orphan ordering holds and
@@ -3402,32 +3512,58 @@ class Session:
                     base_refresh.append((instance_dict, prop.key, members))
         for prop, owner_key, remote in assoc_dels:
             assoc = cast(Table, prop.secondary)
-            compiled = (
-                Delete(assoc)
-                .where(
-                    cast(Column, prop.secondary_local) == owner_key,
-                    cast(Column, prop.secondary_remote) == remote,
+            template_key = (assoc, "delete")
+            template = _FLUSH_TEMPLATES.get(template_key)
+            if (
+                template is not None
+                and len(template[1]) == 2
+                and all(
+                    _flush_bind_safe(value, tag)
+                    for value, tag in zip((owner_key, remote), template[2], strict=True)
                 )
-                .compile()
-            )
-            self._raise_bind_error(compiled)
-            ops.append((compiled.string, list(compiled._ordered), compiled._bind_types, False))
-        insert_compiled: dict[int, Compiled] = {}
+            ):
+                string, bind_names, bind_types = template
+                ordered = [owner_key, remote]
+            else:
+                compiled = (
+                    Delete(assoc)
+                    .where(
+                        cast(Column, prop.secondary_local) == owner_key,
+                        cast(Column, prop.secondary_remote) == remote,
+                    )
+                    .compile()
+                )
+                self._raise_bind_error(compiled)
+                if template is None:
+                    _flush_template_put(template_key, compiled)
+                string, bind_names, bind_types = (
+                    compiled.string,
+                    compiled._bind_names,
+                    compiled._bind_types,
+                )
+                ordered = list(compiled._ordered)
+            ops.append((string, ordered, bind_types, False))
         for prop, owner_key, remote in assoc_adds:
             assoc = cast(Table, prop.secondary)
             local_fk = cast(Column, prop.secondary_local)
             remote_fk = cast(Column, prop.secondary_remote)
-            compiled = insert_compiled.get(id(prop))
-            if compiled is None:
+            # The assoc INSERT compiles with NULL placeholders and patches
+            # binds by name per member pair — patched values never went
+            # through compile validation before, so no safety gate here.
+            template_key = (assoc, "insert", (local_fk.name, remote_fk.name))
+            template = _FLUSH_TEMPLATES.get(template_key)
+            if template is None:
                 compiled = (
                     Insert(assoc).values({local_fk.name: None, remote_fk.name: None}).compile()
                 )
                 self._raise_bind_error(compiled)
-                insert_compiled[id(prop)] = compiled
-            ordered = list(compiled._ordered)
-            ordered[compiled._bind_names.index(local_fk.name)] = owner_key
-            ordered[compiled._bind_names.index(remote_fk.name)] = remote
-            ops.append((compiled.string, ordered, compiled._bind_types, False))
+                _flush_template_put(template_key, compiled)
+                template = _FLUSH_TEMPLATES[template_key]
+            string, bind_names, bind_types = template
+            ordered = cast("list[object]", [None] * len(bind_names))
+            ordered[bind_names.index(local_fk.name)] = owner_key
+            ordered[bind_names.index(remote_fk.name)] = remote
+            ops.append((string, ordered, bind_types, False))
         for obj in deleted_order:
             mapper = _mapper_of(obj)
             pk = uow.pk_of(obj)
@@ -3436,9 +3572,27 @@ class Session:
             for level in reversed(mapper.table_levels):
                 if level.pk_column is None:
                     continue
-                compiled = Delete(level.table).where(level.pk_column == pk).compile()
-                self._raise_bind_error(compiled)
-                ops.append((compiled.string, compiled._ordered, compiled._bind_types, False))
+                template_key = (level.table, "delete")
+                template = _FLUSH_TEMPLATES.get(template_key)
+                if (
+                    template is not None
+                    and len(template[1]) == 1
+                    and _flush_bind_safe(pk, template[2][0])
+                ):
+                    string, bind_names, bind_types = template
+                    ordered = [pk]
+                else:
+                    compiled = Delete(level.table).where(level.pk_column == pk).compile()
+                    self._raise_bind_error(compiled)
+                    if template is None:
+                        _flush_template_put(template_key, compiled)
+                    string, bind_names, bind_types = (
+                        compiled.string,
+                        compiled._bind_names,
+                        compiled._bind_types,
+                    )
+                    ordered = list(compiled._ordered)
+                ops.append((string, ordered, bind_types, False))
             dropped.append(obj)
         dropped.extend(synced_deleted)
         try:

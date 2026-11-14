@@ -74,7 +74,9 @@ from catalyst import (
     IntegrityError,
     InvalidRequestError,
     Mapped,
+    ProgrammingError,
     Session,
+    StatementError,
     create_engine,
     mapped_column,
     select,
@@ -878,6 +880,105 @@ def test_flush_datetime_column() -> None:
             sa_loaded = sa_session.get(SAEvent, 1)
             assert sa_loaded is not None
             assert sa_loaded.stamp == moment
+    finally:
+        catalyst_engine.dispose()
+        sa_engine.dispose()
+
+
+def test_flush_template_cache_preserves_bind_errors() -> None:
+    """Regression: once a flush statement template is cached, an unbindable
+    value must still take the real ``compile()`` path and raise the exact
+    error an uncached flush produces — the safety gate may only skip
+    compilation for values that bind identically either way."""
+    catalyst_engine = _catalyst_engine()
+    try:
+        with Session(catalyst_engine) as session:
+            # Warm the INSERT template cache with a valid row.
+            session.add(User(name="warm", score=1))
+            session.flush()
+
+            # Deferred compile-time validation: a string into a DateTime
+            # column records ``bind_error`` and raises ``StatementError``.
+            # A second same-shape bad flush must raise identically through
+            # the now-warm cache.
+            for bad in ("not-a-date", "also-not-a-date"):
+                session.add(Event(stamp=bad))
+                with pytest.raises(StatementError):
+                    session.flush()
+                session.rollback()
+
+            # Execute-time validation: an unbindable value passes compile
+            # and fails inside ``execute_flush`` — identically cached or not.
+            for bad_obj in ({"bad": 1}, ["bad"]):
+                session.add(User(name=bad_obj))
+                with pytest.raises(ProgrammingError):
+                    session.flush()
+                session.rollback()
+
+            # The cached template still serves valid rows.
+            session.add(User(name="fine", score=2))
+            session.flush()
+    finally:
+        catalyst_engine.dispose()
+
+
+def test_flush_template_cache_second_flush_uses_template() -> None:
+    """INSERT/UPDATE/DELETE statement templates must be reused across
+    flushes and round-trip correctly (the cache stores SQL text + bind
+    names + bind types, then rebuilds the parameter list per object)."""
+    catalyst_engine = _catalyst_engine()
+    sa_engine = _sa_engine()
+    try:
+        with Session(catalyst_engine) as session, SASession(sa_engine) as sa_session:
+            rows = [User(name=f"u{i}", score=i) for i in range(4)]
+            sa_rows = [SAUser(name=f"u{i}", score=i) for i in range(4)]
+            session.add_all(rows)
+            sa_session.add_all(sa_rows)
+            # Split across two flushes so the second flush hits the cache.
+            session.flush()
+            sa_session.flush()
+            extra = User(name="late", score=99)
+            sa_extra = SAUser(name="late", score=99)
+            session.add(extra)
+            sa_session.add(sa_extra)
+            session.commit()
+            sa_session.commit()
+
+            # UPDATE through a warm cache (two separate flushes).
+            rows[0].score = 100
+            sa_rows[0].score = 100
+            session.flush()
+            sa_session.flush()
+            rows[1].score = 200
+            sa_rows[1].score = 200
+            session.flush()
+            sa_session.flush()
+
+            # DELETE through a warm cache.
+            session.delete(rows[2])
+            sa_session.delete(sa_rows[2])
+            session.flush()
+            sa_session.flush()
+            session.delete(rows[3])
+            sa_session.delete(sa_rows[3])
+            session.commit()
+            sa_session.commit()
+
+            session.expunge_all()
+            sa_session.expunge_all()
+            catalyst_names = [
+                row.name for row in session.scalars(select(User).order_by(User.id)).all()
+            ]
+            sa_names = [
+                row.name for row in sa_session.scalars(sa.select(SAUser).order_by(SAUser.id)).all()
+            ]
+            assert catalyst_names == sa_names == ["u0", "u1", "late"]
+            loaded0 = session.scalars(select(User).where(User.name == "u0")).one()
+            sa_loaded0 = sa_session.scalars(sa.select(SAUser).where(SAUser.name == "u0")).one()
+            assert loaded0.score == sa_loaded0.score == 100
+            loaded1 = session.scalars(select(User).where(User.name == "u1")).one()
+            sa_loaded1 = sa_session.scalars(sa.select(SAUser).where(SAUser.name == "u1")).one()
+            assert loaded1.score == sa_loaded1.score == 200
     finally:
         catalyst_engine.dispose()
         sa_engine.dispose()
